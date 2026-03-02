@@ -209,7 +209,6 @@ func TestUseAdd(t *testing.T) {
 	if !hasUseAdd {
 		t.Errorf("expected UseAdd to be a caller of Add")
 	}
-
 }
 
 func TestIsTestFunction(t *testing.T) {

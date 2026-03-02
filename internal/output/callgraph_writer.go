@@ -59,7 +59,7 @@ func WriteJSON(result *callgraph.CallGraphResult, outputDir string) error {
 
 	// Write to file with trailing newline for better file handling.
 	// Avoids an extra allocation vs append(jsonData, '\n').
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600) // #nosec G304 -- filename is constrained by sanitizeCallgraphLanguage and joined under configured outputDir
 	if err != nil {
 		return fmt.Errorf("failed to open %s: %w", path, err)
 	}

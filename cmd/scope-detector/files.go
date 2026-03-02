@@ -43,11 +43,11 @@ func readPatternsFile(path string) ([]string, error) {
 		return nil, fmt.Errorf("patterns file path invalid: %w", err)
 	}
 
-	file, err := os.Open(cleaned)
+	file, err := os.Open(cleaned) // #nosec G304 -- ValidatePath rejects traversal and constrains path to workspace root
 	if err != nil {
 		return nil, fmt.Errorf("failed to read patterns file: %w", err)
 	}
-	defer file.Close()
+	defer func() { _ = file.Close() }()
 
 	scanner := bufio.NewScanner(file)
 	var patterns []string

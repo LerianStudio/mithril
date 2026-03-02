@@ -96,7 +96,7 @@ func (p *PythonAnalyzer) runScript(files []string) (*FlowAnalysis, error) {
 	// Build command arguments: python3 script.py <language> --files-from <manifest>
 	args := []string{p.scriptPath, p.language, "--files-from", manifestPath}
 
-	cmd := exec.Command("python3", args...) // #nosec G204 - args are controlled
+	cmd := exec.Command("python3", args...) // #nosec G204,G702 -- no shell invocation; args are validated/internal
 	cmd.Env = procenv.Build()
 
 	var stdout, stderr bytes.Buffer

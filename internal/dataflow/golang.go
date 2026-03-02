@@ -543,11 +543,15 @@ func (g *GoAnalyzer) detectSourcesInFile(filePath string) ([]Source, error) {
 		return nil, fmt.Errorf("file too large: %d bytes (max %d)", info.Size(), MaxFileSize)
 	}
 
-	file, err := os.Open(filePath)
+	file, err := os.Open(filePath) // #nosec G304 -- filePath comes from validated project scope paths
 	if err != nil {
 		return nil, err
 	}
-	defer file.Close()
+	defer func() {
+		if closeErr := file.Close(); closeErr != nil {
+			return
+		}
+	}()
 
 	var sources []Source
 	scanner := bufio.NewScanner(file)
@@ -617,11 +621,15 @@ func (g *GoAnalyzer) detectSinksInFile(filePath string) ([]Sink, error) {
 		return nil, fmt.Errorf("file too large: %d bytes (max %d)", info.Size(), MaxFileSize)
 	}
 
-	file, err := os.Open(filePath)
+	file, err := os.Open(filePath) // #nosec G304 -- filePath comes from validated project scope paths
 	if err != nil {
 		return nil, err
 	}
-	defer file.Close()
+	defer func() {
+		if closeErr := file.Close(); closeErr != nil {
+			return
+		}
+	}()
 
 	var sinks []Sink
 	scanner := bufio.NewScanner(file)
@@ -977,11 +985,13 @@ func readFileLines(path string) ([]string, error) {
 		return nil, fmt.Errorf("file too large: %d bytes (max %d)", info.Size(), MaxFileSize)
 	}
 
-	file, err := os.Open(path)
+	file, err := os.Open(path) // #nosec G304 -- path is caller-controlled internal file path
 	if err != nil {
 		return nil, err
 	}
-	defer file.Close()
+	defer func() {
+		_ = file.Close()
+	}()
 
 	var lines []string
 	scanner := bufio.NewScanner(file)
@@ -1178,13 +1188,13 @@ func (g *GoAnalyzer) checkSanitization(sourceVar string, sourceLine, sinkLine in
 func describeFlow(source Source, sink Sink, sanitized bool) string {
 	var sb strings.Builder
 
-	sb.WriteString(fmt.Sprintf("Data from %s (%s)", source.Type, source.Pattern))
+	_, _ = fmt.Fprintf(&sb, "Data from %s (%s)", source.Type, source.Pattern)
 
 	if source.Variable != "" {
-		sb.WriteString(fmt.Sprintf(" in variable '%s'", source.Variable))
+		_, _ = fmt.Fprintf(&sb, " in variable '%s'", source.Variable)
 	}
 
-	sb.WriteString(fmt.Sprintf(" flows to %s (%s)", sink.Type, sink.Pattern))
+	_, _ = fmt.Fprintf(&sb, " flows to %s (%s)", sink.Type, sink.Pattern)
 
 	if sanitized {
 		sb.WriteString(" [sanitized]")

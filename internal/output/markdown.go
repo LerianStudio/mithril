@@ -35,7 +35,7 @@ func RenderImpactSummary(result *callgraph.CallGraphResult) string {
 
 	// Header
 	sb.WriteString("# Impact Summary\n\n")
-	sb.WriteString(fmt.Sprintf("**Language:** %s\n\n", result.Language))
+	fmt.Fprintf(&sb, "**Language:** %s\n\n", result.Language)
 
 	// Warnings section
 	renderWarnings(&sb, result)
@@ -98,7 +98,7 @@ func renderWarnings(sb *strings.Builder, result *callgraph.CallGraphResult) {
 	}
 
 	for _, warning := range result.Warnings {
-		sb.WriteString(fmt.Sprintf("- %s\n", warning))
+		fmt.Fprintf(sb, "- %s\n", warning)
 	}
 
 	sb.WriteString("\n")
@@ -109,18 +109,18 @@ func renderSummaryTable(sb *strings.Builder, result *callgraph.CallGraphResult) 
 	sb.WriteString("## Summary Metrics\n\n")
 	sb.WriteString("| Metric | Value |\n")
 	sb.WriteString("|--------|-------|\n")
-	sb.WriteString(fmt.Sprintf("| Modified Functions | %d |\n", len(result.ModifiedFunctions)))
-	sb.WriteString(fmt.Sprintf("| Direct Callers | %d |\n", result.ImpactAnalysis.DirectCallers))
-	sb.WriteString(fmt.Sprintf("| Transitive Callers | %d |\n", result.ImpactAnalysis.TransitiveCallers))
-	sb.WriteString(fmt.Sprintf("| Affected Tests | %d |\n", result.ImpactAnalysis.AffectedTests))
-	sb.WriteString(fmt.Sprintf("| Affected Packages | %d |\n", len(result.ImpactAnalysis.AffectedPackages)))
+	fmt.Fprintf(sb, "| Modified Functions | %d |\n", len(result.ModifiedFunctions))
+	fmt.Fprintf(sb, "| Direct Callers | %d |\n", result.ImpactAnalysis.DirectCallers)
+	fmt.Fprintf(sb, "| Transitive Callers | %d |\n", result.ImpactAnalysis.TransitiveCallers)
+	fmt.Fprintf(sb, "| Affected Tests | %d |\n", result.ImpactAnalysis.AffectedTests)
+	fmt.Fprintf(sb, "| Affected Packages | %d |\n", len(result.ImpactAnalysis.AffectedPackages))
 	sb.WriteString("\n")
 
 	// List affected packages if any
 	if len(result.ImpactAnalysis.AffectedPackages) > 0 {
 		sb.WriteString("### Affected Packages\n\n")
 		for _, pkg := range result.ImpactAnalysis.AffectedPackages {
-			sb.WriteString(fmt.Sprintf("- `%s`\n", pkg))
+			fmt.Fprintf(sb, "- `%s`\n", pkg)
 		}
 		sb.WriteString("\n")
 	}
@@ -147,10 +147,10 @@ func renderFunctionImpact(fcg callgraph.FunctionCallGraph, language, riskLevel s
 	var sb strings.Builder
 
 	// Function header with risk badge
-	sb.WriteString(fmt.Sprintf("### `%s`\n\n", fcg.Function))
-	sb.WriteString(fmt.Sprintf("**File:** `%s`\n", fcg.File))
-	sb.WriteString(fmt.Sprintf("**Risk Level:** %s\n", riskLevel))
-	sb.WriteString(fmt.Sprintf("**Callers:** %d\n\n", len(fcg.Callers)))
+	fmt.Fprintf(&sb, "### `%s`\n\n", fcg.Function)
+	fmt.Fprintf(&sb, "**File:** `%s`\n", fcg.File)
+	fmt.Fprintf(&sb, "**Risk Level:** %s\n", riskLevel)
+	fmt.Fprintf(&sb, "**Callers:** %d\n\n", len(fcg.Callers))
 
 	// Test coverage status
 	renderTestCoverage(&sb, fcg.TestCoverage)
@@ -171,7 +171,7 @@ func renderTestCoverage(sb *strings.Builder, tests []callgraph.TestCoverage) {
 		sb.WriteString("**Test Coverage:** Has tests\n\n")
 		sb.WriteString("<details>\n<summary>Tests covering this function</summary>\n\n")
 		for _, test := range tests {
-			sb.WriteString(fmt.Sprintf("- `%s` (%s:%d)\n", test.TestFunction, test.File, test.Line))
+			fmt.Fprintf(sb, "- `%s` (%s:%d)\n", test.TestFunction, test.File, test.Line)
 		}
 		sb.WriteString("\n</details>\n\n")
 	} else {
@@ -196,16 +196,16 @@ func renderCallers(sb *strings.Builder, callers []callgraph.CallInfo) {
 	for i := 0; i < displayCount; i++ {
 		caller := callers[i]
 		if caller.CallSite != "" {
-			sb.WriteString(fmt.Sprintf("- `%s` at `%s:%d` (call site: %s)\n",
-				caller.Function, caller.File, caller.Line, caller.CallSite))
+			fmt.Fprintf(sb, "- `%s` at `%s:%d` (call site: %s)\n",
+				caller.Function, caller.File, caller.Line, caller.CallSite)
 		} else {
-			sb.WriteString(fmt.Sprintf("- `%s` at `%s:%d`\n",
-				caller.Function, caller.File, caller.Line))
+			fmt.Fprintf(sb, "- `%s` at `%s:%d`\n",
+				caller.Function, caller.File, caller.Line)
 		}
 	}
 
 	if len(callers) > maxCallersToShow {
-		sb.WriteString(fmt.Sprintf("- ... and %d more\n", len(callers)-maxCallersToShow))
+		fmt.Fprintf(sb, "- ... and %d more\n", len(callers)-maxCallersToShow)
 	}
 
 	sb.WriteString("\n")
@@ -228,15 +228,15 @@ func renderCallees(sb *strings.Builder, callees []callgraph.CallInfo) {
 	for i := 0; i < displayCount; i++ {
 		callee := callees[i]
 		if callee.File != "" && callee.Line > 0 {
-			sb.WriteString(fmt.Sprintf("- `%s` at `%s:%d`\n",
-				callee.Function, callee.File, callee.Line))
+			fmt.Fprintf(sb, "- `%s` at `%s:%d`\n",
+				callee.Function, callee.File, callee.Line)
 		} else {
-			sb.WriteString(fmt.Sprintf("- `%s`\n", callee.Function))
+			fmt.Fprintf(sb, "- `%s`\n", callee.Function)
 		}
 	}
 
 	if len(callees) > maxCalleesToShow {
-		sb.WriteString(fmt.Sprintf("- ... and %d more\n", len(callees)-maxCalleesToShow))
+		fmt.Fprintf(sb, "- ... and %d more\n", len(callees)-maxCalleesToShow)
 	}
 
 	sb.WriteString("\n")

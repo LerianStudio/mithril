@@ -84,37 +84,37 @@ func GenerateSecuritySummary(analyses map[string]*FlowAnalysis) string {
 
 	// Header
 	sb.WriteString("# Security Data Flow Analysis\n\n")
-	sb.WriteString(fmt.Sprintf("**Generated:** %s\n\n", time.Now().Format(time.RFC3339)))
+	fmt.Fprintf(&sb, "**Generated:** %s\n\n", time.Now().Format(time.RFC3339))
 
 	// Executive Summary
 	sb.WriteString("## Executive Summary\n\n")
 	sb.WriteString("| Metric | Value |\n")
 	sb.WriteString("|--------|-------|\n")
-	sb.WriteString(fmt.Sprintf("| Languages Analyzed | %d |\n", len(languages)))
-	sb.WriteString(fmt.Sprintf("| Total Sources | %d |\n", totalStats.TotalSources))
-	sb.WriteString(fmt.Sprintf("| Total Sinks | %d |\n", totalStats.TotalSinks))
-	sb.WriteString(fmt.Sprintf("| Total Flows | %d |\n", totalStats.TotalFlows))
-	sb.WriteString(fmt.Sprintf("| Unsanitized Flows | %d |\n", totalStats.UnsanitizedFlows))
-	sb.WriteString(fmt.Sprintf("| Critical Risk Flows | %d |\n", totalStats.CriticalFlows))
-	sb.WriteString(fmt.Sprintf("| High Risk Flows | %d |\n", totalStats.HighRiskFlows))
-	sb.WriteString(fmt.Sprintf("| Nil/Null Risks | %d |\n", totalStats.NilRisks))
+	fmt.Fprintf(&sb, "| Languages Analyzed | %d |\n", len(languages))
+	fmt.Fprintf(&sb, "| Total Sources | %d |\n", totalStats.TotalSources)
+	fmt.Fprintf(&sb, "| Total Sinks | %d |\n", totalStats.TotalSinks)
+	fmt.Fprintf(&sb, "| Total Flows | %d |\n", totalStats.TotalFlows)
+	fmt.Fprintf(&sb, "| Unsanitized Flows | %d |\n", totalStats.UnsanitizedFlows)
+	fmt.Fprintf(&sb, "| Critical Risk Flows | %d |\n", totalStats.CriticalFlows)
+	fmt.Fprintf(&sb, "| High Risk Flows | %d |\n", totalStats.HighRiskFlows)
+	fmt.Fprintf(&sb, "| Nil/Null Risks | %d |\n", totalStats.NilRisks)
 	sb.WriteString("\n")
 
 	// Risk Assessment
 	sb.WriteString("## Risk Assessment\n\n")
 
 	if totalStats.CriticalFlows > 0 {
-		sb.WriteString(fmt.Sprintf("### CRITICAL (%d issues)\n\n", totalStats.CriticalFlows))
+		fmt.Fprintf(&sb, "### CRITICAL (%d issues)\n\n", totalStats.CriticalFlows)
 		sb.WriteString("Critical security vulnerabilities detected that require immediate attention.\n\n")
 	}
 
 	if totalStats.HighRiskFlows > 0 {
-		sb.WriteString(fmt.Sprintf("### HIGH (%d issues)\n\n", totalStats.HighRiskFlows))
+		fmt.Fprintf(&sb, "### HIGH (%d issues)\n\n", totalStats.HighRiskFlows)
 		sb.WriteString("High-risk security issues that should be addressed promptly.\n\n")
 	}
 
 	if totalStats.UncheckedNilRisks > 0 {
-		sb.WriteString(fmt.Sprintf("### NIL SAFETY (%d issues)\n\n", totalStats.UncheckedNilRisks))
+		fmt.Fprintf(&sb, "### NIL SAFETY (%d issues)\n\n", totalStats.UncheckedNilRisks)
 		sb.WriteString("Unchecked nil/null values that may cause runtime panics or crashes.\n\n")
 	}
 
@@ -142,16 +142,16 @@ func GenerateSecuritySummary(analyses map[string]*FlowAnalysis) string {
 				riskLabel = "CRITICAL"
 			}
 
-			sb.WriteString(fmt.Sprintf("### %s Flow %d: %s\n\n", riskLabel, flowNum, escapeMarkdownInline(flow.Description)))
+			fmt.Fprintf(&sb, "### %s Flow %d: %s\n\n", riskLabel, flowNum, escapeMarkdownInline(flow.Description))
 
-			sb.WriteString(fmt.Sprintf("**Risk Level:** %s\n\n", capitalizeFirst(string(flow.Risk))))
+			fmt.Fprintf(&sb, "**Risk Level:** %s\n\n", capitalizeFirst(string(flow.Risk)))
 
-			sb.WriteString(fmt.Sprintf("**Source:** `%s:%d` (Type: %s)\n\n", escapeMarkdownInline(flow.Source.File), flow.Source.Line, escapeMarkdownInline(string(flow.Source.Type))))
+			fmt.Fprintf(&sb, "**Source:** `%s:%d` (Type: %s)\n\n", escapeMarkdownInline(flow.Source.File), flow.Source.Line, escapeMarkdownInline(string(flow.Source.Type)))
 
-			sb.WriteString(fmt.Sprintf("**Sink:** `%s:%d` (Function: %s)\n\n", escapeMarkdownInline(flow.Sink.File), flow.Sink.Line, escapeMarkdownInline(flow.Sink.Function)))
+			fmt.Fprintf(&sb, "**Sink:** `%s:%d` (Function: %s)\n\n", escapeMarkdownInline(flow.Sink.File), flow.Sink.Line, escapeMarkdownInline(flow.Sink.Function))
 
 			if flow.Sanitized {
-				sb.WriteString(fmt.Sprintf("**Sanitized:** Yes (Sanitizers: %s)\n\n", escapeMarkdownInline(strings.Join(flow.Sanitizers, ", "))))
+				fmt.Fprintf(&sb, "**Sanitized:** Yes (Sanitizers: %s)\n\n", escapeMarkdownInline(strings.Join(flow.Sanitizers, ", ")))
 			} else {
 				sb.WriteString("**Sanitized:** No\n\n")
 			}
@@ -168,7 +168,7 @@ func GenerateSecuritySummary(analyses map[string]*FlowAnalysis) string {
 				sb.WriteString("\n```\n\n")
 			}
 
-			sb.WriteString(fmt.Sprintf("**Recommendation:** %s\n\n", getRecommendation(flow)))
+			fmt.Fprintf(&sb, "**Recommendation:** %s\n\n", getRecommendation(flow))
 			sb.WriteString("---\n\n")
 		}
 	}
@@ -184,8 +184,8 @@ func GenerateSecuritySummary(analyses map[string]*FlowAnalysis) string {
 			if ns.IsChecked {
 				checked = "Yes"
 			}
-			sb.WriteString(fmt.Sprintf("| %s | %d | %s | %s | %s | %s |\n",
-				escapeMarkdownInline(ns.File), ns.Line, escapeMarkdownInline(ns.Variable), escapeMarkdownInline(ns.Origin), checked, capitalizeFirst(string(ns.Risk))))
+			fmt.Fprintf(&sb, "| %s | %d | %s | %s | %s | %s |\n",
+				escapeMarkdownInline(ns.File), ns.Line, escapeMarkdownInline(ns.Variable), escapeMarkdownInline(ns.Origin), checked, capitalizeFirst(string(ns.Risk)))
 		}
 		sb.WriteString("\n")
 	}
@@ -200,16 +200,16 @@ func GenerateSecuritySummary(analyses map[string]*FlowAnalysis) string {
 				continue
 			}
 
-			sb.WriteString(fmt.Sprintf("### %s\n\n", capitalizeFirst(lang)))
+			fmt.Fprintf(&sb, "### %s\n\n", capitalizeFirst(lang))
 			sb.WriteString("| Metric | Value |\n")
 			sb.WriteString("|--------|-------|\n")
-			sb.WriteString(fmt.Sprintf("| Sources | %d |\n", analysis.Statistics.TotalSources))
-			sb.WriteString(fmt.Sprintf("| Sinks | %d |\n", analysis.Statistics.TotalSinks))
-			sb.WriteString(fmt.Sprintf("| Flows | %d |\n", analysis.Statistics.TotalFlows))
-			sb.WriteString(fmt.Sprintf("| Unsanitized | %d |\n", analysis.Statistics.UnsanitizedFlows))
-			sb.WriteString(fmt.Sprintf("| Critical | %d |\n", analysis.Statistics.CriticalFlows))
-			sb.WriteString(fmt.Sprintf("| High | %d |\n", analysis.Statistics.HighRiskFlows))
-			sb.WriteString(fmt.Sprintf("| Nil Risks | %d |\n", analysis.Statistics.NilRisks))
+			fmt.Fprintf(&sb, "| Sources | %d |\n", analysis.Statistics.TotalSources)
+			fmt.Fprintf(&sb, "| Sinks | %d |\n", analysis.Statistics.TotalSinks)
+			fmt.Fprintf(&sb, "| Flows | %d |\n", analysis.Statistics.TotalFlows)
+			fmt.Fprintf(&sb, "| Unsanitized | %d |\n", analysis.Statistics.UnsanitizedFlows)
+			fmt.Fprintf(&sb, "| Critical | %d |\n", analysis.Statistics.CriticalFlows)
+			fmt.Fprintf(&sb, "| High | %d |\n", analysis.Statistics.HighRiskFlows)
+			fmt.Fprintf(&sb, "| Nil Risks | %d |\n", analysis.Statistics.NilRisks)
 			sb.WriteString("\n")
 		}
 	}

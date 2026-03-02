@@ -146,10 +146,7 @@ func TestValidateScriptsDir(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			scriptsDir := tt.setup(t)
-			enforceBaseRestriction := true
-			if tt.name == "explicit_path_outside_allowed" {
-				enforceBaseRestriction = false
-			}
+			enforceBaseRestriction := tt.name != "explicit_path_outside_allowed"
 			err := validateScriptsDir(scriptsDir, enforceBaseRestriction)
 
 			if tt.wantErr {

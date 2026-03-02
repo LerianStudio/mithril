@@ -14,28 +14,28 @@ func RenderMarkdown(diff *SemanticDiff) string {
 
 	var sb strings.Builder
 
-	sb.WriteString(fmt.Sprintf("# Semantic Changes: %s\n\n", diff.FilePath))
-	sb.WriteString(fmt.Sprintf("**Language:** %s\n\n", diff.Language))
+	_, _ = fmt.Fprintf(&sb, "# Semantic Changes: %s\n\n", diff.FilePath)
+	_, _ = fmt.Fprintf(&sb, "**Language:** %s\n\n", diff.Language)
 
 	// Summary section
 	sb.WriteString("## Summary\n\n")
 	sb.WriteString("| Category | Added | Removed | Modified |\n")
 	sb.WriteString("|----------|-------|---------|----------|\n")
-	sb.WriteString(fmt.Sprintf("| Functions | %d | %d | %d |\n",
+	_, _ = fmt.Fprintf(&sb, "| Functions | %d | %d | %d |\n",
 		diff.Summary.FunctionsAdded,
 		diff.Summary.FunctionsRemoved,
-		diff.Summary.FunctionsModified))
-	sb.WriteString(fmt.Sprintf("| Types | %d | %d | %d |\n",
+		diff.Summary.FunctionsModified)
+	_, _ = fmt.Fprintf(&sb, "| Types | %d | %d | %d |\n",
 		diff.Summary.TypesAdded,
 		diff.Summary.TypesRemoved,
-		diff.Summary.TypesModified))
-	sb.WriteString(fmt.Sprintf("| Variables | %d | %d | %d |\n",
+		diff.Summary.TypesModified)
+	_, _ = fmt.Fprintf(&sb, "| Variables | %d | %d | %d |\n",
 		diff.Summary.VariablesAdded,
 		diff.Summary.VariablesRemoved,
-		diff.Summary.VariablesModified))
-	sb.WriteString(fmt.Sprintf("| Imports | %d | %d | - |\n\n",
+		diff.Summary.VariablesModified)
+	_, _ = fmt.Fprintf(&sb, "| Imports | %d | %d | - |\n\n",
 		diff.Summary.ImportsAdded,
-		diff.Summary.ImportsRemoved))
+		diff.Summary.ImportsRemoved)
 
 	// Functions section
 	if len(diff.Functions) > 0 {
@@ -68,7 +68,7 @@ func renderFunction(fn FunctionDiff) string {
 	var sb strings.Builder
 
 	icon := getChangeIcon(fn.ChangeType)
-	sb.WriteString(fmt.Sprintf("### %s `%s`\n\n", icon, fn.Name))
+	_, _ = fmt.Fprintf(&sb, "### %s `%s`\n\n", icon, fn.Name)
 
 	switch fn.ChangeType {
 	case ChangeAdded:
@@ -90,7 +90,7 @@ func renderFunction(fn FunctionDiff) string {
 	case ChangeModified:
 		sb.WriteString("**Status:** Modified\n\n")
 		if fn.BodyDiff != "" {
-			sb.WriteString(fmt.Sprintf("**Changes:** %s\n\n", fn.BodyDiff))
+			_, _ = fmt.Fprintf(&sb, "**Changes:** %s\n\n", fn.BodyDiff)
 		}
 
 		if fn.Before != nil && fn.After != nil {
@@ -110,17 +110,17 @@ func renderType(t TypeDiff) string {
 	var sb strings.Builder
 
 	icon := getChangeIcon(t.ChangeType)
-	sb.WriteString(fmt.Sprintf("### %s `%s` (%s)\n\n", icon, t.Name, t.Kind))
-	sb.WriteString(fmt.Sprintf("**Status:** %s\n", capitalizeFirst(string(t.ChangeType))))
-	sb.WriteString(fmt.Sprintf("**Lines:** %d-%d\n\n", t.StartLine, t.EndLine))
+	_, _ = fmt.Fprintf(&sb, "### %s `%s` (%s)\n\n", icon, t.Name, t.Kind)
+	_, _ = fmt.Fprintf(&sb, "**Status:** %s\n", capitalizeFirst(string(t.ChangeType)))
+	_, _ = fmt.Fprintf(&sb, "**Lines:** %d-%d\n\n", t.StartLine, t.EndLine)
 
 	if len(t.Fields) > 0 {
 		sb.WriteString("**Field Changes:**\n\n")
 		sb.WriteString("| Field | Change | Old Type | New Type |\n")
 		sb.WriteString("|-------|--------|----------|----------|\n")
 		for _, f := range t.Fields {
-			sb.WriteString(fmt.Sprintf("| %s | %s | %s | %s |\n",
-				f.Name, f.ChangeType, f.OldType, f.NewType))
+			_, _ = fmt.Fprintf(&sb, "| %s | %s | %s | %s |\n",
+				f.Name, f.ChangeType, f.OldType, f.NewType)
 		}
 		sb.WriteString("\n")
 	}
@@ -217,17 +217,17 @@ func RenderMultipleMarkdown(diffs []SemanticDiff) string {
 	}
 
 	sb.WriteString("## Overall Summary\n\n")
-	sb.WriteString(fmt.Sprintf("**Files analyzed:** %d\n\n", len(diffs)))
+	_, _ = fmt.Fprintf(&sb, "**Files analyzed:** %d\n\n", len(diffs))
 	sb.WriteString("| Category | Added | Removed | Modified |\n")
 	sb.WriteString("|----------|-------|---------|----------|\n")
-	sb.WriteString(fmt.Sprintf("| Functions | %d | %d | %d |\n",
-		totalFuncsAdded, totalFuncsRemoved, totalFuncsModified))
-	sb.WriteString(fmt.Sprintf("| Types | %d | %d | %d |\n",
-		totalTypesAdded, totalTypesRemoved, totalTypesModified))
-	sb.WriteString(fmt.Sprintf("| Variables | %d | %d | %d |\n",
-		totalVarsAdded, totalVarsRemoved, totalVarsModified))
-	sb.WriteString(fmt.Sprintf("| Imports | %d | %d | - |\n\n",
-		totalImportsAdded, totalImportsRemoved))
+	_, _ = fmt.Fprintf(&sb, "| Functions | %d | %d | %d |\n",
+		totalFuncsAdded, totalFuncsRemoved, totalFuncsModified)
+	_, _ = fmt.Fprintf(&sb, "| Types | %d | %d | %d |\n",
+		totalTypesAdded, totalTypesRemoved, totalTypesModified)
+	_, _ = fmt.Fprintf(&sb, "| Variables | %d | %d | %d |\n",
+		totalVarsAdded, totalVarsRemoved, totalVarsModified)
+	_, _ = fmt.Fprintf(&sb, "| Imports | %d | %d | - |\n\n",
+		totalImportsAdded, totalImportsRemoved)
 
 	sb.WriteString("---\n\n")
 

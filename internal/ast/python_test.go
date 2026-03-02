@@ -281,7 +281,7 @@ func TestPythonExtractor_VariableDiffDetected(t *testing.T) {
 	diff, err := extractor.ExtractDiff(context.Background(), beforePath, afterPath)
 	require.NoError(t, err)
 
-	var changes = map[string]ChangeType{}
+	changes := map[string]ChangeType{}
 	for _, v := range diff.Variables {
 		changes[v.Name] = v.ChangeType
 	}
