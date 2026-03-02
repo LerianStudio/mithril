@@ -1,5 +1,5 @@
 .PHONY: all build test test-coverage clean install fmt vet golangci-lint lint \
-	scope-detector static-analysis ast-extractor call-graph data-flow compile-context run-all \
+	scope-detector static-analysis ast-extractor call-graph data-flow compile-context run-all mithril \
 	build-context
 
 # Binary output directory
@@ -10,7 +10,7 @@ BINARIES := scope-detector static-analysis ast-extractor call-graph data-flow co
 
 all: build
 
-build: $(BINARIES)
+build: $(BINARIES) mithril
 
 # Pattern rule for building all phase binaries
 # Replaces individual targets with identical echo/mkdir/go-build pattern
@@ -18,6 +18,11 @@ $(BINARIES):
 	@echo "Building $@..."
 	@mkdir -p $(BIN_DIR)
 	@go build -o $(BIN_DIR)/$@ ./cmd/$@
+
+mithril:
+	@echo "Building mithril..."
+	@mkdir -p $(BIN_DIR)
+	@go build -o $(BIN_DIR)/mithril .
 
 # Convenience target for Phase 5 binaries only
 build-context: compile-context run-all
