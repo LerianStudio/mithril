@@ -8,6 +8,23 @@ import (
 	"unicode"
 )
 
+var markdownInlineEscaper = strings.NewReplacer(
+	"`", "\\`",
+	"*", "\\*",
+	"_", "\\_",
+	"[", "\\[",
+	"]", "\\]",
+	"(", "\\(",
+	")", "\\)",
+	"#", "\\#",
+	"|", "\\|",
+	"<", "&lt;",
+	">", "&gt;",
+	"\n", " ",
+	"\r", " ",
+	"\t", " ",
+)
+
 // capitalizeFirst capitalizes the first letter of a string.
 // stdlib-only replacement for deprecated strings.Title.
 func capitalizeFirst(s string) string {
@@ -22,20 +39,7 @@ func capitalizeFirst(s string) string {
 // escapeMarkdownInline escapes special markdown characters in inline text
 // to prevent markdown injection attacks in generated reports.
 func escapeMarkdownInline(s string) string {
-	replacer := strings.NewReplacer(
-		"`", "\\`",
-		"*", "\\*",
-		"_", "\\_",
-		"[", "\\[",
-		"]", "\\]",
-		"(", "\\(",
-		")", "\\)",
-		"#", "\\#",
-		"|", "\\|",
-		"<", "&lt;",
-		">", "&gt;",
-	)
-	return replacer.Replace(s)
+	return markdownInlineEscaper.Replace(s)
 }
 
 // escapeMarkdownCodeBlock escapes content for code blocks to prevent
@@ -117,6 +121,10 @@ func GenerateSecuritySummary(analyses map[string]*FlowAnalysis) string {
 	if totalStats.CriticalFlows == 0 && totalStats.HighRiskFlows == 0 && totalStats.UncheckedNilRisks == 0 {
 		sb.WriteString("No critical, high-risk, or unchecked nil safety issues detected.\n\n")
 	}
+
+	// Analysis limitations
+	sb.WriteString("## Analysis Limits\n\n")
+	sb.WriteString("- Data flow tracking is heuristic and primarily intra-file; flows that cross function boundaries may be under-reported.\n\n")
 
 	// Critical & High Risk Flows Detail
 	if totalStats.CriticalFlows > 0 || totalStats.HighRiskFlows > 0 {

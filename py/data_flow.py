@@ -31,20 +31,21 @@ MAX_FILE_SIZE = 10 * 1024 * 1024
 class Source:
     """Represents a data source (user input, external data)."""
 
-    source_type: str  # http_body, http_query, env_var, etc.
+    type: str  # http_body, http_query, env_var, etc.
     variable: str
     file: str
     line: int
     column: int
     pattern: str  # The matched pattern
+    context: str = ""  # Source line context
 
 
 @dataclass
 class Sink:
     """Represents a data sink (dangerous operation)."""
 
-    sink_type: str  # database, command_exec, http_response, etc.
-    variable: str
+    type: str  # database, command_exec, http_response, etc.
+    function: str
     file: str
     line: int
     column: int
@@ -61,7 +62,9 @@ class Flow:
     sink: Sink
     risk: str  # critical, high, medium, low
     sanitized: bool
-    sanitizer: Optional[str] = None
+    sanitizers: list[str] = field(default_factory=list)
+    path: list[str] = field(default_factory=list)
+    description: str = ""
 
 
 @dataclass
@@ -73,7 +76,11 @@ class NilSource:
     line: int
     column: int
     pattern: str
-    reason: str  # database_query, map_lookup, json_parse, etc.
+    origin: str  # database_query, map_lookup, json_parse, etc.
+    is_checked: bool = False
+    check_line: int = 0
+    usage_line: int = 0
+    risk: str = "medium"
 
 
 @dataclass
@@ -216,6 +223,11 @@ PYTHON_SINK_PATTERNS: dict[str, list[tuple[str, str]]] = {
         (r"HttpResponseRedirect\s*\(", "HttpResponseRedirect()"),
         (r"RedirectResponse\s*\(", "RedirectResponse()"),
     ],
+    "ssrf": [
+        (r"requests\.(get|post|put|delete|patch)\s*\(", "requests outbound call"),
+        (r"httpx\.(get|post|put|delete|patch)\s*\(", "httpx outbound call"),
+        (r"urllib\.request\.urlopen\s*\(", "urllib outbound call"),
+    ],
 }
 
 
@@ -355,6 +367,14 @@ TYPESCRIPT_SINK_PATTERNS: dict[str, list[tuple[str, str]]] = {
         (r"location\.assign\s*\(", "location.assign()"),
         (r"location\.replace\s*\(", "location.replace()"),
     ],
+    "ssrf": [
+        (r"\bfetch\s*\(", "fetch() outbound call"),
+        (r"axios\.(get|post|put|delete|patch)\s*\(", "axios outbound call"),
+        (r"axios\s*\(", "axios() outbound call"),
+        (r"got\s*\(", "got() outbound call"),
+        (r"http\.request\s*\(", "http.request outbound call"),
+        (r"https\.request\s*\(", "https.request outbound call"),
+    ],
 }
 
 
@@ -387,7 +407,6 @@ TYPESCRIPT_NULL_PATTERNS: list[tuple[str, str, str]] = [
 
 PYTHON_SANITIZERS: dict[str, list[str]] = {
     "database": [
-        r"%s",  # Parameterized query placeholder
         r"\?",  # SQLite placeholder
         r":\w+",  # Named parameter
         r"\.filter\s*\(",  # ORM filter (safe)
@@ -477,8 +496,7 @@ SINK_RISK_WEIGHT: dict[str, int] = {
 def hash_flow(source: Source, sink: Sink) -> str:
     """Generate a unique hash for a source-sink flow."""
     data = (
-        f"{source.file}:{source.line}:{source.source_type}:"
-        f"{sink.file}:{sink.line}:{sink.sink_type}"
+        f"{source.file}:{source.line}:{source.type}:{sink.file}:{sink.line}:{sink.type}"
     )
     return hashlib.sha256(data.encode()).hexdigest()[:16]
 
@@ -490,22 +508,24 @@ def calculate_risk(source: Source, sink: Sink, sanitized: bool = False) -> str:
 
     # Critical: User input to exec or database
     http_inputs = {"http_body", "http_query", "http_header", "http_path", "user_input"}
-    if source.source_type in http_inputs:
-        if sink.sink_type in {"command_exec", "database"}:
+    if source.type in http_inputs:
+        if sink.type in {"command_exec", "database"}:
             return "critical"
-        if sink.sink_type in {"http_response", "template", "redirect"}:
+        if sink.type == "ssrf":
+            return "high"
+        if sink.type in {"http_response", "template", "redirect"}:
             return "high"
 
-    # Medium: Env vars or file to dangerous sinks
-    if source.source_type == "env_var" and sink.sink_type in {"database", "command_exec"}:
+    # Medium: Environment variables to dangerous sinks
+    if source.type == "env_var" and sink.type in {"database", "command_exec"}:
         return "medium"
-    if source.source_type == "file_read" and sink.sink_type in {"database", "command_exec"}:
+    if source.type == "file_read" and sink.type in {"database", "command_exec"}:
         return "medium"
-    if sink.sink_type == "file_write":
+    if sink.type == "file_write":
         return "medium"
 
     # Low: Logging
-    if sink.sink_type == "logging":
+    if sink.type == "logging":
         return "low"
 
     return "info"
@@ -551,9 +571,7 @@ def extract_variable(line: str, match_start: int) -> str:
     return "<unknown>"
 
 
-def detect_sources(
-    files: list[tuple[str, str]], language: str
-) -> list[Source]:
+def detect_sources(files: list[tuple[str, str]], language: str) -> list[Source]:
     """Detect all data sources in the given files."""
     sources: list[Source] = []
 
@@ -573,12 +591,13 @@ def detect_sources(
                         variable = extract_variable(line, match.start())
                         sources.append(
                             Source(
-                                source_type=source_type,
+                                type=source_type,
                                 variable=variable,
                                 file=file_path,
                                 line=line_num,
                                 column=match.start() + 1,
                                 pattern=desc,
+                                context=line,
                             )
                         )
 
@@ -602,11 +621,11 @@ def detect_sinks(files: list[tuple[str, str]], language: str) -> list[Sink]:
             for sink_type, pattern_list in patterns.items():
                 for pattern, desc in pattern_list:
                     for match in re.finditer(pattern, line):
-                        variable = extract_variable(line, match.start())
+                        function = extract_variable(line, match.start())
                         sinks.append(
                             Sink(
-                                sink_type=sink_type,
-                                variable=variable,
+                                type=sink_type,
+                                function=function,
                                 file=file_path,
                                 line=line_num,
                                 column=match.start() + 1,
@@ -618,9 +637,7 @@ def detect_sinks(files: list[tuple[str, str]], language: str) -> list[Sink]:
     return sinks
 
 
-def detect_null_sources(
-    files: list[tuple[str, str]], language: str
-) -> list[NilSource]:
+def detect_null_sources(files: list[tuple[str, str]], language: str) -> list[NilSource]:
     """Detect potentially null/nil variable sources."""
     nil_sources: list[NilSource] = []
 
@@ -633,6 +650,32 @@ def detect_null_sources(
             for pattern, desc, reason in TYPESCRIPT_NULL_PATTERNS:
                 for match in re.finditer(pattern, line):
                     variable = extract_variable(line, match.start())
+                    is_checked = False
+                    check_line = 0
+                    usage_line = 0
+                    risk = "medium"
+
+                    if variable and variable != "<unknown>":
+                        safe_variable = re.escape(variable)
+                        nil_check = re.compile(
+                            rf"\b{safe_variable}\b\s*(!==?|===?)\s*(null|undefined)|"
+                            rf"(null|undefined)\s*(!==?|===?)\s*\b{safe_variable}\b"
+                        )
+                        usage = re.compile(rf"\b{safe_variable}\b\s*(?:\.|\[)")
+
+                        for scan_line_num, scan_line in enumerate(
+                            lines[line_num:], start=line_num + 1
+                        ):
+                            if nil_check.search(scan_line):
+                                is_checked = True
+                                check_line = scan_line_num
+                                risk = "low"
+                                break
+                            if usage.search(scan_line):
+                                usage_line = scan_line_num
+                                risk = "high"
+                                break
+
                     nil_sources.append(
                         NilSource(
                             variable=variable,
@@ -640,19 +683,34 @@ def detect_null_sources(
                             line=line_num,
                             column=match.start() + 1,
                             pattern=desc,
-                            reason=reason,
+                            origin=reason,
+                            is_checked=is_checked,
+                            check_line=check_line,
+                            usage_line=usage_line,
+                            risk=risk,
                         )
                     )
 
     return nil_sources
 
 
-def check_sanitization(source: Source, sink: Sink, language: str) -> tuple[bool, Optional[str]]:
+def check_sanitization(
+    source: Source,
+    sink: Sink,
+    language: str,
+    file_lines: Optional[list[str]] = None,
+) -> tuple[bool, Optional[str]]:
     """Check if data flow is sanitized between source and sink."""
     sanitizers = {
         "python": {
-            "database": [r"execute\s*\([^,]+,\s*[\[\(]", r"\?\s*,", r"%s"],  # Parameterized queries
-            "command_exec": [r"shlex\.quote", r"subprocess\.\w+\([^)]*shell\s*=\s*False"],
+            "database": [
+                r"execute\s*\([^,]+,\s*[\[\(]",
+                r"\?\s*,",
+            ],  # Parameterized queries
+            "command_exec": [
+                r"shlex\.quote",
+                r"subprocess\.\w+\([^)]*shell\s*=\s*False",
+            ],
             "http_response": [r"escape", r"html\.escape", r"markupsafe", r"bleach"],
             "template": [r"autoescape\s*=\s*True", r"\|safe\b"],
         },
@@ -661,22 +719,39 @@ def check_sanitization(source: Source, sink: Sink, language: str) -> tuple[bool,
             "command_exec": [r"shell:\s*false"],
             "http_response": [r"escapeHtml", r"sanitize", r"DOMPurify", r"xss"],
             "template": [r"textContent", r"createTextNode"],
-        }
+        },
     }
 
     lang_sanitizers = sanitizers.get(language, {})
-    sink_sanitizers = lang_sanitizers.get(sink.sink_type, [])
+    sink_sanitizers = lang_sanitizers.get(sink.type, [])
 
-    # Check sink context for sanitization patterns
-    for pattern in sink_sanitizers:
-        if re.search(pattern, sink.context, re.IGNORECASE):
-            return True, pattern
+    lines_to_scan = [sink.context]
+    if (
+        file_lines is not None
+        and source.file == sink.file
+        and source.line > 0
+        and sink.line > 0
+        and source.line <= sink.line
+    ):
+        start = source.line - 1
+        end = min(sink.line, len(file_lines))
+        if start < end:
+            lines_to_scan = file_lines[start:end]
+
+    # Check full source->sink window for sanitization patterns
+    for context_line in lines_to_scan:
+        for pattern in sink_sanitizers:
+            if re.search(pattern, context_line, re.IGNORECASE):
+                return True, pattern
 
     return False, None
 
 
 def track_flows(
-    sources: list[Source], sinks: list[Sink], language: str
+    sources: list[Source],
+    sinks: list[Sink],
+    language: str,
+    file_lines_by_path: Optional[dict[str, list[str]]] = None,
 ) -> list[Flow]:
     """Track data flows from sources to sinks."""
     flows: list[Flow] = []
@@ -700,7 +775,12 @@ def track_flows(
             seen_flows.add(flow_id)
 
             # Check for sanitization first (needed for risk calculation)
-            sanitized, sanitizer = check_sanitization(source, sink, language)
+            file_lines = None
+            if file_lines_by_path is not None:
+                file_lines = file_lines_by_path.get(source.file)
+            sanitized, sanitizer = check_sanitization(
+                source, sink, language, file_lines
+            )
 
             # Calculate risk (uses sanitized flag)
             risk = calculate_risk(source, sink, sanitized)
@@ -712,7 +792,12 @@ def track_flows(
                     sink=sink,
                     risk=risk,
                     sanitized=sanitized,
-                    sanitizer=sanitizer,
+                    sanitizers=[sanitizer] if sanitizer else [],
+                    path=[
+                        f"{source.file}:{source.line} - Source: {source.pattern}",
+                        f"{sink.file}:{sink.line} - Sink: {sink.pattern}",
+                    ],
+                    description=f"Data from {source.type} flows to {sink.type}",
                 )
             )
 
@@ -766,7 +851,12 @@ def analyze(files: list[str], language: str) -> AnalysisOutput:
     output.sinks = detect_sinks(file_contents, language)
 
     # Track flows
-    output.flows = track_flows(output.sources, output.sinks, language)
+    file_lines_by_path = {
+        file_path: content.splitlines() for file_path, content in file_contents
+    }
+    output.flows = track_flows(
+        output.sources, output.sinks, language, file_lines_by_path
+    )
 
     # Detect null sources (TypeScript only)
     output.nil_sources = detect_null_sources(file_contents, language)
@@ -790,13 +880,36 @@ def to_dict(obj) -> dict | list | str | int | bool | None:
     return obj
 
 
-def output_to_json(output: AnalysisOutput) -> str:
+def compute_statistics(output: AnalysisOutput) -> dict[str, int]:
+    """Compute summary statistics compatible with Go FlowAnalysis."""
+    unsanitized_flows = sum(1 for flow in output.flows if not flow.sanitized)
+    critical_flows = sum(1 for flow in output.flows if flow.risk == "critical")
+    high_risk_flows = sum(1 for flow in output.flows if flow.risk == "high")
+    unchecked_nil_risks = sum(
+        1 for source in output.nil_sources if not source.is_checked
+    )
+
+    return {
+        "total_sources": len(output.sources),
+        "total_sinks": len(output.sinks),
+        "total_flows": len(output.flows),
+        "unsanitized_flows": unsanitized_flows,
+        "critical_flows": critical_flows,
+        "high_risk_flows": high_risk_flows,
+        "nil_risks": len(output.nil_sources),
+        "unchecked_nil_risks": unchecked_nil_risks,
+    }
+
+
+def output_to_json(output: AnalysisOutput, language: str) -> str:
     """Convert AnalysisOutput to JSON string."""
-    data = {
+    data: dict[str, object] = {
+        "language": language,
         "sources": [to_dict(s) for s in output.sources],
         "sinks": [to_dict(s) for s in output.sinks],
         "flows": [to_dict(f) for f in output.flows],
         "nil_sources": [to_dict(n) for n in output.nil_sources],
+        "statistics": compute_statistics(output),
     }
     if output.error:
         data["error"] = output.error
@@ -812,6 +925,7 @@ def main() -> None:
             "Usage: data_flow.py <language> <file1> [file2] ...",
             file=sys.stderr,
         )
+        print("   or: data_flow.py <language> --files-from <path>", file=sys.stderr)
         print("", file=sys.stderr)
         print(
             "Analyzes files for data flow vulnerabilities.",
@@ -823,7 +937,9 @@ def main() -> None:
         print("  typescript TypeScript/JavaScript (Express, Node)", file=sys.stderr)
         print("", file=sys.stderr)
         print("Output:", file=sys.stderr)
-        print("  JSON to stdout with sources, sinks, flows, nil_sources", file=sys.stderr)
+        print(
+            "  JSON to stdout with sources, sinks, flows, nil_sources", file=sys.stderr
+        )
         sys.exit(1)
 
     language = args[0].lower()
@@ -834,7 +950,19 @@ def main() -> None:
         )
         sys.exit(1)
 
-    files = args[1:]
+    file_args = args[1:]
+    files: list[str] = []
+    if len(file_args) >= 2 and file_args[0] == "--files-from":
+        manifest_path = file_args[1]
+        try:
+            with open(manifest_path, encoding="utf-8") as manifest:
+                files = [line.strip() for line in manifest.readlines() if line.strip()]
+        except OSError as e:
+            print(f"Error: failed to read file manifest: {e}", file=sys.stderr)
+            sys.exit(1)
+    else:
+        files = file_args
+
     if not files:
         print("Error: No files specified", file=sys.stderr)
         sys.exit(1)
@@ -844,10 +972,10 @@ def main() -> None:
 
     try:
         result = analyze(resolved_files, language)
-        print(output_to_json(result))
+        print(output_to_json(result, language))
     except Exception as e:
         output = AnalysisOutput(error=f"{type(e).__name__}: {e}")
-        print(output_to_json(output))
+        print(output_to_json(output, language))
         sys.exit(1)
 
 

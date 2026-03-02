@@ -7,22 +7,25 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"github.com/lerianstudio/mithril/internal/ast"
 	"github.com/lerianstudio/mithril/internal/dataflow"
 	"github.com/lerianstudio/mithril/internal/fileutil"
+	scopepkg "github.com/lerianstudio/mithril/internal/scope"
 )
 
 // ScopeFile represents the scope.json structure from Phase 0.
 // This is a simplified representation that supports both flat file lists
 // and language-categorized files.
 type ScopeFile struct {
-	Files     []string            `json:"-"` // Populated after parsing
-	Languages map[string][]string `json:"languages"`
+	Files           []string            `json:"-"` // Populated after parsing
+	Languages       []string            `json:"languages"`
+	FilesByLanguage map[string][]string `json:"-"`
 }
 
-// filesNested represents the nested files structure in scope.json.
+// filesNested represents the nested files structure in legacy scope.json variants.
 type filesNested struct {
 	Modified []string `json:"modified"`
 	Added    []string `json:"added"`
@@ -110,8 +113,14 @@ func run() error {
 
 	if *verbose {
 		fmt.Fprintf(os.Stderr, "Loaded %d files from scope\n", len(scope.Files))
-		for lang, files := range scope.Languages {
-			fmt.Fprintf(os.Stderr, "  %s: %d files\n", lang, len(files))
+		if len(scope.FilesByLanguage) > 0 {
+			for lang, files := range scope.FilesByLanguage {
+				fmt.Fprintf(os.Stderr, "  %s: %d files\n", lang, len(files))
+			}
+		} else {
+			for _, lang := range scope.Languages {
+				fmt.Fprintf(os.Stderr, "  %s: %d files\n", lang, len(getFilesForLanguage(scope, lang)))
+			}
 		}
 	}
 
@@ -211,27 +220,135 @@ func run() error {
 
 // validateFilePath ensures a file path is within the working directory to prevent path traversal.
 func validateFilePath(basePath, filePath string) (string, error) {
+	baseAbs, err := filepath.Abs(basePath)
+	if err != nil {
+		return "", fmt.Errorf("failed to resolve base path: %w", err)
+	}
+	baseCanonical := baseAbs
+	if resolvedBase, resolveErr := filepath.EvalSymlinks(baseAbs); resolveErr == nil {
+		baseCanonical = resolvedBase
+	}
+
 	validator, err := ast.NewPathValidator(basePath)
 	if err != nil {
 		return "", fmt.Errorf("invalid base path: %w", err)
 	}
-	validated, err := validator.ValidatePath(filePath)
+	candidate := filePath
+	if !filepath.IsAbs(candidate) {
+		candidate = filepath.Join(basePath, candidate)
+	}
+	validated, err := validator.ValidatePath(candidate)
 	if err != nil {
 		return "", fmt.Errorf("path traversal detected: %w", err)
 	}
-	return validated, nil
+	if !filepath.IsAbs(validated) {
+		validated = filepath.Join(baseCanonical, validated)
+	}
+	validatedAbs, err := filepath.Abs(validated)
+	if err != nil {
+		return "", fmt.Errorf("failed to resolve validated path: %w", err)
+	}
+	validatedCanonical := validatedAbs
+	if resolvedValidated, resolveErr := filepath.EvalSymlinks(validatedAbs); resolveErr == nil {
+		validatedCanonical = resolvedValidated
+	}
+
+	relPath, err := filepath.Rel(baseCanonical, validatedCanonical)
+	if err != nil {
+		return "", fmt.Errorf("failed to normalize validated path: %w", err)
+	}
+	relPath = filepath.Clean(relPath)
+	if relPath == ".." || strings.HasPrefix(relPath, ".."+string(filepath.Separator)) {
+		return "", fmt.Errorf("validated path escaped base directory")
+	}
+
+	return relPath, nil
 }
 
-// loadScope reads and parses scope.json, populating the Languages map if empty.
+// loadScope reads and parses scope.json.
+// It prefers the canonical scope reader and falls back to legacy formats for compatibility.
 // workDir is used to validate that all file paths are within the working directory.
 func loadScope(path string, workDir string) (*ScopeFile, error) {
+	canonicalScope, err := scopepkg.ReadScopeJSON(path)
+	if err == nil {
+		return buildScopeFromCanonical(canonicalScope, workDir)
+	}
+
+	legacyScope, legacyErr := loadLegacyScope(path, workDir)
+	if legacyErr != nil {
+		return nil, fmt.Errorf("failed to read scope via canonical and legacy parsers: canonical: %v; legacy: %w", err, legacyErr)
+	}
+
+	return legacyScope, nil
+}
+
+func buildScopeFromCanonical(canonical *scopepkg.ScopeJSON, workDir string) (*ScopeFile, error) {
+	scope := &ScopeFile{
+		Languages:       []string{},
+		FilesByLanguage: make(map[string][]string),
+	}
+
+	rawFiles := canonical.GetAllFiles()
+	if len(rawFiles) > MaxFiles {
+		return nil, fmt.Errorf("too many files: %d (max %d)", len(rawFiles), MaxFiles)
+	}
+
+	validatedFiles := make([]string, 0, len(rawFiles))
+	for _, f := range rawFiles {
+		validPath, err := validateFilePath(workDir, f)
+		if err != nil {
+			return nil, fmt.Errorf("invalid scope file path %q: %w", f, err)
+		}
+		validatedFiles = append(validatedFiles, validPath)
+	}
+	scope.Files = validatedFiles
+
+	seenLangs := make(map[string]struct{})
+	for _, lang := range canonical.Languages {
+		normalized := normalizeLanguage(lang)
+		if normalized == "" {
+			continue
+		}
+		if _, ok := seenLangs[normalized]; ok {
+			continue
+		}
+		seenLangs[normalized] = struct{}{}
+		scope.Languages = append(scope.Languages, normalized)
+	}
+
+	for _, file := range scope.Files {
+		lang := detectLanguage(file)
+		if lang == "" {
+			continue
+		}
+		scope.FilesByLanguage[lang] = append(scope.FilesByLanguage[lang], file)
+	}
+
+	if len(scope.Languages) == 0 {
+		for lang := range scope.FilesByLanguage {
+			scope.Languages = append(scope.Languages, lang)
+		}
+		sort.Strings(scope.Languages)
+	}
+
+	for _, lang := range scope.Languages {
+		if _, ok := scope.FilesByLanguage[lang]; !ok {
+			scope.FilesByLanguage[lang] = []string{}
+		}
+	}
+
+	return scope, nil
+}
+
+func loadLegacyScope(path string, workDir string) (*ScopeFile, error) {
 	data, err := fileutil.ReadJSONFileWithLimit(path)
 	if err != nil {
 		return nil, fmt.Errorf("reading scope file: %w", err)
 	}
 
 	scope := &ScopeFile{
-		Languages: make(map[string][]string),
+		Languages:       []string{},
+		FilesByLanguage: make(map[string][]string),
 	}
 
 	// Parse into generic map to handle polymorphic "files" field
@@ -270,9 +387,7 @@ func loadScope(path string, workDir string) (*ScopeFile, error) {
 	for _, f := range rawFiles {
 		validPath, err := validateFilePath(workDir, f)
 		if err != nil {
-			// Log warning but continue (don't fail on single bad path)
-			fmt.Fprintf(os.Stderr, "Warning: skipping invalid path: %v\n", err)
-			continue
+			return nil, fmt.Errorf("invalid scope file path %q: %w", f, err)
 		}
 		validatedFiles = append(validatedFiles, validPath)
 	}
@@ -280,17 +395,33 @@ func loadScope(path string, workDir string) (*ScopeFile, error) {
 
 	// Extract languages if present
 	if langRaw, ok := rawScope["languages"]; ok {
-		if err := json.Unmarshal(langRaw, &scope.Languages); err != nil {
-			// Ignore language parsing errors, will populate from files
-			scope.Languages = make(map[string][]string)
+		var langList []string
+		if err := json.Unmarshal(langRaw, &langList); err == nil {
+			scope.Languages = uniqueStrings(langList)
+		} else {
+			var langMap map[string][]string
+			if err := json.Unmarshal(langRaw, &langMap); err == nil {
+				scope.FilesByLanguage = make(map[string][]string, len(langMap))
+				for lang, files := range langMap {
+					scope.FilesByLanguage[lang] = files
+					scope.Languages = append(scope.Languages, lang)
+				}
+				sort.Strings(scope.Languages)
+			} else {
+				scope.Languages = []string{}
+				scope.FilesByLanguage = make(map[string][]string)
+			}
 		}
 	}
 	if scope.Languages == nil {
-		scope.Languages = make(map[string][]string)
+		scope.Languages = []string{}
+	}
+	if scope.FilesByLanguage == nil {
+		scope.FilesByLanguage = make(map[string][]string)
 	}
 
 	// Validate language file paths as well
-	for lang, files := range scope.Languages {
+	for lang, files := range scope.FilesByLanguage {
 		if len(files) > MaxFiles {
 			return nil, fmt.Errorf("too many files for language %s: %d (max %d)", lang, len(files), MaxFiles)
 		}
@@ -298,22 +429,28 @@ func loadScope(path string, workDir string) (*ScopeFile, error) {
 		for _, f := range files {
 			validPath, err := validateFilePath(workDir, f)
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "Warning: skipping invalid path in %s: %v\n", lang, err)
-				continue
+				return nil, fmt.Errorf("invalid %s scope path %q: %w", lang, f, err)
 			}
 			validatedLangFiles = append(validatedLangFiles, validPath)
 		}
-		scope.Languages[lang] = validatedLangFiles
+		scope.FilesByLanguage[lang] = validatedLangFiles
 	}
 
-	// Populate Languages map from Files if empty
-	if len(scope.Languages) == 0 && len(scope.Files) > 0 {
+	// Populate language-indexed files from Files if empty
+	if len(scope.FilesByLanguage) == 0 && len(scope.Files) > 0 {
 		for _, file := range scope.Files {
 			lang := detectLanguage(file)
 			if lang != "" {
-				scope.Languages[lang] = append(scope.Languages[lang], file)
+				scope.FilesByLanguage[lang] = append(scope.FilesByLanguage[lang], file)
 			}
 		}
+	}
+
+	if len(scope.Languages) == 0 && len(scope.FilesByLanguage) > 0 {
+		for lang := range scope.FilesByLanguage {
+			scope.Languages = append(scope.Languages, lang)
+		}
+		sort.Strings(scope.Languages)
 	}
 
 	return scope, nil
@@ -336,27 +473,35 @@ func detectLanguage(file string) string {
 
 // normalizeLanguage normalizes language names to canonical form.
 func normalizeLanguage(lang string) string {
-	switch strings.ToLower(lang) {
-	case "go", "golang":
-		return "go"
-	case "python", "py":
-		return "python"
-	case "typescript", "ts", "javascript", "js":
-		return "typescript"
-	default:
+	normalized := string(scopepkg.NormalizeLanguage(lang))
+	if normalized == "mixed" {
 		return ""
 	}
+	return normalized
 }
 
 // getFilesForLanguage returns files for a specific language from the scope.
 func getFilesForLanguage(scope *ScopeFile, lang string) []string {
-	// First, check the Languages map
-	if files, ok := scope.Languages[lang]; ok && len(files) > 0 {
+	// First, check language-indexed files
+	if files, ok := scope.FilesByLanguage[lang]; ok && len(files) > 0 {
 		return files
 	}
 
 	// Fall back to filtering Files by extension
 	return filterFilesByLanguage(scope.Files, lang)
+}
+
+func uniqueStrings(values []string) []string {
+	seen := make(map[string]struct{}, len(values))
+	result := make([]string, 0, len(values))
+	for _, value := range values {
+		if _, ok := seen[value]; ok {
+			continue
+		}
+		seen[value] = struct{}{}
+		result = append(result, value)
+	}
+	return result
 }
 
 // filterFilesByLanguage filters files by language extension.

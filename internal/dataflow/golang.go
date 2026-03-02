@@ -14,6 +14,11 @@ import (
 // MaxFileSize is the maximum file size to analyze (10MB - matches Python analyzer).
 const MaxFileSize = 10 * 1024 * 1024
 
+const (
+	defaultScannerBuffer = 64 * 1024
+	maxScannerBuffer     = 1024 * 1024
+)
+
 // sourcePattern defines a pattern for detecting untrusted data sources.
 type sourcePattern struct {
 	Type    SourceType
@@ -30,23 +35,33 @@ type sinkPattern struct {
 
 // GoAnalyzer implements data flow analysis for Go code.
 type GoAnalyzer struct {
-	workDir         string
-	sourcePatterns  []sourcePattern
-	sinkPatterns    []sinkPattern
-	sanitizerRegex  *regexp.Regexp
-	nilPatterns     []*regexp.Regexp
-	variableTracker map[string]Source
+	workDir        string
+	sourcePatterns []sourcePattern
+	sinkPatterns   []sinkPattern
+	sanitizerRegex *regexp.Regexp
+	nilPatterns    []*regexp.Regexp
 }
+
+var (
+	extractVariablePatterns = []*regexp.Regexp{
+		regexp.MustCompile(`(\w+)\s*(?:,\s*(?:err|ok|_))?\s*:?=`),
+		regexp.MustCompile(`^\s*(\w+)\s*=`),
+	}
+	extractFunctionNamePattern = regexp.MustCompile(`(\w+(?:\.\w+)*)\s*\(`)
+	assignmentCapturePattern   = regexp.MustCompile(`^\s*([A-Za-z_]\w*)\s*:?=\s*(.+)$`)
+	functionSignaturePattern   = regexp.MustCompile(`^\s*func\s+(?:\([^)]*\)\s*)?([A-Za-z_]\w*)\s*\(([^)]*)\)`)
+	basicCallPattern           = regexp.MustCompile(`([A-Za-z_]\w*)\s*\(([^)]*)\)`)
+	whitespaceCompactor        = strings.NewReplacer(" ", "", "\t", "")
+)
 
 // NewGoAnalyzer creates a new Go data flow analyzer.
 func NewGoAnalyzer(workDir string) *GoAnalyzer {
 	return &GoAnalyzer{
-		workDir:         workDir,
-		sourcePatterns:  initSourcePatterns(),
-		sinkPatterns:    initSinkPatterns(),
-		sanitizerRegex:  initSanitizerRegex(),
-		nilPatterns:     initNilPatterns(),
-		variableTracker: make(map[string]Source),
+		workDir:        workDir,
+		sourcePatterns: initSourcePatterns(),
+		sinkPatterns:   initSinkPatterns(),
+		sanitizerRegex: initSanitizerRegex(),
+		nilPatterns:    initNilPatterns(),
 	}
 }
 
@@ -105,6 +120,21 @@ func initSourcePatterns() []sourcePattern {
 			Type:    SourceHTTPQuery,
 			Pattern: regexp.MustCompile(`c\.QueryParam\s*\(`),
 			Desc:    "Echo query parameter",
+		},
+		{
+			Type:    SourceHTTPQuery,
+			Pattern: regexp.MustCompile(`(?:r|req|request)\.Cookie\s*\(`),
+			Desc:    "HTTP cookie value",
+		},
+		{
+			Type:    SourceHTTPQuery,
+			Pattern: regexp.MustCompile(`c\.Cookie\s*\(`),
+			Desc:    "Framework cookie value",
+		},
+		{
+			Type:    SourceHTTPQuery,
+			Pattern: regexp.MustCompile(`c\.(?:GetQuery|QueryArray|PostForm|PostFormArray)\s*\(`),
+			Desc:    "Gin parameter extraction",
 		},
 
 		// HTTP Headers
@@ -240,6 +270,16 @@ func initSourcePatterns() []sourcePattern {
 			Pattern: regexp.MustCompile(`fmt\.Scan(?:f|ln)?\s*\(`),
 			Desc:    "Console input",
 		},
+		{
+			Type:    SourceUserInput,
+			Pattern: regexp.MustCompile(`os\.Args(?:\[[^\]]+\])?`),
+			Desc:    "Command line arguments",
+		},
+		{
+			Type:    SourceHTTPBody,
+			Pattern: regexp.MustCompile(`grpc\.(?:UnaryServerInterceptor|StreamServerInterceptor)`),
+			Desc:    "gRPC interceptor input",
+		},
 	}
 }
 
@@ -289,6 +329,11 @@ func initSinkPatterns() []sinkPattern {
 			Pattern: regexp.MustCompile(`syscall\.Exec\s*\(`),
 			Desc:    "Syscall exec",
 		},
+		{
+			Type:    SinkRedirect,
+			Pattern: regexp.MustCompile(`(?:net\.Dial|net\.DialTimeout|http\.Get|http\.Post|http\.NewRequest(?:WithContext)?)\s*\(`),
+			Desc:    "Outbound network request",
+		},
 
 		// HTTP Response
 		{
@@ -320,6 +365,11 @@ func initSinkPatterns() []sinkPattern {
 			Type:    SinkResponse,
 			Pattern: regexp.MustCompile(`c\.(?:String|HTML|XML)\s*\(`),
 			Desc:    "Echo/Gin response",
+		},
+		{
+			Type:    SinkResponse,
+			Pattern: regexp.MustCompile(`(?:w|rw|writer|response)\.Header\s*\(\)\.Set\s*\(`),
+			Desc:    "HTTP response header write",
 		},
 
 		// Logging
@@ -370,6 +420,16 @@ func initSinkPatterns() []sinkPattern {
 			Pattern: regexp.MustCompile(`io\.(?:Copy|WriteString)\s*\(`),
 			Desc:    "IO write operation",
 		},
+		{
+			Type:    SinkFile,
+			Pattern: regexp.MustCompile(`filepath\.Join\s*\(`),
+			Desc:    "Path construction",
+		},
+		{
+			Type:    SinkFile,
+			Pattern: regexp.MustCompile(`os\.Open\s*\(`),
+			Desc:    "File open",
+		},
 
 		// Template Rendering
 		{
@@ -386,6 +446,11 @@ func initSinkPatterns() []sinkPattern {
 			Type:    SinkTemplate,
 			Pattern: regexp.MustCompile(`html/template.*Execute`),
 			Desc:    "HTML template execute",
+		},
+		{
+			Type:    SinkTemplate,
+			Pattern: regexp.MustCompile(`json\.Unmarshal\s*\(`),
+			Desc:    "JSON deserialization",
 		},
 
 		// Redirects
@@ -413,16 +478,9 @@ func initSanitizerRegex() *regexp.Regexp {
 		`html\.EscapeString`,
 		`url\.QueryEscape`,
 		`url\.PathEscape`,
+		`filepath\.(?:Clean|Base)`,
 		`strconv\.(?:Atoi|ParseInt|ParseFloat|ParseBool)`,
-		`regexp\.MustCompile.*MatchString`,
-		`strings\.(?:TrimSpace|ReplaceAll)`,
 		`template\.(?:HTMLEscapeString|JSEscapeString)`,
-		`sanitize\w*`,
-		`escape\w*`,
-		`validate\w*`,
-		`clean\w*`,
-		`filter\w*`,
-		`whitelist\w*`,
 		`sql\.Named`,
 		`pgx\.NamedArgs`,
 	}
@@ -493,15 +551,16 @@ func (g *GoAnalyzer) detectSourcesInFile(filePath string) ([]Source, error) {
 
 	var sources []Source
 	scanner := bufio.NewScanner(file)
+	scanner.Buffer(make([]byte, defaultScannerBuffer), maxScannerBuffer)
 	lineNum := 0
+	stripper := newCommentStripper()
 
 	for scanner.Scan() {
 		lineNum++
-		line := scanner.Text()
+		line := stripper.strip(scanner.Text())
 
-		// Skip comments
 		trimmed := strings.TrimSpace(line)
-		if strings.HasPrefix(trimmed, "//") || strings.HasPrefix(trimmed, "/*") {
+		if trimmed == "" {
 			continue
 		}
 
@@ -522,10 +581,6 @@ func (g *GoAnalyzer) detectSourcesInFile(filePath string) ([]Source, error) {
 
 				sources = append(sources, source)
 
-				// Track variable for flow analysis
-				if variable != "" {
-					g.variableTracker[variable] = source
-				}
 			}
 		}
 	}
@@ -570,15 +625,16 @@ func (g *GoAnalyzer) detectSinksInFile(filePath string) ([]Sink, error) {
 
 	var sinks []Sink
 	scanner := bufio.NewScanner(file)
+	scanner.Buffer(make([]byte, defaultScannerBuffer), maxScannerBuffer)
 	lineNum := 0
+	stripper := newCommentStripper()
 
 	for scanner.Scan() {
 		lineNum++
-		line := scanner.Text()
+		line := stripper.strip(scanner.Text())
 
-		// Skip comments
 		trimmed := strings.TrimSpace(line)
-		if strings.HasPrefix(trimmed, "//") || strings.HasPrefix(trimmed, "/*") {
+		if trimmed == "" {
 			continue
 		}
 
@@ -619,7 +675,7 @@ func (g *GoAnalyzer) TrackFlows(sources []Source, sinks []Sink, files []string) 
 		if err != nil {
 			continue
 		}
-		fileContents[filePath] = content
+		fileContents[filePath] = stripGoComments(content)
 	}
 
 	// Analyze each source-sink pair within the same file
@@ -658,22 +714,22 @@ func (g *GoAnalyzer) analyzeFlow(source Source, sink Sink, fileContents map[stri
 		return nil
 	}
 
+	trackedVars := trackDerivedVariables(lines, sourceVar, source.Line, sink.Line)
+
 	// Check if source variable appears in sink line
-	if sink.Line > 0 && sink.Line <= len(lines) {
-		sinkLine := lines[sink.Line-1]
-		if !strings.Contains(sinkLine, sourceVar) {
-			// Check for common transformations
-			if !containsVariableOrDerivative(sinkLine, sourceVar) {
-				return nil
-			}
-		}
+	sinkLine, ok := lineAt(lines, sink.Line)
+	if !ok {
+		return nil
+	}
+	if !containsAnyVariableOrDerivative(sinkLine, trackedVars) {
+		return nil
 	}
 
 	// Build flow path
 	path := buildFlowPath(source, sink, lines)
 
 	// Check for sanitization between source and sink
-	sanitized, sanitizers := g.checkSanitization(source.Line, sink.Line, lines)
+	sanitized, sanitizers := g.checkSanitization(source.Variable, source.Line, sink.Line, lines)
 
 	// Calculate risk level
 	risk := calculateRisk(source.Type, sink.Type, sanitized)
@@ -725,15 +781,14 @@ func (g *GoAnalyzer) detectNilSourcesInFile(filePath string) ([]NilSource, error
 	if err != nil {
 		return nil, err
 	}
+	cleanContent := stripGoComments(content)
 
 	var nilSources []NilSource
 	detectedVars := make(map[string]NilSource)
 
 	// First pass: detect variables that may be nil
-	for lineNum, line := range content {
-		// Skip comments
-		trimmed := strings.TrimSpace(line)
-		if strings.HasPrefix(trimmed, "//") || strings.HasPrefix(trimmed, "/*") {
+	for lineNum, line := range cleanContent {
+		if strings.TrimSpace(line) == "" {
 			continue
 		}
 
@@ -764,18 +819,20 @@ func (g *GoAnalyzer) detectNilSourcesInFile(filePath string) ([]NilSource, error
 	}
 
 	// Second pass: check for nil checks and usage
-	for lineNum, line := range content {
+	matchers := buildNilVarMatchers(detectedVars)
+	for lineNum, line := range cleanContent {
 		lineNumber := lineNum + 1
+		compact := compactLine(line)
 
 		for varName, nilSrc := range detectedVars {
 			// Skip if already marked as checked
 			if nilSrc.IsChecked {
 				continue
 			}
+			matcher := matchers[varName]
 
 			// Check for nil check
-			nilCheckPattern := regexp.MustCompile(fmt.Sprintf(`if\s+%s\s*[!=]=\s*nil|if\s+nil\s*[!=]=\s*%s|%s\s*!=\s*nil\s*{`, varName, varName, varName))
-			if nilCheckPattern.MatchString(line) && lineNumber > nilSrc.Line {
+			if matcher.hasNilCheck(compact) && lineNumber > nilSrc.Line {
 				nilSrc.IsChecked = true
 				nilSrc.CheckLine = lineNumber
 				detectedVars[varName] = nilSrc
@@ -783,8 +840,7 @@ func (g *GoAnalyzer) detectNilSourcesInFile(filePath string) ([]NilSource, error
 			}
 
 			// Check for usage without nil check
-			usagePattern := regexp.MustCompile(fmt.Sprintf(`%s\.|\*%s|%s\[`, varName, varName, varName))
-			if usagePattern.MatchString(line) && lineNumber > nilSrc.Line && !nilSrc.IsChecked {
+			if matcher.hasUsage(compact) && lineNumber > nilSrc.Line && !nilSrc.IsChecked {
 				nilSrc.UsageLine = lineNumber
 				nilSrc.Risk = RiskHigh
 				detectedVars[varName] = nilSrc
@@ -805,6 +861,66 @@ func (g *GoAnalyzer) detectNilSourcesInFile(filePath string) ([]NilSource, error
 	}
 
 	return nilSources, nil
+}
+
+type nilVarMatcher struct {
+	nilChecks []string
+	usages    []string
+}
+
+func buildNilVarMatchers(detectedVars map[string]NilSource) map[string]nilVarMatcher {
+	matchers := make(map[string]nilVarMatcher, len(detectedVars))
+	for name := range detectedVars {
+		matchers[name] = newNilVarMatcher(name)
+	}
+	return matchers
+}
+
+func newNilVarMatcher(varName string) nilVarMatcher {
+	return nilVarMatcher{
+		nilChecks: []string{
+			"if" + varName + "!=nil",
+			"if" + varName + "==nil",
+			"ifnil!=" + varName,
+			"ifnil==" + varName,
+			varName + "!=nil{",
+			varName + "==nil{",
+		},
+		usages: []string{
+			varName + ".",
+			"*" + varName,
+			varName + "[",
+		},
+	}
+}
+
+func compactLine(line string) string {
+	return whitespaceCompactor.Replace(line)
+}
+
+func lineAt(lines []string, lineNumber int) (string, bool) {
+	if lineNumber <= 0 || lineNumber > len(lines) {
+		return "", false
+	}
+	return lines[lineNumber-1], true
+}
+
+func (m nilVarMatcher) hasNilCheck(compactLine string) bool {
+	for _, token := range m.nilChecks {
+		if strings.Contains(compactLine, token) {
+			return true
+		}
+	}
+	return false
+}
+
+func (m nilVarMatcher) hasUsage(compactLine string) bool {
+	for _, token := range m.usages {
+		if strings.Contains(compactLine, token) {
+			return true
+		}
+	}
+	return false
 }
 
 // Analyze performs complete data flow analysis on the given files.
@@ -853,6 +969,14 @@ func isGoFile(path string) bool {
 
 // readFileLines reads a file into lines.
 func readFileLines(path string) ([]string, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return nil, err
+	}
+	if info.Size() > MaxFileSize {
+		return nil, fmt.Errorf("file too large: %d bytes (max %d)", info.Size(), MaxFileSize)
+	}
+
 	file, err := os.Open(path)
 	if err != nil {
 		return nil, err
@@ -861,21 +985,66 @@ func readFileLines(path string) ([]string, error) {
 
 	var lines []string
 	scanner := bufio.NewScanner(file)
+	scanner.Buffer(make([]byte, defaultScannerBuffer), maxScannerBuffer)
 	for scanner.Scan() {
 		lines = append(lines, scanner.Text())
 	}
 	return lines, scanner.Err()
 }
 
-// extractVariable extracts the variable name from an assignment line.
-func extractVariable(line string) string {
-	// Match patterns like: var := expr, var, err := expr, var = expr
-	patterns := []*regexp.Regexp{
-		regexp.MustCompile(`(\w+)\s*(?:,\s*(?:err|ok|_))?\s*:?=`),
-		regexp.MustCompile(`^\s*(\w+)\s*=`),
+type commentStripper struct {
+	inBlock bool
+}
+
+func newCommentStripper() *commentStripper {
+	return &commentStripper{}
+}
+
+func (s *commentStripper) strip(line string) string {
+	if line == "" {
+		return ""
 	}
 
-	for _, p := range patterns {
+	var builder strings.Builder
+	for i := 0; i < len(line); {
+		if s.inBlock {
+			end := strings.Index(line[i:], "*/")
+			if end == -1 {
+				return builder.String()
+			}
+			i += end + 2
+			s.inBlock = false
+			continue
+		}
+
+		if strings.HasPrefix(line[i:], "//") {
+			break
+		}
+		if strings.HasPrefix(line[i:], "/*") {
+			s.inBlock = true
+			i += 2
+			continue
+		}
+
+		builder.WriteByte(line[i])
+		i++
+	}
+
+	return builder.String()
+}
+
+func stripGoComments(lines []string) []string {
+	cleaned := make([]string, len(lines))
+	stripper := newCommentStripper()
+	for i, line := range lines {
+		cleaned[i] = stripper.strip(line)
+	}
+	return cleaned
+}
+
+// extractVariable extracts the variable name from an assignment line.
+func extractVariable(line string) string {
+	for _, p := range extractVariablePatterns {
 		if matches := p.FindStringSubmatch(line); len(matches) > 1 {
 			varName := matches[1]
 			// Skip common non-variable patterns
@@ -890,9 +1059,7 @@ func extractVariable(line string) string {
 
 // extractFunctionName extracts the function name from a call expression.
 func extractFunctionName(line string) string {
-	// Match patterns like: pkg.Function(, obj.Method(, Function(
-	pattern := regexp.MustCompile(`(\w+(?:\.\w+)*)\s*\(`)
-	if matches := pattern.FindStringSubmatch(line); len(matches) > 1 {
+	if matches := extractFunctionNamePattern.FindStringSubmatch(line); len(matches) > 1 {
 		return matches[1]
 	}
 	return ""
@@ -908,7 +1075,7 @@ func generateFlowID(source Source, sink Sink) string {
 // calculateRisk determines the risk level of a flow.
 func calculateRisk(sourceType SourceType, sinkType SinkType, sanitized bool) RiskLevel {
 	if sanitized {
-		return RiskLow
+		return RiskInfo
 	}
 
 	// Critical: User input to command execution or database (SQL injection)
@@ -950,17 +1117,61 @@ func calculateRisk(sourceType SourceType, sinkType SinkType, sanitized bool) Ris
 }
 
 // checkSanitization checks if data is sanitized between source and sink.
-func (g *GoAnalyzer) checkSanitization(sourceLine, sinkLine int, lines []string) (bool, []string) {
+func (g *GoAnalyzer) checkSanitization(sourceVar string, sourceLine, sinkLine int, lines []string) (bool, []string) {
 	var sanitizers []string
+	assignedSanitizedVars := make(map[string]struct{})
+	if sinkLine <= 0 || sourceLine <= 0 || sourceLine >= sinkLine {
+		return false, sanitizers
+	}
+	trackedVars := trackDerivedVariables(lines, sourceVar, sourceLine, sinkLine)
 
-	for i := sourceLine; i < sinkLine && i < len(lines); i++ {
+	start := sourceLine - 1
+	if start < 0 {
+		start = 0
+	}
+	end := sinkLine - 1
+	if end > len(lines) {
+		end = len(lines)
+	}
+
+	for i := start; i < end; i++ {
 		line := lines[i]
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "//") || strings.HasPrefix(trimmed, "/*") {
+			continue
+		}
+
+		if len(trackedVars) > 0 && !containsAnyVariableOrDerivative(line, trackedVars) {
+			continue
+		}
+
 		if matches := g.sanitizerRegex.FindAllString(line, -1); matches != nil {
 			sanitizers = append(sanitizers, matches...)
+			if assigned := extractVariable(line); assigned != "" {
+				assignedSanitizedVars[assigned] = struct{}{}
+			}
 		}
 	}
 
-	return len(sanitizers) > 0, sanitizers
+	if len(sanitizers) == 0 {
+		return false, sanitizers
+	}
+
+	sinkExpr := lines[sinkLine-1]
+	if g.sanitizerRegex.MatchString(sinkExpr) && containsAnyVariableOrDerivative(sinkExpr, trackedVars) {
+		return true, sanitizers
+	}
+
+	if len(assignedSanitizedVars) > 0 {
+		for assigned := range assignedSanitizedVars {
+			if containsVariableOrDerivative(sinkExpr, assigned) {
+				return true, sanitizers
+			}
+		}
+		return false, sanitizers
+	}
+
+	return true, sanitizers
 }
 
 // describeFlow generates a human-readable description of a flow.
@@ -1002,8 +1213,12 @@ func buildFlowPath(source Source, sink Sink, lines []string) []string {
 
 // containsVariableOrDerivative checks if line contains variable or a derivative.
 func containsVariableOrDerivative(line, varName string) bool {
+	if varName == "" {
+		return false
+	}
+
 	// Direct usage
-	if strings.Contains(line, varName) {
+	if containsIdentifier(line, varName) {
 		return true
 	}
 
@@ -1019,12 +1234,186 @@ func containsVariableOrDerivative(line, varName string) bool {
 	}
 
 	for _, d := range derivatives {
-		if strings.Contains(line, d) {
+		if containsIdentifier(line, d) || strings.Contains(line, d) {
 			return true
 		}
 	}
 
 	return false
+}
+
+func containsAnyVariableOrDerivative(line string, variables map[string]struct{}) bool {
+	for variable := range variables {
+		if containsVariableOrDerivative(line, variable) {
+			return true
+		}
+	}
+	return false
+}
+
+func trackDerivedVariables(lines []string, sourceVar string, sourceLine, sinkLine int) map[string]struct{} {
+	tracked := make(map[string]struct{})
+	if sourceVar == "" {
+		return tracked
+	}
+	tracked[sourceVar] = struct{}{}
+	functionParams := parseFunctionParameters(lines)
+
+	if sourceLine <= 0 || sinkLine <= 0 || sourceLine >= sinkLine {
+		return tracked
+	}
+
+	start := sourceLine - 1
+	if start < 0 {
+		start = 0
+	}
+	end := sinkLine - 1
+	if end > len(lines) {
+		end = len(lines)
+	}
+
+	for i := start; i < end; i++ {
+		line := strings.TrimSpace(lines[i])
+		if strings.HasPrefix(line, "//") || strings.HasPrefix(line, "/*") {
+			continue
+		}
+
+		matches := assignmentCapturePattern.FindStringSubmatch(line)
+		if len(matches) >= 3 {
+			assignedVar := matches[1]
+			if assignedVar != "" && assignedVar != "_" {
+				rhs := matches[2]
+				if containsAnyVariableOrDerivative(rhs, tracked) {
+					tracked[assignedVar] = struct{}{}
+				}
+			}
+			continue
+		}
+
+		for _, call := range basicCallPattern.FindAllStringSubmatch(line, -1) {
+			if len(call) < 3 {
+				continue
+			}
+			params, ok := functionParams[call[1]]
+			if !ok || len(params) == 0 {
+				continue
+			}
+
+			args := splitCallArguments(call[2])
+			for idx, arg := range args {
+				if idx >= len(params) {
+					break
+				}
+				if containsAnyVariableOrDerivative(arg, tracked) {
+					tracked[params[idx]] = struct{}{}
+				}
+			}
+		}
+	}
+
+	return tracked
+}
+
+func containsIdentifier(line, identifier string) bool {
+	if identifier == "" {
+		return false
+	}
+
+	searchFrom := 0
+	for {
+		idx := strings.Index(line[searchFrom:], identifier)
+		if idx == -1 {
+			return false
+		}
+		idx += searchFrom
+		startOK := idx == 0 || !isIdentifierChar(line[idx-1])
+		endIdx := idx + len(identifier)
+		endOK := endIdx == len(line) || !isIdentifierChar(line[endIdx])
+		if startOK && endOK {
+			return true
+		}
+		searchFrom = idx + 1
+		if searchFrom >= len(line) {
+			return false
+		}
+	}
+}
+
+func isIdentifierChar(ch byte) bool {
+	return (ch >= 'a' && ch <= 'z') ||
+		(ch >= 'A' && ch <= 'Z') ||
+		(ch >= '0' && ch <= '9') ||
+		ch == '_'
+}
+
+func parseFunctionParameters(lines []string) map[string][]string {
+	paramsByFunction := make(map[string][]string)
+	for _, rawLine := range lines {
+		line := strings.TrimSpace(rawLine)
+		matches := functionSignaturePattern.FindStringSubmatch(line)
+		if len(matches) < 3 {
+			continue
+		}
+
+		funcName := matches[1]
+		if funcName == "" {
+			continue
+		}
+
+		paramsByFunction[funcName] = extractParamNames(matches[2])
+	}
+	return paramsByFunction
+}
+
+func extractParamNames(paramList string) []string {
+	segments := strings.Split(paramList, ",")
+	names := make([]string, 0, len(segments))
+	for _, segment := range segments {
+		segment = strings.TrimSpace(segment)
+		if segment == "" {
+			continue
+		}
+
+		parts := strings.Fields(segment)
+		if len(parts) < 2 {
+			continue
+		}
+
+		for _, candidate := range strings.Split(parts[0], ",") {
+			candidate = strings.TrimSpace(candidate)
+			if candidate != "" {
+				names = append(names, candidate)
+			}
+		}
+	}
+	return names
+}
+
+func splitCallArguments(args string) []string {
+	if strings.TrimSpace(args) == "" {
+		return []string{}
+	}
+
+	result := make([]string, 0, 4)
+	start := 0
+	depth := 0
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case '(', '[', '{':
+			depth++
+		case ')', ']', '}':
+			if depth > 0 {
+				depth--
+			}
+		case ',':
+			if depth == 0 {
+				result = append(result, strings.TrimSpace(args[start:i]))
+				start = i + 1
+			}
+		}
+	}
+	result = append(result, strings.TrimSpace(args[start:]))
+	return result
 }
 
 // determineNilOrigin categorizes the source of a potentially nil value.

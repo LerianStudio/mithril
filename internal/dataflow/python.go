@@ -9,6 +9,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+
+	"github.com/lerianstudio/mithril/internal/procenv"
 )
 
 // PythonAnalyzer implements data flow analysis for Python and TypeScript
@@ -74,12 +76,28 @@ func (p *PythonAnalyzer) runScript(files []string) (*FlowAnalysis, error) {
 		}, nil
 	}
 
-	// Build command arguments: python3 script.py <language> <files...>
-	args := []string{p.scriptPath, p.language}
-	args = append(args, filteredFiles...)
+	manifest, err := os.CreateTemp("", "dataflow-files-*.txt")
+	if err != nil {
+		return nil, fmt.Errorf("creating file manifest: %w", err)
+	}
+	manifestPath := manifest.Name()
+	defer func() {
+		_ = manifest.Close()
+		_ = os.Remove(manifestPath)
+	}()
+
+	if _, err := manifest.WriteString(strings.Join(filteredFiles, "\n")); err != nil {
+		return nil, fmt.Errorf("writing file manifest: %w", err)
+	}
+	if err := manifest.Close(); err != nil {
+		return nil, fmt.Errorf("closing file manifest: %w", err)
+	}
+
+	// Build command arguments: python3 script.py <language> --files-from <manifest>
+	args := []string{p.scriptPath, p.language, "--files-from", manifestPath}
 
 	cmd := exec.Command("python3", args...) // #nosec G204 - args are controlled
-	cmd.Env = append([]string{"LC_ALL=C"}, os.Environ()...)
+	cmd.Env = procenv.Build()
 
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout

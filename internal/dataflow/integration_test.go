@@ -15,11 +15,7 @@ import (
 // with a Go file containing multiple security vulnerabilities.
 func TestIntegration_FullPipeline(t *testing.T) {
 	// Create temp directory for test files
-	tempDir, err := os.MkdirTemp("", "dataflow-integration-*")
-	if err != nil {
-		t.Fatalf("failed to create temp directory: %v", err)
-	}
-	defer os.RemoveAll(tempDir)
+	tempDir := t.TempDir()
 
 	// Create vulnerable Go file with multiple security issues
 	vulnGoFile := filepath.Join(tempDir, "vulnerable.go")
@@ -164,19 +160,31 @@ func getConfigSafe(key string) string {
 	criticalCount := 0
 	highCount := 0
 	sanitizedCount := 0
+	hasCommandInjection := false
+	hasXSSFlow := false
+	hasSanitizedQuery := false
 
 	for _, flow := range analysis.Flows {
 		switch flow.Risk {
 		case RiskCritical:
 			criticalCount++
 			t.Logf("Critical flow: %s -> %s (%s)", flow.Source.Type, flow.Sink.Type, flow.Description)
+			if flow.Source.Type == SourceHTTPQuery && flow.Sink.Type == SinkExec {
+				hasCommandInjection = true
+			}
 		case RiskHigh:
 			highCount++
 			t.Logf("High risk flow: %s -> %s (%s)", flow.Source.Type, flow.Sink.Type, flow.Description)
+			if flow.Source.Type == SourceHTTPQuery && flow.Sink.Type == SinkResponse {
+				hasXSSFlow = true
+			}
 		}
 		if flow.Sanitized {
 			sanitizedCount++
 			t.Logf("Sanitized flow: %s -> %s (sanitizers: %v)", flow.Source.Type, flow.Sink.Type, flow.Sanitizers)
+			if flow.Source.Type == SourceHTTPQuery && flow.Sink.Type == SinkDatabase {
+				hasSanitizedQuery = true
+			}
 		}
 	}
 
@@ -186,14 +194,23 @@ func getConfigSafe(key string) string {
 	if criticalCount < 1 {
 		t.Errorf("expected at least 1 critical flow (command injection), got %d", criticalCount)
 	}
+	if !hasCommandInjection {
+		t.Error("expected command injection flow (http_query -> exec) to be detected")
+	}
 
 	// Verify at least 1 high risk flow (XSS)
 	if highCount < 1 {
 		t.Errorf("expected at least 1 high risk flow (XSS), got %d", highCount)
 	}
+	if !hasXSSFlow {
+		t.Error("expected XSS flow (http_query -> response) to be detected")
+	}
 
 	// Log sanitized flow count (parameterized query should be detected as sanitized)
 	t.Logf("Sanitized flows: %d", sanitizedCount)
+	if sanitizedCount < 1 || !hasSanitizedQuery {
+		t.Error("expected parameterized query flow to be marked sanitized")
+	}
 
 	// Verify statistics
 	if analysis.Statistics.TotalFlows != len(analysis.Flows) {
@@ -221,14 +238,14 @@ func getConfigSafe(key string) string {
 	}
 
 	for _, section := range expectedSections {
-		if !containsString(summary, section) {
+		if !strings.Contains(summary, section) {
 			t.Errorf("security summary missing section: %q", section)
 		}
 	}
 
 	// Verify Critical & High Risk Flows section appears when there are issues
 	if criticalCount > 0 || highCount > 0 {
-		if !containsString(summary, "## Critical & High Risk Flows") {
+		if !strings.Contains(summary, "## Critical & High Risk Flows") {
 			t.Error("security summary missing '## Critical & High Risk Flows' section")
 		}
 	}
@@ -267,11 +284,7 @@ func TestIntegration_MultiLanguage(t *testing.T) {
 	}
 
 	// Create temp directory for test files
-	tempDir, err := os.MkdirTemp("", "dataflow-multilang-*")
-	if err != nil {
-		t.Fatalf("failed to create temp directory: %v", err)
-	}
-	defer os.RemoveAll(tempDir)
+	tempDir := t.TempDir()
 
 	// Create Go file with XSS vulnerability
 	goFile := filepath.Join(tempDir, "handler.go")
@@ -370,12 +383,12 @@ def get_user():
 	summary := GenerateSecuritySummary(analyses)
 
 	// Verify summary includes language breakdown
-	if !containsString(summary, "## Language Breakdown") {
+	if !strings.Contains(summary, "## Language Breakdown") {
 		t.Error("combined summary should include Language Breakdown section")
 	}
 
 	// Verify summary includes Go section
-	if !containsString(summary, "### Go") {
+	if !strings.Contains(summary, "### Go") {
 		t.Error("combined summary should include Go language section")
 	}
 
@@ -385,9 +398,4 @@ def get_user():
 		t.Errorf("failed to write combined summary: %v", err)
 	}
 	t.Logf("Combined summary written to: %s", summaryPath)
-}
-
-// containsString checks if string s contains substring substr.
-func containsString(s, substr string) bool {
-	return strings.Contains(s, substr)
 }

@@ -1,6 +1,7 @@
 package dataflow
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -176,6 +177,75 @@ func vulnerableHandler(db *sql.DB, r *http.Request) {
 		}
 	}
 	assert.True(t, foundCritical, "Expected to find a Critical risk flow for SQL injection")
+}
+
+func TestGoAnalyzer_TrackFlows_TracksDerivedAssignments(t *testing.T) {
+	tmpDir := t.TempDir()
+	testFile := filepath.Join(tmpDir, "derived.go")
+	content := `package main
+
+import (
+	"database/sql"
+	"net/http"
+)
+
+func handler(db *sql.DB, r *http.Request) {
+	userInput := r.URL.Query().Get("q")
+	query := userInput
+	db.Exec(query)
+}
+`
+	err := os.WriteFile(testFile, []byte(content), 0o644)
+	require.NoError(t, err)
+
+	analyzer := NewGoAnalyzer(tmpDir)
+	sources, err := analyzer.DetectSources([]string{testFile})
+	require.NoError(t, err)
+	require.NotEmpty(t, sources)
+
+	sinks, err := analyzer.DetectSinks([]string{testFile})
+	require.NoError(t, err)
+	require.NotEmpty(t, sinks)
+
+	flows, err := analyzer.TrackFlows(sources, sinks, []string{testFile})
+	require.NoError(t, err)
+	require.NotEmpty(t, flows, "expected flow when sink uses derived variable")
+}
+
+func TestGoAnalyzer_TrackFlows_TracksSimpleCrossFunctionArgumentFlow(t *testing.T) {
+	tmpDir := t.TempDir()
+	testFile := filepath.Join(tmpDir, "crossfunc.go")
+	content := `package main
+
+import (
+	"database/sql"
+	"net/http"
+)
+
+func handler(db *sql.DB, r *http.Request) {
+	userInput := r.URL.Query().Get("q")
+	processQuery(db, userInput)
+}
+
+func processQuery(db *sql.DB, q string) {
+	db.Exec(q)
+}
+`
+	err := os.WriteFile(testFile, []byte(content), 0o644)
+	require.NoError(t, err)
+
+	analyzer := NewGoAnalyzer(tmpDir)
+	sources, err := analyzer.DetectSources([]string{testFile})
+	require.NoError(t, err)
+	require.NotEmpty(t, sources)
+
+	sinks, err := analyzer.DetectSinks([]string{testFile})
+	require.NoError(t, err)
+	require.NotEmpty(t, sinks)
+
+	flows, err := analyzer.TrackFlows(sources, sinks, []string{testFile})
+	require.NoError(t, err)
+	require.NotEmpty(t, flows, "expected flow when source is passed as function argument")
 }
 
 func TestGoAnalyzer_DetectNilSources(t *testing.T) {
@@ -361,11 +431,11 @@ func TestCalculateRisk(t *testing.T) {
 			expected:   RiskLow,
 		},
 		{
-			name:       "Sanitized Critical becomes Low",
+			name:       "Sanitized Critical becomes Info",
 			sourceType: SourceHTTPQuery,
 			sinkType:   SinkExec,
 			sanitized:  true,
-			expected:   RiskLow,
+			expected:   RiskInfo,
 		},
 		{
 			name:       "HTTP Header to Exec - Critical",
@@ -433,6 +503,7 @@ func TestCheckSanitization(t *testing.T) {
 	tests := []struct {
 		name       string
 		lines      []string
+		sourceVar  string
 		sourceLine int
 		sinkLine   int
 		sanitized  bool
@@ -446,6 +517,7 @@ func TestCheckSanitization(t *testing.T) {
 			sourceLine: 1,
 			sinkLine:   2,
 			sanitized:  false,
+			sourceVar:  "userID",
 		},
 		{
 			name: "html.EscapeString - sanitized",
@@ -457,6 +529,7 @@ func TestCheckSanitization(t *testing.T) {
 			sourceLine: 1,
 			sinkLine:   3,
 			sanitized:  true,
+			sourceVar:  "name",
 		},
 		{
 			name: "url.QueryEscape - sanitized",
@@ -468,6 +541,7 @@ func TestCheckSanitization(t *testing.T) {
 			sourceLine: 1,
 			sinkLine:   3,
 			sanitized:  true,
+			sourceVar:  "path",
 		},
 		{
 			name: "strconv.Atoi - sanitized",
@@ -479,9 +553,10 @@ func TestCheckSanitization(t *testing.T) {
 			sourceLine: 1,
 			sinkLine:   3,
 			sanitized:  true,
+			sourceVar:  "idStr",
 		},
 		{
-			name: "Custom sanitize function - sanitized",
+			name: "Custom sanitize function is not implicitly trusted",
 			lines: []string{
 				"input := r.URL.Query().Get(\"input\")",
 				"clean := sanitizeInput(input)",
@@ -489,10 +564,11 @@ func TestCheckSanitization(t *testing.T) {
 			},
 			sourceLine: 1,
 			sinkLine:   3,
-			sanitized:  true,
+			sanitized:  false,
+			sourceVar:  "input",
 		},
 		{
-			name: "Validate function - sanitized",
+			name: "Validate helper is not implicitly trusted",
 			lines: []string{
 				"email := r.URL.Query().Get(\"email\")",
 				"if validateEmail(email) {",
@@ -501,7 +577,8 @@ func TestCheckSanitization(t *testing.T) {
 			},
 			sourceLine: 1,
 			sinkLine:   3,
-			sanitized:  true,
+			sanitized:  false,
+			sourceVar:  "email",
 		},
 		{
 			name: "No sanitization between source and sink",
@@ -512,6 +589,7 @@ func TestCheckSanitization(t *testing.T) {
 			sourceLine: 1,
 			sinkLine:   2,
 			sanitized:  false,
+			sourceVar:  "input",
 		},
 		{
 			name: "template.HTMLEscapeString - sanitized",
@@ -523,6 +601,7 @@ func TestCheckSanitization(t *testing.T) {
 			sourceLine: 1,
 			sinkLine:   3,
 			sanitized:  true,
+			sourceVar:  "content",
 		},
 		{
 			name: "pgx.NamedArgs - sanitized",
@@ -534,16 +613,125 @@ func TestCheckSanitization(t *testing.T) {
 			sourceLine: 1,
 			sinkLine:   3,
 			sanitized:  true,
+			sourceVar:  "name",
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			sanitized, sanitizers := analyzer.checkSanitization(tt.sourceLine, tt.sinkLine, tt.lines)
+			sanitized, sanitizers := analyzer.checkSanitization(tt.sourceVar, tt.sourceLine, tt.sinkLine, tt.lines)
 			assert.Equal(t, tt.sanitized, sanitized, "Sanitization detection mismatch for %s", tt.name)
 
 			if tt.sanitized {
 				assert.NotEmpty(t, sanitizers, "Expected sanitizers to be detected for %s", tt.name)
+			}
+		})
+	}
+}
+
+func TestCheckSanitization_AvoidsFalseNegativesOnConfiguredSanitizers(t *testing.T) {
+	analyzer := NewGoAnalyzer(t.TempDir())
+
+	tests := []struct {
+		name       string
+		line       string
+		sinkTarget string
+	}{
+		{name: "url path escape", line: `safe := url.PathEscape(input)`, sinkTarget: "safe"},
+		{name: "filepath clean", line: `cleanPath := filepath.Clean(input)`, sinkTarget: "cleanPath"},
+		{name: "template js escape", line: `safeJS := template.JSEscapeString(input)`, sinkTarget: "safeJS"},
+		{name: "sql named args", line: `args := sql.Named("name", input)`, sinkTarget: "args"},
+		{name: "pgx named args", line: `args := pgx.NamedArgs{"name": input}`, sinkTarget: "args"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			lines := []string{
+				"input := r.URL.Query().Get(\"name\")",
+				tt.line,
+				fmt.Sprintf("db.Exec(query, %s)", tt.sinkTarget),
+			}
+
+			sanitized, sanitizers := analyzer.checkSanitization("input", 1, 3, lines)
+			if !sanitized {
+				t.Fatalf("expected sanitizer detection for %q", tt.line)
+			}
+			if len(sanitizers) == 0 {
+				t.Fatalf("expected matched sanitizers for %q", tt.line)
+			}
+		})
+	}
+}
+
+func TestCheckSanitization_AvoidsFalsePositives(t *testing.T) {
+	analyzer := NewGoAnalyzer(t.TempDir())
+
+	tests := []struct {
+		name      string
+		sourceVar string
+		lines     []string
+	}{
+		{
+			name:      "sanitizer on different variable",
+			sourceVar: "input",
+			lines: []string{
+				"input := r.URL.Query().Get(\"name\")",
+				"safeOther := html.EscapeString(other)",
+				"db.Exec(query, input)",
+			},
+		},
+		{
+			name:      "sanitizer in comment",
+			sourceVar: "input",
+			lines: []string{
+				"input := r.URL.Query().Get(\"name\")",
+				"// safe := html.EscapeString(input)",
+				"db.Exec(query, input)",
+			},
+		},
+		{
+			name:      "sanitizer result unused",
+			sourceVar: "input",
+			lines: []string{
+				"input := r.URL.Query().Get(\"name\")",
+				"safe := html.EscapeString(input)",
+				"db.Exec(query, input)",
+			},
+		},
+		{
+			name:      "cleanup helper is not sanitizer",
+			sourceVar: "input",
+			lines: []string{
+				"input := r.URL.Query().Get(\"name\")",
+				"cleaned := cleanupTempDir(input)",
+				"db.Exec(query, cleaned)",
+			},
+		},
+		{
+			name:      "filter helper is not sanitizer",
+			sourceVar: "input",
+			lines: []string{
+				"input := r.URL.Query().Get(\"name\")",
+				"filtered := filterByDate(input)",
+				"db.Exec(query, filtered)",
+			},
+		},
+		{
+			name:      "trimspace is not sanitizer",
+			sourceVar: "input",
+			lines: []string{
+				"input := r.URL.Query().Get(\"name\")",
+				"trimmed := strings.TrimSpace(input)",
+				"db.Exec(query, trimmed)",
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			sanitized, _ := analyzer.checkSanitization(tt.sourceVar, 1, 3, tt.lines)
+			if sanitized {
+				t.Fatalf("expected unsanitized flow for %s", tt.name)
 			}
 		})
 	}
@@ -828,6 +1016,12 @@ func TestContainsVariableOrDerivative(t *testing.T) {
 			varName:  "userID",
 			expected: false,
 		},
+		{
+			name:     "Identifier boundary prevents false match",
+			line:     "fmt.Println(userID2)",
+			varName:  "userID",
+			expected: false,
+		},
 	}
 
 	for _, tt := range tests {
@@ -940,4 +1134,18 @@ func TestDescribeFlow(t *testing.T) {
 	descSanitized := describeFlow(source, sink, true)
 	assert.Contains(t, descSanitized, "sanitized")
 	assert.NotContains(t, descSanitized, "unsanitized")
+}
+
+func TestReadFileLines_RejectsOversizedFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "large.go")
+	file, err := os.Create(path)
+	require.NoError(t, err)
+
+	err = file.Truncate(MaxFileSize + 1)
+	require.NoError(t, err)
+	require.NoError(t, file.Close())
+
+	_, err = readFileLines(path)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "file too large")
 }
