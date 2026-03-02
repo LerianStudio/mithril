@@ -14,3 +14,11 @@ coverage.out
 # OS files
 .DS_Store
 Thumbs.db
+
+# Generated analysis artifacts
+.ring/codereview/
+docs/codereview/
+
+# Python bytecode cache
+py/__pycache__/
+*.pyc
