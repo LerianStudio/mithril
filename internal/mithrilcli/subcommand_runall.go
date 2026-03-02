@@ -24,7 +24,10 @@ type runAllConfig struct {
 	headRef   string
 	files     string
 	filesFrom string
+	compare   bool
+	staged    bool
 	unstaged  bool
+	allMod    bool
 	outputDir string
 	skip      string
 	verbose   bool
@@ -50,9 +53,12 @@ func runAll(args []string, stdout io.Writer, stderr io.Writer) error {
 	cfg := &runAllConfig{}
 	fs.StringVar(&cfg.baseRef, "base", "main", "Base git reference (commit/branch)")
 	fs.StringVar(&cfg.headRef, "head", "HEAD", "Head git reference (commit/branch)")
+	fs.BoolVar(&cfg.compare, "compare", false, "Compare refs using --base/--head")
+	fs.BoolVar(&cfg.staged, "staged", false, "Analyze only staged files")
 	fs.StringVar(&cfg.files, "files", "", "Comma-separated file patterns to analyze")
 	fs.StringVar(&cfg.filesFrom, "files-from", "", "Path to file containing file patterns")
 	fs.BoolVar(&cfg.unstaged, "unstaged", false, "Analyze only unstaged and untracked files")
+	fs.BoolVar(&cfg.allMod, "all-modified", false, "Analyze all modified files (staged + unstaged)")
 	fs.StringVar(&cfg.outputDir, "output", ".ring/codereview", "Output directory for all phase results")
 	fs.StringVar(&cfg.skip, "skip", "", "Comma-separated list of phases to skip")
 	fs.BoolVar(&cfg.verbose, "verbose", false, "Enable verbose output")
@@ -134,10 +140,45 @@ func validateRunAllFlags(fs *flag.FlagSet, cfg *runAllConfig, stderr io.Writer) 
 			headSet = true
 		}
 	})
-	if cfg.unstaged && (filesSelected || baseSet || headSet) {
-		_, _ = fmt.Fprintln(stderr, "Error: --unstaged cannot be used with --files/--files-from or --base/--head")
+	if baseSet || headSet {
+		cfg.compare = true
+	}
+
+	modeCount := 0
+	if cfg.compare {
+		modeCount++
+	}
+	if cfg.staged {
+		modeCount++
+	}
+	if cfg.unstaged {
+		modeCount++
+	}
+	if cfg.allMod {
+		modeCount++
+	}
+	if filesSelected {
+		modeCount++
+	}
+
+	if modeCount > 1 {
+		_, _ = fmt.Fprintln(stderr, "Error: choose only one mode: --compare, --staged, --unstaged, --all-modified, or --files/--files-from")
 		return fmt.Errorf("invalid flag combination")
 	}
+	if modeCount == 0 {
+		cfg.compare = true
+	}
+	if cfg.compare && !baseSet {
+		cfg.baseRef = "main"
+	}
+	if cfg.compare && !headSet {
+		cfg.headRef = "HEAD"
+	}
+	if !cfg.compare {
+		cfg.baseRef = ""
+		cfg.headRef = ""
+	}
+
 	if filesSelected && (baseSet || headSet) {
 		_, _ = fmt.Fprintln(stderr, "Error: --files/--files-from cannot be used with --base/--head")
 		return fmt.Errorf("invalid flag combination")
@@ -149,6 +190,10 @@ func runScopePhase(cfg *runAllConfig, _ io.Writer, stderr io.Writer) error {
 	args := []string{"--output", filepath.Join(cfg.outputDir, "scope.json")}
 	if cfg.unstaged {
 		args = append(args, "--unstaged")
+	} else if cfg.staged {
+		args = append(args, "--staged")
+	} else if cfg.allMod {
+		args = append(args, "--all-modified")
 	} else if cfg.files != "" || cfg.filesFrom != "" {
 		if cfg.files != "" {
 			args = append(args, "--files", cfg.files)
@@ -174,10 +219,13 @@ func runStaticAnalysisPhase(cfg *runAllConfig, stdout io.Writer, stderr io.Write
 }
 
 func runASTPhase(cfg *runAllConfig, stdout io.Writer, stderr io.Writer) error {
-	batchPath, _, err := generateASTBatchFile(cfg)
+	batchPath, tempDir, err := generateASTBatchFile(cfg)
 	if err != nil {
 		return err
 	}
+	defer func() {
+		_ = os.RemoveAll(tempDir)
+	}()
 	args := []string{"--batch", batchPath, "--output", "json"}
 	if cfg.verbose {
 		args = append(args, "-v")
@@ -309,7 +357,7 @@ func generateASTBatchFile(cfg *runAllConfig) (string, string, error) {
 	if beforeRef == "" {
 		beforeRef = cfg.baseRef
 	}
-	tempDir, err := os.MkdirTemp(cfg.outputDir, "ast-before-*")
+	tempDir, err := os.MkdirTemp("", "mithril-ast-before-*")
 	if err != nil {
 		return "", "", fmt.Errorf("failed to create temp directory: %w", err)
 	}

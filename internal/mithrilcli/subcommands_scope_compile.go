@@ -74,7 +74,9 @@ func runScopeDetector(args []string, stdout io.Writer, stderr io.Writer) error {
 	headRef := fs.String("head", "", "Head reference (commit/branch). When both refs empty, detects all uncommitted changes")
 	filesFlag := fs.String("files", "", "Comma-separated file patterns to analyze (mutually exclusive with --base/--head)")
 	filesFrom := fs.String("files-from", "", "Path to file containing file patterns (one per line)")
+	staged := fs.Bool("staged", false, "Analyze only staged files")
 	unstaged := fs.Bool("unstaged", false, "Analyze only unstaged and untracked files")
+	allModified := fs.Bool("all-modified", false, "Analyze all modified files (staged + unstaged)")
 	outputPath := fs.String("output", "", "Output file path. Empty = write to stdout")
 	workDir := fs.String("workdir", "", "Working directory. Empty = current directory")
 	verbose := fs.Bool("v", false, "Enable verbose output")
@@ -113,9 +115,23 @@ func runScopeDetector(args []string, stdout io.Writer, stderr io.Writer) error {
 		err    error
 	)
 
+	modeCount := 0
+	if *staged {
+		modeCount++
+	}
+	if *unstaged {
+		modeCount++
+	}
+	if *allModified {
+		modeCount++
+	}
+	if modeCount > 1 {
+		return fmt.Errorf("--staged, --unstaged, and --all-modified are mutually exclusive")
+	}
+
 	if len(patterns) > 0 {
-		if *baseRef != "" || *headRef != "" || *unstaged {
-			return fmt.Errorf("--files/--files-from cannot be used with --base/--head or --unstaged")
+		if *baseRef != "" || *headRef != "" || *staged || *unstaged || *allModified {
+			return fmt.Errorf("--files/--files-from cannot be used with --base/--head, --staged, --unstaged, or --all-modified")
 		}
 		expanded, expandErr := scope.ExpandFilePatterns(wd, patterns)
 		if expandErr != nil {
@@ -127,11 +143,21 @@ func runScopeDetector(args []string, stdout io.Writer, stderr io.Writer) error {
 		} else {
 			result, err = detector.DetectFromFiles("", expanded)
 		}
+	} else if *staged {
+		if *baseRef != "" || *headRef != "" {
+			return fmt.Errorf("--staged cannot be used with --base/--head")
+		}
+		result, err = detector.DetectStagedChanges()
 	} else if *unstaged {
 		if *baseRef != "" || *headRef != "" {
 			return fmt.Errorf("--unstaged cannot be used with --base/--head")
 		}
 		result, err = detector.DetectUnstagedChanges()
+	} else if *allModified {
+		if *baseRef != "" || *headRef != "" {
+			return fmt.Errorf("--all-modified cannot be used with --base/--head")
+		}
+		result, err = detector.DetectAllChanges()
 	} else if *baseRef == "" && *headRef == "" {
 		result, err = detector.DetectAllChanges()
 	} else {
@@ -206,7 +232,7 @@ func readPatternsFile(path string) ([]string, error) {
 		return nil, fmt.Errorf("patterns file path invalid: %w", err)
 	}
 
-	file, err := os.Open(cleaned)
+	file, err := os.Open(cleaned) // #nosec G304 -- ValidatePath rejects traversal and constrains path to workspace root
 	if err != nil {
 		return nil, fmt.Errorf("failed to read patterns file: %w", err)
 	}

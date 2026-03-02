@@ -152,7 +152,9 @@ func TestMain_Help(t *testing.T) {
 		"-head",
 		"-files",
 		"-files-from",
+		"-staged",
 		"-unstaged",
+		"-all-modified",
 		"-output",
 		"-workdir",
 		"-version",
@@ -164,6 +166,46 @@ func TestMain_Help(t *testing.T) {
 		if !strings.Contains(outputStr, expected) {
 			t.Errorf("Help output missing expected string %q\nOutput: %s", expected, outputStr)
 		}
+	}
+}
+
+func TestMain_InvalidModeCombinations(t *testing.T) {
+	binaryPath := buildTestBinary(t)
+	defer cleanupTestBinary(t, binaryPath)
+
+	tests := []struct {
+		name        string
+		args        []string
+		wantMessage string
+	}{
+		{
+			name:        "staged and unstaged conflict",
+			args:        []string{"--staged", "--unstaged"},
+			wantMessage: "mutually exclusive",
+		},
+		{
+			name:        "all-modified with refs conflict",
+			args:        []string{"--all-modified", "--base=main"},
+			wantMessage: "--all-modified cannot be used with --base/--head",
+		},
+		{
+			name:        "files with staged conflict",
+			args:        []string{"--files=*.go", "--staged"},
+			wantMessage: "--files/--files-from cannot be used",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cmd := exec.Command(binaryPath, tt.args...)
+			output, err := cmd.CombinedOutput()
+			if err == nil {
+				t.Fatalf("expected command to fail, output: %s", string(output))
+			}
+			if !strings.Contains(string(output), tt.wantMessage) {
+				t.Fatalf("expected output to contain %q, got: %s", tt.wantMessage, string(output))
+			}
+		})
 	}
 }
 

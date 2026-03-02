@@ -20,14 +20,6 @@ func (d *Detector) DetectFromFiles(baseRef string, files []string) (*ScopeResult
 		return nil, fmt.Errorf("no valid files provided")
 	}
 
-	workDir := d.workDir
-	if workDir == "" {
-		cwd, err := os.Getwd()
-		if err != nil {
-			return nil, fmt.Errorf("failed to get working directory: %w", err)
-		}
-		workDir = cwd
-	}
 	if baseRef == "" {
 		baseRef = "HEAD"
 	}

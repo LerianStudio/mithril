@@ -761,6 +761,72 @@ func TestDetector_DetectAllChanges(t *testing.T) {
 	}
 }
 
+func TestDetector_DetectStagedChanges(t *testing.T) {
+	tests := []struct {
+		name        string
+		mockResult  *git.DiffResult
+		mockErr     error
+		checkResult func(*testing.T, *ScopeResult)
+	}{
+		{
+			name: "successful detection",
+			mockResult: &git.DiffResult{
+				BaseRef: "HEAD",
+				HeadRef: "index",
+				Files: []git.ChangedFile{
+					{Path: "internal/app/service.go", Status: git.StatusModified, Additions: 8, Deletions: 2},
+				},
+				Stats: git.DiffStats{TotalFiles: 1, TotalAdditions: 8, TotalDeletions: 2},
+			},
+			checkResult: func(t *testing.T, r *ScopeResult) {
+				if r.Language != "go" {
+					t.Errorf("Language = %q, want %q", r.Language, "go")
+				}
+				if r.BaseRef != "HEAD" {
+					t.Errorf("BaseRef = %q, want %q", r.BaseRef, "HEAD")
+				}
+				if r.HeadRef != "index" {
+					t.Errorf("HeadRef = %q, want %q", r.HeadRef, "index")
+				}
+			},
+		},
+		{
+			name:       "staged diff error propagates",
+			mockResult: nil,
+			mockErr:    errors.New("staged diff failed"),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			d := NewDetector("")
+			d.gitClient = &mockGitClient{
+				stagedResult: tt.mockResult,
+				stagedErr:    tt.mockErr,
+			}
+
+			result, err := d.DetectStagedChanges()
+			if tt.mockErr != nil {
+				if err == nil {
+					t.Fatalf("DetectStagedChanges() expected error")
+				}
+				if !strings.Contains(err.Error(), tt.mockErr.Error()) {
+					t.Fatalf("DetectStagedChanges() error = %v, want containing %q", err, tt.mockErr.Error())
+				}
+				return
+			}
+
+			if err != nil {
+				t.Fatalf("DetectStagedChanges() unexpected error: %v", err)
+			}
+
+			if tt.checkResult != nil {
+				tt.checkResult(t, result)
+			}
+		})
+	}
+}
+
 func TestDetector_DetectUnstagedChanges(t *testing.T) {
 	workDir := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(workDir, "cmd"), 0o755); err != nil {
@@ -840,6 +906,8 @@ type mockGitClient struct {
 	diffErr          error
 	allChangesResult *git.DiffResult
 	allChangesErr    error
+	stagedResult     *git.DiffResult
+	stagedErr        error
 	unstagedFiles    []string
 	unstagedErr      error
 	stats            git.DiffStats
@@ -900,6 +968,13 @@ func (m *mockGitClient) GetAllChangesDiff() (*git.DiffResult, error) {
 		return nil, m.allChangesErr
 	}
 	return m.allChangesResult, nil
+}
+
+func (m *mockGitClient) GetStagedDiff() (*git.DiffResult, error) {
+	if m.stagedErr != nil {
+		return nil, m.stagedErr
+	}
+	return m.stagedResult, nil
 }
 
 func (m *mockGitClient) GetDiffStatsForFiles(baseRef string, files []string) (git.DiffStats, map[string]git.FileStats, error) {

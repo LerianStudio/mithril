@@ -64,6 +64,7 @@ type ScopeResult struct {
 type gitClientInterface interface {
 	GetDiff(baseRef, headRef string) (*git.DiffResult, error)
 	GetAllChangesDiff() (*git.DiffResult, error)
+	GetStagedDiff() (*git.DiffResult, error)
 	GetDiffStatsForFiles(baseRef string, files []string) (git.DiffStats, map[string]git.FileStats, error)
 	FileExistsAtRef(ref, path string) (bool, error)
 	ListUnstagedFiles() ([]string, error)
@@ -103,6 +104,16 @@ func (d *Detector) DetectAllChanges() (*ScopeResult, error) {
 	return d.buildScopeResult(diffResult)
 }
 
+// DetectStagedChanges analyzes only staged changes (index vs HEAD).
+func (d *Detector) DetectStagedChanges() (*ScopeResult, error) {
+	diffResult, err := d.gitClient.GetStagedDiff()
+	if err != nil {
+		return nil, err
+	}
+
+	return d.buildScopeResult(diffResult)
+}
+
 // DetectUnstagedChanges analyzes only unstaged and untracked files.
 func (d *Detector) DetectUnstagedChanges() (*ScopeResult, error) {
 	files, err := d.gitClient.ListUnstagedFiles()
@@ -115,6 +126,7 @@ func (d *Detector) DetectUnstagedChanges() (*ScopeResult, error) {
 	return d.buildScopeResultFromFiles("HEAD", files)
 }
 
+// buildScopeResultFromFiles analyzes a list of files against a base ref.
 func (d *Detector) buildScopeResultFromFiles(baseRef string, files []string) (*ScopeResult, error) {
 	cleanFiles := normalizeFileList(files)
 	if len(cleanFiles) == 0 {
@@ -135,7 +147,13 @@ func (d *Detector) buildScopeResultFromFiles(baseRef string, files []string) (*S
 		if status == git.StatusUnknown {
 			status = git.StatusModified
 		}
-		fileStats := findFileStats(statsByFile, file)
+
+		// Ensure statsByFile is not nil and handles missing entries gracefully
+		var fileStats git.FileStats
+		if statsByFile != nil {
+			fileStats = findFileStats(statsByFile, file)
+		}
+
 		changedFiles = append(changedFiles, git.ChangedFile{
 			Path:      file,
 			Status:    status,

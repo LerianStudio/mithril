@@ -7,6 +7,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"path/filepath"
 
 	"github.com/lerianstudio/mithril/internal/fileutil"
 	"github.com/lerianstudio/mithril/internal/output"
@@ -21,7 +22,9 @@ var (
 	headRef     = flag.String("head", "", "Head reference (commit/branch). When both refs empty, detects all uncommitted changes")
 	filesFlag   = flag.String("files", "", "Comma-separated file patterns to analyze (mutually exclusive with --base/--head)")
 	filesFrom   = flag.String("files-from", "", "Path to file containing file patterns (one per line)")
+	staged      = flag.Bool("staged", false, "Analyze only staged files")
 	unstaged    = flag.Bool("unstaged", false, "Analyze only unstaged and untracked files")
+	allModified = flag.Bool("all-modified", false, "Analyze all modified files (staged + unstaged)")
 	outputPath  = flag.String("output", "", "Output file path. Empty = write to stdout")
 	workDir     = flag.String("workdir", "", "Working directory. Empty = current directory")
 	showVersion = flag.Bool("version", false, "Show version and exit")
@@ -34,17 +37,20 @@ func init() {
 
 func main() {
 	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, "Usage: scope-detector [options]\n\n")
+		cmd := filepath.Base(os.Args[0])
+		fmt.Fprintf(os.Stderr, "Usage: %s [options]\n\n", cmd)
 		fmt.Fprintf(os.Stderr, "Analyzes git diff to detect changed files and project language.\n\n")
 		fmt.Fprintf(os.Stderr, "Options:\n")
 		flag.PrintDefaults()
 		fmt.Fprintf(os.Stderr, "\nExamples:\n")
-		fmt.Fprintf(os.Stderr, "  scope-detector                             # All uncommitted changes\n")
-		fmt.Fprintf(os.Stderr, "  scope-detector --base=main --head=HEAD     # Compare branches\n")
-		fmt.Fprintf(os.Stderr, "  scope-detector --files=cmd/*.go,scripts/**/*.ts\n")
-		fmt.Fprintf(os.Stderr, "  scope-detector --files-from=.ring/filelist.txt\n")
-		fmt.Fprintf(os.Stderr, "  scope-detector --unstaged\n")
-		fmt.Fprintf(os.Stderr, "  scope-detector --output=.ring/codereview/scope.json\n")
+		fmt.Fprintf(os.Stderr, "  %s                             # All uncommitted changes\n", cmd)
+		fmt.Fprintf(os.Stderr, "  %s --base=main --head=HEAD     # Compare branches\n", cmd)
+		fmt.Fprintf(os.Stderr, "  %s --files=cmd/*.go,scripts/**/*.ts\n", cmd)
+		fmt.Fprintf(os.Stderr, "  %s --files-from=.ring/filelist.txt\n", cmd)
+		fmt.Fprintf(os.Stderr, "  %s --staged\n", cmd)
+		fmt.Fprintf(os.Stderr, "  %s --unstaged\n", cmd)
+		fmt.Fprintf(os.Stderr, "  %s --all-modified\n", cmd)
+		fmt.Fprintf(os.Stderr, "  %s --output=.ring/codereview/scope.json\n", cmd)
 	}
 	flag.Parse()
 
@@ -84,9 +90,23 @@ func run() error {
 		return patternsErr
 	}
 
+	modeCount := 0
+	if *staged {
+		modeCount++
+	}
+	if *unstaged {
+		modeCount++
+	}
+	if *allModified {
+		modeCount++
+	}
+	if modeCount > 1 {
+		return fmt.Errorf("--staged, --unstaged, and --all-modified are mutually exclusive")
+	}
+
 	if len(patterns) > 0 {
-		if *baseRef != "" || *headRef != "" || *unstaged {
-			return fmt.Errorf("--files/--files-from cannot be used with --base/--head or --unstaged")
+		if *baseRef != "" || *headRef != "" || *staged || *unstaged || *allModified {
+			return fmt.Errorf("--files/--files-from cannot be used with --base/--head, --staged, --unstaged, or --all-modified")
 		}
 		expanded, expandErr := scope.ExpandFilePatterns(wd, patterns)
 		if expandErr != nil {
@@ -110,11 +130,21 @@ func run() error {
 		} else {
 			result, err = detector.DetectFromFiles("", expanded)
 		}
+	} else if *staged {
+		if *baseRef != "" || *headRef != "" {
+			return fmt.Errorf("--staged cannot be used with --base/--head")
+		}
+		result, err = detector.DetectStagedChanges()
 	} else if *unstaged {
 		if *baseRef != "" || *headRef != "" {
 			return fmt.Errorf("--unstaged cannot be used with --base/--head")
 		}
 		result, err = detector.DetectUnstagedChanges()
+	} else if *allModified {
+		if *baseRef != "" || *headRef != "" {
+			return fmt.Errorf("--all-modified cannot be used with --base/--head")
+		}
+		result, err = detector.DetectAllChanges()
 	} else if *baseRef == "" && *headRef == "" {
 		// No refs specified: detect all uncommitted changes (staged + unstaged)
 		result, err = detector.DetectAllChanges()
@@ -131,14 +161,22 @@ func run() error {
 	if *verbose {
 		fmt.Fprintln(os.Stderr, "=== Scope Detector (Verbose) ===")
 		fmt.Fprintf(os.Stderr, "Working directory: %s\n", wd)
-		if *unstaged {
+		if *staged {
+			fmt.Fprintln(os.Stderr, "Mode: staged")
+		} else if *unstaged {
 			fmt.Fprintln(os.Stderr, "Mode: unstaged + untracked")
+		} else if *allModified {
+			fmt.Fprintln(os.Stderr, "Mode: all modified")
 		} else if *baseRef == "" {
 			fmt.Fprintln(os.Stderr, "Base ref: (empty - detecting all uncommitted changes)")
 		} else {
 			fmt.Fprintf(os.Stderr, "Base ref: %s\n", *baseRef)
 		}
-		if *unstaged {
+		if *staged {
+			fmt.Fprintln(os.Stderr, "Head ref: index")
+		} else if *unstaged {
+			fmt.Fprintln(os.Stderr, "Head ref: working tree")
+		} else if *allModified {
 			fmt.Fprintln(os.Stderr, "Head ref: working tree")
 		} else if *headRef == "" {
 			fmt.Fprintln(os.Stderr, "Head ref: (empty - using working tree)")
