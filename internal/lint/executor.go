@@ -7,10 +7,8 @@ import (
 	"fmt"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	"github.com/lerianstudio/mithril/internal/procenv"
@@ -102,9 +100,7 @@ func (e *Executor) Run(ctx context.Context, dir string, name string, args ...str
 	cmd := exec.Command(cmdName, args...) // #nosec G204 - name/args come from registered linters
 	cmd.Dir = dir
 	cmd.Env = procenv.Build()
-	if runtime.GOOS != "windows" {
-		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	}
+	configureProcessGroup(cmd)
 
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
@@ -123,12 +119,7 @@ func (e *Executor) Run(ctx context.Context, dir string, name string, args ...str
 	select {
 	case err = <-done:
 	case <-ctx.Done():
-		if cmd.Process != nil {
-			if runtime.GOOS != "windows" {
-				_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
-			}
-			_ = cmd.Process.Kill()
-		}
+		terminateProcess(cmd)
 		err = <-done
 	}
 
