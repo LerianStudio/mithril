@@ -91,6 +91,12 @@ func run() error {
 	}
 	*astFile = validatedAST
 
+	validatedOutput, err := fileutil.ValidatePath(*outputDir, ".")
+	if err != nil {
+		return fmt.Errorf("invalid output directory: %w", err)
+	}
+	*outputDir = validatedOutput
+
 	languages := []string{}
 	if *language != "" {
 		languages = append(languages, *language)
@@ -161,8 +167,6 @@ func run() error {
 		outputSuffix := ""
 		if *callgraphSuffix != "" {
 			outputSuffix = *callgraphSuffix
-		} else if len(languages) > 1 {
-			outputSuffix = "-" + lang
 		}
 
 		if err := runCallgraphForLanguage(lang, langDiffs, workDir, outputSuffix); err != nil {
@@ -307,24 +311,45 @@ func buildModifiedFunctions(diffs []SemanticDiff) []callgraph.ModifiedFunction {
 }
 
 // extractPackageFromPath extracts the package name from a file path.
-// For Go files, this is typically the parent directory name.
+// For Go files, this is the normalized parent directory path.
 func extractPackageFromPath(filePath string) string {
-	dir := filepath.Dir(filePath)
+	cleaned := filepath.Clean(filePath)
+	if filepath.IsAbs(cleaned) {
+		wd, err := os.Getwd()
+		if err == nil {
+			rel, relErr := filepath.Rel(wd, cleaned)
+			if relErr == nil {
+				rel = filepath.Clean(rel)
+				if rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+					cleaned = rel
+				}
+			}
+		}
+	}
+	dir := filepath.Dir(cleaned)
 	if dir == "." || dir == "" {
 		return "main"
 	}
-	return filepath.Base(dir)
+	if filepath.IsAbs(dir) {
+		return filepath.Base(dir)
+	}
+	return filepath.ToSlash(dir)
 }
 
 // writeResults writes call graph results to output files.
 func writeResults(result *callgraph.CallGraphResult) error {
+	writer := output.NewCallGraphWriter(*outputDir)
+	if err := writer.EnsureDir(); err != nil {
+		return fmt.Errorf("failed to create output directory: %w", err)
+	}
+
 	// Write JSON output
-	if err := output.WriteJSON(result, *outputDir); err != nil {
+	if err := writer.WriteResult(result); err != nil {
 		return fmt.Errorf("failed to write JSON output: %w", err)
 	}
 
 	// Write impact summary markdown
-	if err := output.WriteImpactSummary(result, *outputDir); err != nil {
+	if err := writer.WriteSummary(result); err != nil {
 		return fmt.Errorf("failed to write impact summary: %w", err)
 	}
 

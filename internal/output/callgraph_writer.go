@@ -6,9 +6,12 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 
 	"github.com/lerianstudio/mithril/internal/callgraph"
 )
+
+var safeCallgraphLanguagePattern = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
 
 // CallGraphWriter handles writing call graph analysis results.
 type CallGraphWriter struct {
@@ -39,8 +42,13 @@ func WriteJSON(result *callgraph.CallGraphResult, outputDir string) error {
 		return fmt.Errorf("failed to create output directory %s: %w", outputDir, err)
 	}
 
+	language, err := sanitizeCallgraphLanguage(result.Language)
+	if err != nil {
+		return err
+	}
+
 	// Generate filename based on language
-	filename := fmt.Sprintf("%s-calls.json", result.Language)
+	filename := fmt.Sprintf("%s-calls.json", language)
 	path := filepath.Join(outputDir, filename)
 
 	// Marshal with pretty printing
@@ -77,6 +85,19 @@ func WriteJSON(result *callgraph.CallGraphResult, outputDir string) error {
 	}
 
 	return nil
+}
+
+func sanitizeCallgraphLanguage(raw string) (string, error) {
+	base := filepath.Base(raw)
+	if base != raw {
+		return "", fmt.Errorf("invalid call graph language %q: path separators are not allowed", raw)
+	}
+
+	if !safeCallgraphLanguagePattern.MatchString(base) {
+		return "", fmt.Errorf("invalid call graph language %q: only alphanumeric, dash, underscore allowed", raw)
+	}
+
+	return base, nil
 }
 
 // WriteImpactSummary writes the impact summary as a Markdown file.

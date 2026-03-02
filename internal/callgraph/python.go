@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/lerianstudio/mithril/internal/fileutil"
+	"github.com/lerianstudio/mithril/internal/procenv"
 )
 
 // Resource protection limits for Python analysis.
@@ -26,14 +27,20 @@ const (
 
 // PythonAnalyzer implements call graph analysis for Python code.
 type PythonAnalyzer struct {
-	workDir string
+	workDir         string
+	runHelperFn     func(ctx context.Context, files []string, modifiedFuncs []ModifiedFunction) (*pyHelperOutput, error)
+	runFallbackFn   func(ctx context.Context, modifiedFuncs []ModifiedFunction, result *CallGraphResult) (*CallGraphResult, error)
+	processHelperFn func(helper *pyHelperOutput, modifiedFuncs []ModifiedFunction, result *CallGraphResult) (*CallGraphResult, error)
 }
 
 // NewPythonAnalyzer creates a new Python call graph analyzer.
 // workDir is the root directory for module resolution.
 func NewPythonAnalyzer(workDir string) *PythonAnalyzer {
 	return &PythonAnalyzer{
-		workDir: workDir,
+		workDir:         workDir,
+		runHelperFn:     nil,
+		runFallbackFn:   nil,
+		processHelperFn: nil,
 	}
 }
 
@@ -43,6 +50,10 @@ func (p *PythonAnalyzer) sanitizeFilePaths(files []string) ([]string, error) {
 	absWorkDir, err := filepath.Abs(p.workDir)
 	if err != nil {
 		return nil, fmt.Errorf("failed to resolve workDir: %w", err)
+	}
+	realWorkDir, err := filepath.EvalSymlinks(absWorkDir)
+	if err != nil {
+		return nil, fmt.Errorf("failed to resolve workDir symlinks: %w", err)
 	}
 
 	var sanitized []string
@@ -65,12 +76,11 @@ func (p *PythonAnalyzer) sanitizeFilePaths(files []string) ([]string, error) {
 		// Evaluate symlinks to prevent escape via symlink
 		realPath, err := filepath.EvalSymlinks(absPath)
 		if err != nil {
-			// File might not exist yet, use the resolved absolute path
-			realPath = absPath
+			return nil, fmt.Errorf("invalid file path (cannot resolve symlinks): %s", f)
 		}
 
 		// Verify path is within workDir (prevent path traversal)
-		if !strings.HasPrefix(realPath, absWorkDir+string(filepath.Separator)) && realPath != absWorkDir {
+		if !strings.HasPrefix(realPath, realWorkDir+string(filepath.Separator)) && realPath != realWorkDir {
 			return nil, fmt.Errorf("invalid file path (outside work directory): %s", f)
 		}
 
@@ -167,15 +177,28 @@ func (p *PythonAnalyzer) Analyze(modifiedFuncs []ModifiedFunction, timeBudgetSec
 	files := p.collectUniqueFiles(modifiedFuncs)
 
 	// Try to use the custom Python helper for detailed analysis
-	helperResult, helperErr := p.runCallGraphPy(ctx, files, modifiedFuncs)
+	runHelper := p.runHelperFn
+	if runHelper == nil {
+		runHelper = p.runCallGraphPy
+	}
+	runFallback := p.runFallbackFn
+	if runFallback == nil {
+		runFallback = p.runPyan3
+	}
+	processHelper := p.processHelperFn
+	if processHelper == nil {
+		processHelper = p.processHelperResults
+	}
+
+	helperResult, helperErr := runHelper(ctx, files, modifiedFuncs)
 	if helperErr != nil {
 		result.Warnings = append(result.Warnings, fmt.Sprintf("Python helper unavailable: %v", helperErr))
 		// Fall back to pyan3
-		return p.runPyan3(ctx, modifiedFuncs, result)
+		return runFallback(ctx, modifiedFuncs, result)
 	}
 
 	// Process helper results
-	return p.processHelperResults(helperResult, modifiedFuncs, result)
+	return processHelper(helperResult, modifiedFuncs, result)
 }
 
 // getAffectedPackages extracts unique package paths from modified functions.
@@ -225,7 +248,7 @@ func (e *pyHelperOutputTooLargeError) Error() string {
 func (p *PythonAnalyzer) runPythonHelperCommand(ctx context.Context, pythonBinary string, args []string) ([]byte, error) {
 	cmd := exec.CommandContext(ctx, pythonBinary, args...) // #nosec G204 - args sanitized
 	cmd.Dir = p.workDir
-	cmd.Env = append([]string{"LC_ALL=C"}, os.Environ()...)
+	cmd.Env = procenv.Build()
 
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
@@ -381,6 +404,10 @@ func (p *PythonAnalyzer) findHelperScript() string {
 
 // processHelperResults converts Python helper output to CallGraphResult.
 func (p *PythonAnalyzer) processHelperResults(helper *pyHelperOutput, modifiedFuncs []ModifiedFunction, result *CallGraphResult) (*CallGraphResult, error) {
+	if helper == nil {
+		return p.returnEmptyResults(modifiedFuncs, result), nil
+	}
+
 	// Build lookup maps
 	funcLookup := make(map[string]*pyHelperFunction)
 	for i := range helper.Functions {
@@ -467,28 +494,25 @@ func (p *PythonAnalyzer) runPyan3(ctx context.Context, modifiedFuncs []ModifiedF
 	args := []string{"-e", "from pyan import main; main()", "--dot"}
 	args = append(args, sanitizedFiles...)
 
-	cmd := exec.CommandContext(ctx, "python3", args...) // #nosec G204 - args sanitized
-	cmd.Dir = p.workDir
-	cmd.Env = append([]string{"LC_ALL=C"}, os.Environ()...)
-
-	output, err := cmd.Output()
+	output, err := p.runPythonHelperCommand(ctx, "python3", args)
 	if err != nil {
+		var tooLarge *pyHelperOutputTooLargeError
+		if errors.As(err, &tooLarge) {
+			result.Warnings = append(result.Warnings, "pyan3 output exceeds size limit")
+			return p.returnEmptyResults(modifiedFuncs, result), nil
+		}
+
 		// Try with pip-installed pyan3
 		pyanArgs := append([]string{"--dot"}, sanitizedFiles...)
-		cmd = exec.CommandContext(ctx, "pyan3", pyanArgs...) // #nosec G204 - args sanitized
-		cmd.Dir = p.workDir
-		cmd.Env = append([]string{"LC_ALL=C"}, os.Environ()...)
-		output, err = cmd.Output()
+		output, err = p.runPythonHelperCommand(ctx, "pyan3", pyanArgs)
 		if err != nil {
+			if errors.As(err, &tooLarge) {
+				result.Warnings = append(result.Warnings, "pyan3 output exceeds size limit")
+				return p.returnEmptyResults(modifiedFuncs, result), nil
+			}
 			result.Warnings = append(result.Warnings, fmt.Sprintf("pyan3 not available: %v", err))
 			return p.returnEmptyResults(modifiedFuncs, result), nil
 		}
-	}
-
-	// Check output size limit
-	if len(output) > pyMaxOutputSize {
-		result.Warnings = append(result.Warnings, "pyan3 output exceeds size limit")
-		return p.returnEmptyResults(modifiedFuncs, result), nil
 	}
 
 	// Parse DOT output (basic parsing for caller/callee relationships)
@@ -504,6 +528,9 @@ func (p *PythonAnalyzer) parsePyanOutput(dotOutput string, modifiedFuncs []Modif
 	lines := strings.Split(dotOutput, "\n")
 	for _, line := range lines {
 		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "//") || strings.HasPrefix(line, "#") {
+			continue
+		}
 		if !strings.Contains(line, "->") {
 			continue
 		}
@@ -514,8 +541,13 @@ func (p *PythonAnalyzer) parsePyanOutput(dotOutput string, modifiedFuncs []Modif
 			continue
 		}
 
+		rawCallee := strings.TrimSpace(strings.TrimSuffix(parts[1], ";"))
+		if idx := strings.Index(rawCallee, "["); idx >= 0 {
+			rawCallee = strings.TrimSpace(rawCallee[:idx])
+		}
+
 		caller := strings.Trim(strings.TrimSpace(parts[0]), "\"")
-		callee := strings.Trim(strings.TrimSpace(strings.TrimSuffix(parts[1], ";")), "\"")
+		callee := strings.Trim(strings.TrimSpace(rawCallee), "\"")
 
 		if caller != "" && callee != "" {
 			edges[caller] = append(edges[caller], callee)

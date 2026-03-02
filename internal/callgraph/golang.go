@@ -9,6 +9,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"golang.org/x/tools/go/callgraph"
 	"golang.org/x/tools/go/callgraph/cha"
@@ -91,7 +93,7 @@ func (g *GoAnalyzer) buildSSA(pkgs []*packages.Package) *ssa.Program {
 // getAffectedPackages extracts unique package paths from modified functions.
 func getAffectedPackages(funcs []ModifiedFunction) []string {
 	seen := make(map[string]bool)
-	var result []string
+	result := make([]string, 0)
 
 	for _, fn := range funcs {
 		if fn.Package != "" && !seen[fn.Package] {
@@ -246,11 +248,7 @@ func (g *GoAnalyzer) analyzeFunction(
 		}
 
 		callerFunc := edge.Caller.Func
-		callerName := callerFunc.Name()
-		if callerFunc.Signature.Recv() != nil {
-			// Method - include receiver type
-			callerName = callerFunc.Signature.Recv().Type().String() + "." + callerName
-		}
+		callerName := formatSSAFunctionName(callerFunc)
 
 		// Get position of the call site
 		var callSite string
@@ -297,11 +295,7 @@ func (g *GoAnalyzer) analyzeFunction(
 		}
 
 		calleeFunc := edge.Callee.Func
-		calleeName := calleeFunc.Name()
-		if calleeFunc.Signature.Recv() != nil {
-			// Method - include receiver type
-			calleeName = calleeFunc.Signature.Recv().Type().String() + "." + calleeName
-		}
+		calleeName := formatSSAFunctionName(calleeFunc)
 
 		// Get position
 		var file string
@@ -391,8 +385,7 @@ func (g *GoAnalyzer) findSSAFunction(prog *ssa.Program, modFunc ModifiedFunction
 func (g *GoAnalyzer) functionMatches(fset *token.FileSet, fn *ssa.Function, expectedName, targetFile, receiver string) bool {
 	// Build the full name for comparison
 	fnName := fn.Name()
-	if fn.Signature.Recv() != nil {
-		recvType := fn.Signature.Recv().Type().String()
+	if recvType := safeReceiverTypeString(fn); recvType != "" {
 		// Extract just the type name without package path
 		if idx := strings.LastIndex(recvType, "."); idx >= 0 {
 			recvType = recvType[idx+1:]
@@ -425,10 +418,24 @@ func isTestFunction(name string) bool {
 		name = name[idx+1:]
 	}
 
-	return strings.HasPrefix(name, "Test") ||
-		strings.HasPrefix(name, "Benchmark") ||
-		strings.HasPrefix(name, "Example") ||
-		strings.HasPrefix(name, "Fuzz")
+	prefixes := []string{"Test", "Benchmark", "Example", "Fuzz"}
+	for _, prefix := range prefixes {
+		if !strings.HasPrefix(name, prefix) {
+			continue
+		}
+
+		rest := strings.TrimPrefix(name, prefix)
+		if rest == "" {
+			return true
+		}
+
+		r, _ := utf8.DecodeRuneInString(rest)
+		if !unicode.IsLower(r) {
+			return true
+		}
+	}
+
+	return false
 }
 
 // findTransitiveCallers performs BFS to find all transitive callers up to maxDepth.
@@ -474,7 +481,11 @@ func (g *GoAnalyzer) findTransitiveCallers(
 
 		// Dequeue
 		elem := queue.Front()
-		current := elem.Value.(*nodeWithDepth)
+		current, ok := elem.Value.(*nodeWithDepth)
+		if !ok || current == nil {
+			queue.Remove(elem)
+			continue
+		}
 		queue.Remove(elem)
 
 		// Don't go beyond max depth
@@ -500,7 +511,7 @@ func (g *GoAnalyzer) findTransitiveCallers(
 			callerKey := callerFunc.String()
 			if callerFunc.Pos().IsValid() {
 				pos := prog.Fset.Position(callerFunc.Pos())
-				callerKey = fmt.Sprintf("%s:%s", pos.Filename, callerFunc.Name())
+				callerKey = fmt.Sprintf("%s:%s", pos.Filename, formatSSAFunctionName(callerFunc))
 			}
 			transitiveCallers[callerKey] = true
 
@@ -513,6 +524,30 @@ func (g *GoAnalyzer) findTransitiveCallers(
 	}
 
 	return transitiveCallers
+}
+
+func formatSSAFunctionName(fn *ssa.Function) string {
+	if fn == nil {
+		return ""
+	}
+
+	name := fn.Name()
+	if recvType := safeReceiverTypeString(fn); recvType != "" {
+		name = recvType + "." + name
+	}
+
+	return name
+}
+
+func safeReceiverTypeString(fn *ssa.Function) string {
+	if fn == nil || fn.Signature == nil {
+		return ""
+	}
+	recv := fn.Signature.Recv()
+	if recv == nil || recv.Type() == nil {
+		return ""
+	}
+	return recv.Type().String()
 }
 
 // nodeWithDepth is a helper struct for BFS traversal.

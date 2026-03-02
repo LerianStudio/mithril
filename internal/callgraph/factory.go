@@ -11,6 +11,8 @@ const (
 	LangGolang     = "golang"
 	LangTypeScript = "typescript"
 	LangTS         = "ts"
+	LangJavaScript = "javascript"
+	LangJS         = "js"
 	LangPython     = "python"
 	LangPy         = "py"
 )
@@ -23,6 +25,8 @@ var languageNormalization = map[string]string{
 	// TypeScript
 	LangTypeScript: LangTypeScript,
 	LangTS:         LangTypeScript,
+	LangJavaScript: LangTypeScript,
+	LangJS:         LangTypeScript,
 
 	// Python
 	LangPython: LangPython,
@@ -56,6 +60,8 @@ func SupportedLanguages() []string {
 		LangGolang,
 		LangTypeScript,
 		LangTS,
+		LangJavaScript,
+		LangJS,
 		LangPython,
 		LangPy,
 	}
@@ -72,11 +78,11 @@ func SupportedLanguagesNormalized() []string {
 }
 
 // NormalizeLanguage converts language aliases to their primary identifier.
-// Returns the input unchanged if it's not a known alias.
+// Returns an empty string for unknown values.
 func NormalizeLanguage(language string) string {
 	normalized, ok := languageNormalization[strings.ToLower(language)]
 	if !ok {
-		return language
+		return ""
 	}
 
 	return normalized

@@ -1,17 +1,26 @@
 package callgraph
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
 	"github.com/lerianstudio/mithril/internal/fileutil"
+	"github.com/lerianstudio/mithril/internal/procenv"
 )
+
+// validTypeScriptIdentifier is a regex pattern for valid TypeScript identifiers.
+// Matches identifier chains used by helper --functions filtering.
+var validTypeScriptIdentifier = regexp.MustCompile(`^[a-zA-Z_$][a-zA-Z0-9_$]*(\.[a-zA-Z_$][a-zA-Z0-9_$]*)*$`)
 
 // Resource protection limits for TypeScript analysis.
 const (
@@ -22,19 +31,34 @@ const (
 
 // TypeScriptAnalyzer implements call graph analysis for TypeScript code.
 type TypeScriptAnalyzer struct {
-	workDir string
+	workDir         string
+	runHelperFn     func(ctx context.Context, files []string, modifiedFuncs []ModifiedFunction) (*tsHelperOutput, error)
+	runFallbackFn   func(ctx context.Context, modifiedFuncs []ModifiedFunction, result *CallGraphResult) (*CallGraphResult, error)
+	processHelperFn func(helper *tsHelperOutput, modifiedFuncs []ModifiedFunction, result *CallGraphResult) (*CallGraphResult, error)
 }
 
 // NewTypeScriptAnalyzer creates a new TypeScript call graph analyzer.
 // workDir is the root directory for module resolution.
 func NewTypeScriptAnalyzer(workDir string) *TypeScriptAnalyzer {
 	return &TypeScriptAnalyzer{
-		workDir: workDir,
+		workDir:         workDir,
+		runHelperFn:     nil,
+		runFallbackFn:   nil,
+		processHelperFn: nil,
 	}
 }
 
-// sanitizeFilePaths validates file paths to prevent command injection.
+// sanitizeFilePaths validates file paths to prevent command injection and traversal.
 func (t *TypeScriptAnalyzer) sanitizeFilePaths(files []string) ([]string, error) {
+	absWorkDir, err := filepath.Abs(t.workDir)
+	if err != nil {
+		return nil, fmt.Errorf("failed to resolve workDir: %w", err)
+	}
+	realWorkDir, err := filepath.EvalSymlinks(absWorkDir)
+	if err != nil {
+		return nil, fmt.Errorf("failed to resolve workDir symlinks: %w", err)
+	}
+
 	var sanitized []string
 	for _, f := range files {
 		if strings.HasPrefix(f, "-") {
@@ -43,7 +67,37 @@ func (t *TypeScriptAnalyzer) sanitizeFilePaths(files []string) ([]string, error)
 		if strings.ContainsRune(f, '\x00') {
 			return nil, fmt.Errorf("invalid file path (contains null byte)")
 		}
+
+		absPath, absErr := filepath.Abs(f)
+		if absErr != nil {
+			return nil, fmt.Errorf("invalid file path (cannot resolve): %s", f)
+		}
+
+		realPath, evalErr := filepath.EvalSymlinks(absPath)
+		if evalErr != nil {
+			return nil, fmt.Errorf("invalid file path (cannot resolve symlinks): %s", f)
+		}
+
+		if !strings.HasPrefix(realPath, realWorkDir+string(filepath.Separator)) && realPath != realWorkDir {
+			return nil, fmt.Errorf("invalid file path (outside work directory): %s", f)
+		}
+
 		sanitized = append(sanitized, f)
+	}
+	return sanitized, nil
+}
+
+// sanitizeFunctionNames validates function names to prevent argument injection.
+func (t *TypeScriptAnalyzer) sanitizeFunctionNames(names []string) ([]string, error) {
+	var sanitized []string
+	for _, name := range names {
+		if strings.HasPrefix(name, "-") {
+			return nil, fmt.Errorf("invalid function name (starts with dash): %s", name)
+		}
+		if !validTypeScriptIdentifier.MatchString(name) {
+			return nil, fmt.Errorf("invalid function name (not a valid identifier): %s", name)
+		}
+		sanitized = append(sanitized, name)
 	}
 	return sanitized, nil
 }
@@ -97,6 +151,15 @@ type tsHelperCaller struct {
 	Line     int    `json:"line"`
 }
 
+type tsHelperOutputTooLargeError struct {
+	size  int
+	limit int
+}
+
+func (e *tsHelperOutputTooLargeError) Error() string {
+	return fmt.Sprintf("helper output exceeds size limit (%d > %d bytes)", e.size, e.limit)
+}
+
 // Analyze implements the Analyzer interface for TypeScript code.
 func (t *TypeScriptAnalyzer) Analyze(modifiedFuncs []ModifiedFunction, timeBudgetSec int) (*CallGraphResult, error) {
 	result := &CallGraphResult{
@@ -133,20 +196,33 @@ func (t *TypeScriptAnalyzer) Analyze(modifiedFuncs []ModifiedFunction, timeBudge
 	files := t.collectUniqueFiles(modifiedFuncs)
 
 	// Try to use the TypeScript helper for detailed analysis
-	helperResult, helperErr := t.analyzeWithTSHelper(ctx, files, modifiedFuncs)
+	runHelper := t.runHelperFn
+	if runHelper == nil {
+		runHelper = t.analyzeWithTSHelper
+	}
+	runFallback := t.runFallbackFn
+	if runFallback == nil {
+		runFallback = t.analyzeWithDepCruiser
+	}
+	processHelper := t.processHelperFn
+	if processHelper == nil {
+		processHelper = t.processHelperResults
+	}
+
+	helperResult, helperErr := runHelper(ctx, files, modifiedFuncs)
 	if helperErr != nil {
 		result.Warnings = append(result.Warnings, fmt.Sprintf("TypeScript helper unavailable: %v", helperErr))
 		// Fall back to dependency-cruiser based analysis
-		return t.analyzeWithDepCruiser(ctx, modifiedFuncs, result)
+		return runFallback(ctx, modifiedFuncs, result)
 	}
 
 	if helperResult != nil && helperResult.Error == "Type checker unavailable" {
 		result.Warnings = append(result.Warnings, "TypeScript helper returned type checker error")
-		return t.analyzeWithDepCruiser(ctx, modifiedFuncs, result)
+		return runFallback(ctx, modifiedFuncs, result)
 	}
 
 	// Process helper results
-	return t.processHelperResults(helperResult, modifiedFuncs, result)
+	return processHelper(helperResult, modifiedFuncs, result)
 }
 
 // getAffectedPackages extracts unique package paths from modified functions.
@@ -202,6 +278,13 @@ func (t *TypeScriptAnalyzer) analyzeWithTSHelper(ctx context.Context, files []st
 	for _, fn := range modifiedFuncs {
 		funcNames = append(funcNames, fn.Name)
 	}
+	if len(funcNames) > 0 {
+		sanitizedFuncs, err := t.sanitizeFunctionNames(funcNames)
+		if err != nil {
+			return nil, fmt.Errorf("function name validation failed: %w", err)
+		}
+		funcNames = sanitizedFuncs
+	}
 
 	// Locate the helper script from installed tooling only
 	helperPath := t.findHelperScript()
@@ -222,17 +305,18 @@ func (t *TypeScriptAnalyzer) analyzeWithTSHelper(ctx context.Context, files []st
 	}
 
 	// Try npx ts-node first, then node with compiled JS
-	var cmd *exec.Cmd
+	var output []byte
 	if strings.HasSuffix(helperPath, ".ts") {
-		cmd = exec.CommandContext(ctx, "npx", append([]string{"ts-node"}, args...)...) // #nosec G204 - args sanitized
+		output, err = t.runHelperCommandWithLimit(ctx, "npx", append([]string{"--no-install", "ts-node"}, args...))
 	} else {
-		cmd = exec.CommandContext(ctx, "node", args...) // #nosec G204 - args sanitized
+		output, err = t.runHelperCommandWithLimit(ctx, "node", args)
 	}
-	cmd.Dir = t.workDir
-	cmd.Env = append([]string{"LC_ALL=C"}, os.Environ()...)
-
-	output, err := cmd.Output()
 	if err != nil {
+		var tooLarge *tsHelperOutputTooLargeError
+		if errors.As(err, &tooLarge) {
+			return nil, err
+		}
+
 		// Try with compiled version if ts-node failed
 		jsPath := strings.TrimSuffix(helperPath, ".ts") + ".js"
 		distPath := filepath.Join(filepath.Dir(helperPath), "dist", "call-graph.js")
@@ -243,23 +327,18 @@ func (t *TypeScriptAnalyzer) analyzeWithTSHelper(ctx context.Context, files []st
 			if len(funcNames) > 0 {
 				altArgs = append(altArgs, "--functions", strings.Join(funcNames, ","))
 			}
-			cmd = exec.CommandContext(ctx, "node", altArgs...) // #nosec G204 - args sanitized
-			cmd.Dir = t.workDir
-			cmd.Env = append([]string{"LC_ALL=C"}, os.Environ()...)
-			output, err = cmd.Output()
+			output, err = t.runHelperCommandWithLimit(ctx, "node", altArgs)
 			if err == nil {
 				break
+			}
+			if errors.As(err, &tooLarge) {
+				return nil, err
 			}
 		}
 
 		if err != nil {
 			return nil, fmt.Errorf("failed to run TypeScript helper: %w", err)
 		}
-	}
-
-	// Check output size limit to prevent memory exhaustion
-	if len(output) > tsMaxOutputSize {
-		return nil, fmt.Errorf("helper output exceeds size limit (%d > %d bytes)", len(output), tsMaxOutputSize)
 	}
 
 	var helperOutput tsHelperOutput
@@ -275,6 +354,48 @@ func (t *TypeScriptAnalyzer) analyzeWithTSHelper(ctx context.Context, files []st
 	}
 
 	return &helperOutput, nil
+}
+
+func (t *TypeScriptAnalyzer) runHelperCommandWithLimit(ctx context.Context, command string, args []string) ([]byte, error) {
+	cmd := exec.CommandContext(ctx, command, args...) // #nosec G204 - args sanitized
+	cmd.Env = procenv.Build()
+	cmd.Dir = t.workDir
+
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return nil, fmt.Errorf("failed to create stdout pipe: %w", err)
+	}
+
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+
+	if err := cmd.Start(); err != nil {
+		return nil, err
+	}
+
+	output, readErr := io.ReadAll(io.LimitReader(stdout, tsMaxOutputSize+1))
+	if readErr != nil {
+		_ = cmd.Wait()
+		return nil, fmt.Errorf("failed to read helper output: %w", readErr)
+	}
+
+	if len(output) > tsMaxOutputSize {
+		if cmd.Process != nil {
+			_ = cmd.Process.Kill()
+		}
+		_ = cmd.Wait()
+		return nil, &tsHelperOutputTooLargeError{size: len(output), limit: tsMaxOutputSize}
+	}
+
+	waitErr := cmd.Wait()
+	if exitErr, ok := waitErr.(*exec.ExitError); ok {
+		exitErr.Stderr = stderr.Bytes()
+	}
+	if waitErr != nil {
+		return nil, waitErr
+	}
+
+	return output, nil
 }
 
 // findHelperScript locates the call-graph.ts helper script.
@@ -307,6 +428,19 @@ func (t *TypeScriptAnalyzer) findHelperScript() string {
 
 // processHelperResults converts TypeScript helper output to CallGraphResult.
 func (t *TypeScriptAnalyzer) processHelperResults(helper *tsHelperOutput, modifiedFuncs []ModifiedFunction, result *CallGraphResult) (*CallGraphResult, error) {
+	if helper == nil {
+		for _, modFunc := range modifiedFuncs {
+			result.ModifiedFunctions = append(result.ModifiedFunctions, FunctionCallGraph{
+				Function:     modFunc.Name,
+				File:         modFunc.File,
+				Callers:      make([]CallInfo, 0),
+				Callees:      make([]CallInfo, 0),
+				TestCoverage: make([]TestCoverage, 0),
+			})
+		}
+		return result, nil
+	}
+
 	// Build lookup maps
 	funcLookup := make(map[string]*tsHelperFunction)
 	for i := range helper.Functions {
@@ -481,17 +615,10 @@ func (t *TypeScriptAnalyzer) runDepCruiser(ctx context.Context, files []string) 
 	args := []string{"depcruise", "--output-type", "json"}
 	args = append(args, sanitizedFiles...)
 
-	cmd := exec.CommandContext(ctx, "npx", args...) // #nosec G204 - args sanitized
-	cmd.Env = append([]string{"LC_ALL=C"}, os.Environ()...)
-	cmd.Dir = t.workDir
-
-	output, err := cmd.Output()
+	output, err := t.runHelperCommandWithLimit(ctx, "npx", append([]string{"--no-install"}, args...))
 	if err != nil {
 		// Try global installation
-		cmd = exec.CommandContext(ctx, "depcruise", append([]string{"--output-type", "json"}, sanitizedFiles...)...) // #nosec G204 - args sanitized
-		cmd.Env = append([]string{"LC_ALL=C"}, os.Environ()...)
-		cmd.Dir = t.workDir
-		output, err = cmd.Output()
+		output, err = t.runHelperCommandWithLimit(ctx, "depcruise", append([]string{"--output-type", "json"}, sanitizedFiles...))
 		if err != nil {
 			return nil, fmt.Errorf("dependency-cruiser not available: %w", err)
 		}

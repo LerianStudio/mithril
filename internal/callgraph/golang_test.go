@@ -210,9 +210,6 @@ func TestUseAdd(t *testing.T) {
 		t.Errorf("expected UseAdd to be a caller of Add")
 	}
 
-	if len(fcg.TestCoverage) == 0 {
-		t.Logf("Warning: expected test coverage for Add, got none")
-	}
 }
 
 func TestIsTestFunction(t *testing.T) {
@@ -297,9 +294,19 @@ func TestIsTestFunction(t *testing.T) {
 			expected: false,
 		},
 		{
-			name:     "Test prefix - Testing matches because it starts with Test",
+			name:     "Test prefix - Testing is not a valid test function",
 			funcName: "Testing",
-			expected: true,
+			expected: false,
+		},
+		{
+			name:     "Test prefix - Testable is not a valid test function",
+			funcName: "Testable",
+			expected: false,
+		},
+		{
+			name:     "Benchmark prefix - Benchmarking is not a valid benchmark function",
+			funcName: "Benchmarking",
+			expected: false,
 		},
 		// Method receiver cases (with dot notation)
 		{
@@ -397,19 +404,6 @@ func TestNewGoAnalyzer(t *testing.T) {
 			}
 		})
 	}
-}
-
-// TestGoAnalyzerType verifies the GoAnalyzer struct fields and type.
-func TestGoAnalyzerType(t *testing.T) {
-	analyzer := NewGoAnalyzer("/test/dir")
-
-	// Verify type
-	if analyzer == nil {
-		t.Fatal("NewGoAnalyzer returned nil")
-	}
-
-	// Type assertion should work
-	var _ *GoAnalyzer = analyzer
 }
 
 func TestAnalyzeTimeout(t *testing.T) {

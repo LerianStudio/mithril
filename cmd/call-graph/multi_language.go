@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
+	"regexp"
 	"strings"
 
 	"github.com/lerianstudio/mithril/internal/callgraph"
@@ -14,6 +16,8 @@ import (
 type languagesPayload struct {
 	Languages []string `json:"languages"`
 }
+
+var safeSummaryLanguagePattern = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
 
 func readLanguagesFile(path string) ([]string, error) {
 	if path == "" {
@@ -107,8 +111,29 @@ func writeResultsWithOutputDir(result *callgraph.CallGraphResult, outputDir stri
 	if err := output.WriteImpactSummary(result, outputDir); err != nil {
 		return fmt.Errorf("failed to write markdown output: %w", err)
 	}
+	if err := writeLanguageImpactSummary(result, outputDir); err != nil {
+		return fmt.Errorf("failed to write language markdown output: %w", err)
+	}
 
 	printSummaryWithOutputDir(result, outputDir)
+	return nil
+}
+
+func writeLanguageImpactSummary(result *callgraph.CallGraphResult, outputDir string) error {
+	if result == nil {
+		return fmt.Errorf("cannot write summary for nil result")
+	}
+	language := strings.TrimSpace(result.Language)
+	if !safeSummaryLanguagePattern.MatchString(language) {
+		return fmt.Errorf("invalid language token for summary filename: %q", result.Language)
+	}
+
+	summaryPath := filepath.Join(outputDir, fmt.Sprintf("impact-summary-%s.md", language))
+	summary := output.RenderImpactSummary(result)
+	if err := os.WriteFile(summaryPath, []byte(summary), 0o600); err != nil {
+		return fmt.Errorf("failed to write %s: %w", summaryPath, err)
+	}
+
 	return nil
 }
 

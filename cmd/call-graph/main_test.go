@@ -354,8 +354,8 @@ func TestBuildModifiedFunctions_PackageExtraction(t *testing.T) {
 		t.Fatalf("Expected 1 function, got %d", len(got))
 	}
 
-	if got[0].Package != "service" {
-		t.Errorf("Expected package 'service', got %q", got[0].Package)
+	if got[0].Package != "internal/service" {
+		t.Errorf("Expected package 'internal/service', got %q", got[0].Package)
 	}
 
 	if got[0].File != "internal/service/user.go" {
@@ -372,12 +372,12 @@ func TestExtractPackageFromPath(t *testing.T) {
 		{
 			name:     "standard_go_path",
 			filePath: "internal/service/user.go",
-			want:     "service",
+			want:     "internal/service",
 		},
 		{
 			name:     "nested_path",
 			filePath: "pkg/api/v1/handlers/auth.go",
-			want:     "handlers",
+			want:     "pkg/api/v1/handlers",
 		},
 		{
 			name:     "root_file",

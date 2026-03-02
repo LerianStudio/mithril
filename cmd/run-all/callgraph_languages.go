@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+
+	"github.com/lerianstudio/mithril/internal/callgraph"
 )
 
 func callgraphLanguagesFile(outputDir string) string {
@@ -69,22 +71,20 @@ func languagesForCallgraph(outputDir string) ([]string, error) {
 }
 
 func normalizeCallgraphLanguage(lang string) string {
-	if lang == "" {
+	normalizedInput := strings.ToLower(strings.TrimSpace(lang))
+	if normalizedInput == "" {
 		return ""
 	}
-	normalized := strings.ToLower(strings.TrimSpace(lang))
-	switch normalized {
-	case "go", "golang":
-		return "go"
-	case "typescript", "ts", "javascript", "js":
-		return "typescript"
-	case "python", "py":
-		return "python"
-	case "mixed", "unknown":
+	if normalizedInput == "mixed" || normalizedInput == "unknown" {
 		return ""
-	default:
+	}
+
+	normalized := callgraph.NormalizeLanguage(normalizedInput)
+	if normalized != "" {
 		return normalized
 	}
+
+	return normalizedInput
 }
 
 func orderCallgraphLanguages(languages []string) {
