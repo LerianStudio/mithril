@@ -107,7 +107,6 @@ func run() error {
 				TotalDeletions:   0,
 				PackagesAffected: []string{},
 			}
-			err = nil
 		} else {
 			result, err = detector.DetectFromFiles("", expanded)
 		}
@@ -167,7 +166,7 @@ func run() error {
 
 	// Write output
 	if *outputPath != "" {
-		validatedOutput, err := fileutil.ValidatePath(*outputPath, ".")
+		validatedOutput, err := fileutil.ValidatePath(*outputPath, wd)
 		if err != nil {
 			return fmt.Errorf("invalid output path: %w", err)
 		}

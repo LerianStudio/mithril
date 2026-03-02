@@ -4,47 +4,80 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 )
 
 // testBinaryName is the name of the test binary.
 const testBinaryName = "scope-detector-test"
 
+var (
+	buildOnce     sync.Once
+	buildErr      error
+	binaryAbsPath string
+)
+
+func TestMain(m *testing.M) {
+	cleanupScopeDetectorTempDirs()
+	code := m.Run()
+	if binaryAbsPath != "" {
+		if err := os.Remove(binaryAbsPath); err != nil && !os.IsNotExist(err) {
+			fmt.Fprintf(os.Stderr, "Warning: failed to remove test binary %s: %v\n", binaryAbsPath, err)
+		}
+	}
+	cleanupScopeDetectorTempDirs()
+	os.Exit(code)
+}
+
+func cleanupScopeDetectorTempDirs() {
+	matches, err := filepath.Glob(filepath.Join(".", ".scope-detector-test-*"))
+	if err != nil {
+		return
+	}
+	for _, dir := range matches {
+		_ = os.RemoveAll(dir)
+	}
+}
+
 // buildTestBinary builds the scope-detector binary for testing.
 // Returns the path to the built binary.
 func buildTestBinary(t *testing.T) string {
 	t.Helper()
 
-	// Build in the current directory (where main.go is)
-	binaryPath := filepath.Join(".", testBinaryName)
+	buildOnce.Do(func() {
+		binaryPath := filepath.Join(".", testBinaryName)
+		buildCmd := exec.Command("go", "build", "-o", binaryPath, ".")
+		buildCmd.Dir = "."
 
-	buildCmd := exec.Command("go", "build", "-o", binaryPath, ".")
-	buildCmd.Dir = "." // Ensure we're in the right directory
+		output, err := buildCmd.CombinedOutput()
+		if err != nil {
+			buildErr = fmt.Errorf("failed to build binary: %w\nOutput: %s", err, string(output))
+			return
+		}
 
-	output, err := buildCmd.CombinedOutput()
-	if err != nil {
-		t.Fatalf("Failed to build binary: %v\nOutput: %s", err, string(output))
+		binaryAbsPath, err = filepath.Abs(binaryPath)
+		if err != nil {
+			buildErr = err
+		}
+	})
+
+	if buildErr != nil {
+		t.Fatalf("%v", buildErr)
 	}
 
-	// Return absolute path for reliable execution
-	absPath, err := filepath.Abs(binaryPath)
-	if err != nil {
-		t.Fatalf("Failed to get absolute path: %v", err)
-	}
-
-	return absPath
+	return binaryAbsPath
 }
 
 // cleanupTestBinary removes the test binary.
 func cleanupTestBinary(t *testing.T, binaryPath string) {
 	t.Helper()
-
-	if err := os.Remove(binaryPath); err != nil && !os.IsNotExist(err) {
-		t.Logf("Warning: failed to remove test binary %s: %v", binaryPath, err)
+	if binaryPath == "" {
+		t.Error("expected test binary path to be set")
 	}
 }
 
@@ -144,7 +177,7 @@ func TestMain_OutputToFile(t *testing.T) {
 	defer cleanupTestBinary(t, binaryPath)
 
 	// Create temp directory for output
-	tempDir := t.TempDir()
+	tempDir := repoTempDir(t)
 	outputPath := filepath.Join(tempDir, "scope.json")
 
 	// Run the binary with --output flag
@@ -192,7 +225,7 @@ func TestMain_UnstagedMode(t *testing.T) {
 	defer cleanupTestBinary(t, binaryPath)
 
 	// Create temp directory for output
-	tempDir := t.TempDir()
+	tempDir := repoTempDir(t)
 	outputPath := filepath.Join(tempDir, "scope.json")
 
 	cmd := exec.Command(binaryPath, "--unstaged", "--output="+outputPath)
@@ -231,7 +264,7 @@ func TestMain_OutputToNestedPath(t *testing.T) {
 	defer cleanupTestBinary(t, binaryPath)
 
 	// Create temp directory with nested path
-	tempDir := t.TempDir()
+	tempDir := repoTempDir(t)
 	nestedPath := filepath.Join(tempDir, "nested", "deeply", "scope.json")
 
 	// Run the binary with nested output path
@@ -281,7 +314,7 @@ func TestMain_JSONStructure(t *testing.T) {
 	defer cleanupTestBinary(t, binaryPath)
 
 	// Create temp directory for output
-	tempDir := t.TempDir()
+	tempDir := repoTempDir(t)
 	outputPath := filepath.Join(tempDir, "scope.json")
 
 	// Run the binary
@@ -395,7 +428,7 @@ func TestMain_BaseHeadRefs(t *testing.T) {
 	defer cleanupTestBinary(t, binaryPath)
 
 	// Create temp directory for output
-	tempDir := t.TempDir()
+	tempDir := repoTempDir(t)
 	outputPath := filepath.Join(tempDir, "scope.json")
 
 	// Run with --base and --head flags
@@ -431,7 +464,7 @@ func TestMain_WorkdirFlag(t *testing.T) {
 	defer cleanupTestBinary(t, binaryPath)
 
 	// Create temp directory for output
-	tempDir := t.TempDir()
+	tempDir := repoTempDir(t)
 	outputPath := filepath.Join(tempDir, "scope.json")
 
 	// Get the repository root (assuming we're in a git repo)
@@ -568,7 +601,7 @@ func TestMain_JSONPrettyPrint(t *testing.T) {
 	defer cleanupTestBinary(t, binaryPath)
 
 	// Create temp directory for output
-	tempDir := t.TempDir()
+	tempDir := repoTempDir(t)
 	outputPath := filepath.Join(tempDir, "scope.json")
 
 	// Run the binary
@@ -606,7 +639,7 @@ func TestMain_ConsistentLanguageDetection(t *testing.T) {
 	defer cleanupTestBinary(t, binaryPath)
 
 	// Run twice with same parameters
-	tempDir := t.TempDir()
+	tempDir := repoTempDir(t)
 
 	var results []scopeOutputJSON
 	for i := 0; i < 2; i++ {
@@ -634,4 +667,25 @@ func TestMain_ConsistentLanguageDetection(t *testing.T) {
 	if results[0].Language != results[1].Language {
 		t.Errorf("Language detection inconsistent: %s vs %s", results[0].Language, results[1].Language)
 	}
+}
+
+func repoTempDir(t *testing.T) string {
+	t.Helper()
+	dir, err := os.MkdirTemp(".", ".scope-detector-test-*")
+	if err != nil {
+		t.Fatalf("failed to create repo-local temp dir: %v", err)
+	}
+	absDir, err := filepath.Abs(dir)
+	if err != nil {
+		if removeErr := os.RemoveAll(dir); removeErr != nil {
+			t.Errorf("failed to remove repo-local temp dir %s after abs failure: %v", dir, removeErr)
+		}
+		t.Fatalf("failed to resolve repo-local temp dir: %v", err)
+	}
+	t.Cleanup(func() {
+		if removeErr := os.RemoveAll(absDir); removeErr != nil {
+			t.Errorf("failed to remove repo-local temp dir %s: %v", absDir, removeErr)
+		}
+	})
+	return absDir
 }

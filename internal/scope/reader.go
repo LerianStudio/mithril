@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/lerianstudio/mithril/internal/callgraph"
 	"github.com/lerianstudio/mithril/internal/fileutil"
 	"github.com/lerianstudio/mithril/internal/lint"
 )
@@ -75,6 +76,10 @@ func ReadScopeJSON(scopePath string) (*ScopeJSON, error) {
 
 // GetLanguage returns the primary language as a lint.Language.
 func (s *ScopeJSON) GetLanguage() lint.Language {
+	if s == nil {
+		return lint.Language("")
+	}
+
 	switch s.Language {
 	case "go":
 		return lint.LanguageGo
@@ -92,6 +97,10 @@ func (s *ScopeJSON) GetLanguage() lint.Language {
 
 // GetAllFiles returns all changed files (modified + added) with normalized paths.
 func (s *ScopeJSON) GetAllFiles() []string {
+	if s == nil {
+		return []string{}
+	}
+
 	all := make([]string, 0, len(s.Files.Modified)+len(s.Files.Added))
 	for _, f := range s.Files.Modified {
 		all = append(all, normalizeScopePath(f))
@@ -104,6 +113,10 @@ func (s *ScopeJSON) GetAllFiles() []string {
 
 // GetAllFilesMap returns a map of all changed files for quick lookup with normalized paths.
 func (s *ScopeJSON) GetAllFilesMap() map[string]bool {
+	if s == nil {
+		return map[string]bool{}
+	}
+
 	fileMap := make(map[string]bool)
 	for _, f := range s.Files.Modified {
 		fileMap[normalizeScopePath(f)] = true
@@ -116,18 +129,14 @@ func (s *ScopeJSON) GetAllFilesMap() map[string]bool {
 
 // NormalizeLanguage maps supported language aliases to canonical identifiers.
 func NormalizeLanguage(lang string) lint.Language {
-	switch strings.ToLower(lang) {
-	case "go", "golang":
-		return lint.LanguageGo
-	case "typescript", "ts", "javascript", "js":
-		return lint.LanguageTypeScript
-	case "python", "py":
-		return lint.LanguagePython
-	case "mixed":
+	if strings.EqualFold(strings.TrimSpace(lang), "mixed") {
 		return lint.LanguageMixed
-	default:
+	}
+	normalized := callgraph.NormalizeLanguage(lang)
+	if normalized == "" {
 		return lint.Language("")
 	}
+	return lint.Language(normalized)
 }
 
 // normalizeScopePath normalizes file paths for consistent matching.
@@ -141,6 +150,10 @@ func normalizeScopePath(path string) string {
 
 // GetPackages returns the affected packages.
 func (s *ScopeJSON) GetPackages() []string {
+	if s == nil {
+		return []string{}
+	}
+
 	return s.Packages
 }
 

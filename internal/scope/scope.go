@@ -47,17 +47,17 @@ var extensionToLanguage = map[string]Language{
 
 // ScopeResult contains the analysis of changed files.
 type ScopeResult struct {
-	BaseRef          string   `json:"base_ref"`
-	HeadRef          string   `json:"head_ref"`
-	Language         string   `json:"language"`
-	Languages        []string `json:"languages,omitempty"`
-	ModifiedFiles    []string `json:"modified"`
-	AddedFiles       []string `json:"added"`
-	DeletedFiles     []string `json:"deleted"`
-	TotalFiles       int      `json:"total_files"`
-	TotalAdditions   int      `json:"total_additions"`
-	TotalDeletions   int      `json:"total_deletions"`
-	PackagesAffected []string `json:"packages_affected"`
+	BaseRef          string
+	HeadRef          string
+	Language         string
+	Languages        []string
+	ModifiedFiles    []string
+	AddedFiles       []string
+	DeletedFiles     []string
+	TotalFiles       int
+	TotalAdditions   int
+	TotalDeletions   int
+	PackagesAffected []string
 }
 
 // gitClientInterface defines the git operations needed by Detector.
@@ -144,10 +144,7 @@ func (d *Detector) buildScopeResultFromFiles(baseRef string, files []string) (*S
 		})
 	}
 
-	lang, err := DetectLanguage(cleanFiles)
-	if err != nil {
-		return nil, err
-	}
+	lang := DetectLanguage(cleanFiles)
 	languages := DetectLanguages(cleanFiles)
 	packages := ExtractPackages(FilterByLanguage(cleanFiles, lang))
 	modified, added, deleted := CategorizeFilesByStatus(changedFiles)
@@ -185,6 +182,10 @@ func (d *Detector) emptyScopeResult(baseRef, headRef string) *ScopeResult {
 
 // buildScopeResult creates a ScopeResult from a git DiffResult.
 func (d *Detector) buildScopeResult(diffResult *git.DiffResult) (*ScopeResult, error) {
+	if diffResult == nil {
+		return nil, fmt.Errorf("diff result cannot be nil")
+	}
+
 	// Extract all file paths
 	var allPaths []string
 	for _, f := range diffResult.Files {
@@ -192,10 +193,7 @@ func (d *Detector) buildScopeResult(diffResult *git.DiffResult) (*ScopeResult, e
 	}
 
 	// Detect language
-	lang, err := DetectLanguage(allPaths)
-	if err != nil {
-		return nil, err
-	}
+	lang := DetectLanguage(allPaths)
 
 	// Categorize files by status
 	modified, added, deleted := CategorizeFilesByStatus(diffResult.Files)
@@ -223,7 +221,7 @@ func (d *Detector) buildScopeResult(diffResult *git.DiffResult) (*ScopeResult, e
 
 // DetectLanguage detects the primary programming language from a list of file paths.
 // Returns LanguageMixed if multiple code languages are detected.
-func DetectLanguage(files []string) (Language, error) {
+func DetectLanguage(files []string) Language {
 	languagesFound := make(map[Language]bool)
 
 	for _, f := range files {
@@ -237,18 +235,18 @@ func DetectLanguage(files []string) (Language, error) {
 	count := len(languagesFound)
 
 	if count == 0 {
-		return LanguageUnknown, nil
+		return LanguageUnknown
 	}
 
 	if count > 1 {
-		return LanguageMixed, nil
+		return LanguageMixed
 	}
 
 	// Return the single detected language (count == 1 guarantees exactly one iteration)
 	for lang := range languagesFound {
-		return lang, nil
+		return lang
 	}
-	return LanguageUnknown, nil // Required by compiler; logically unreachable
+	return LanguageUnknown // Required by compiler; logically unreachable
 }
 
 // DetectLanguages returns all detected programming languages from a list of file paths.
@@ -366,7 +364,7 @@ func FilterByLanguage(files []string, lang Language) []string {
 	result := make([]string, 0)
 
 	for _, f := range files {
-		ext := getFileExtension(f)
+		ext := strings.ToLower(getFileExtension(f))
 		if fileLang, ok := extensionToLanguage[ext]; ok && fileLang == lang {
 			result = append(result, f)
 		}

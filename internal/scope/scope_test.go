@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 
 	"github.com/lerianstudio/mithril/internal/git"
@@ -137,11 +138,7 @@ func TestDetectLanguage(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, err := DetectLanguage(tt.files)
-			if err != nil {
-				t.Errorf("DetectLanguage() unexpected error: %v", err)
-				return
-			}
+			got := DetectLanguage(tt.files)
 
 			if got != tt.expected {
 				t.Errorf("DetectLanguage() = %v, want %v", got, tt.expected)
@@ -348,6 +345,12 @@ func TestFilterByLanguage(t *testing.T) {
 			lang:     LanguageMixed,
 			expected: []string{"file1.go", "file2.ts", "file3.py"},
 		},
+		{
+			name:     "uppercase extensions are matched",
+			files:    []string{"MAIN.GO", "Button.TSX", "README.MD"},
+			lang:     LanguageGo,
+			expected: []string{"MAIN.GO"},
+		},
 	}
 
 	for _, tt := range tests {
@@ -385,22 +388,26 @@ func TestNewDetector(t *testing.T) {
 	}
 }
 
-func TestScopeResult_JSON(t *testing.T) {
-	result := &ScopeResult{
-		BaseRef:          "main",
-		HeadRef:          "feature",
-		Language:         "go",
-		Languages:        []string{"go"},
-		ModifiedFiles:    []string{"file1.go"},
-		AddedFiles:       []string{"file2.go"},
-		DeletedFiles:     []string{"file3.go"},
-		TotalFiles:       3,
-		TotalAdditions:   100,
-		TotalDeletions:   50,
-		PackagesAffected: []string{"internal/service"},
+func TestScopeJSON_JSON(t *testing.T) {
+	result := &ScopeJSON{
+		BaseRef:   "main",
+		HeadRef:   "feature",
+		Language:  "go",
+		Languages: []string{"go"},
+		Files: FilesByStatus{
+			Modified: []string{"file1.go"},
+			Added:    []string{"file2.go"},
+			Deleted:  []string{"file3.go"},
+		},
+		Stats: StatsJSON{
+			TotalFiles:     3,
+			TotalAdditions: 100,
+			TotalDeletions: 50,
+		},
+		Packages: []string{"internal/service"},
 	}
 
-	// Marshal the ScopeResult to JSON
+	// Marshal the ScopeJSON to JSON
 	jsonData, err := json.Marshal(result)
 	if err != nil {
 		t.Fatalf("json.Marshal failed: %v", err)
@@ -414,9 +421,7 @@ func TestScopeResult_JSON(t *testing.T) {
 
 	// Verify JSON field names match the struct tags (snake_case)
 	expectedKeys := []string{
-		"base_ref", "head_ref", "language", "languages", "modified", "added",
-		"deleted", "total_files", "total_additions", "total_deletions",
-		"packages_affected",
+		"base_ref", "head_ref", "language", "languages", "files", "stats", "packages_affected",
 	}
 	for _, key := range expectedKeys {
 		if _, exists := jsonMap[key]; !exists {
@@ -436,14 +441,18 @@ func TestScopeResult_JSON(t *testing.T) {
 	}
 
 	// Verify numeric field values (JSON numbers unmarshal as float64)
-	if got, ok := jsonMap["total_files"].(float64); !ok || int(got) != 3 {
-		t.Errorf("total_files: got %v, want %d", jsonMap["total_files"], 3)
+	statsRaw, ok := jsonMap["stats"].(map[string]any)
+	if !ok {
+		t.Fatalf("stats: expected object, got %T", jsonMap["stats"])
 	}
-	if got, ok := jsonMap["total_additions"].(float64); !ok || int(got) != 100 {
-		t.Errorf("total_additions: got %v, want %d", jsonMap["total_additions"], 100)
+	if got, ok := statsRaw["total_files"].(float64); !ok || int(got) != 3 {
+		t.Errorf("total_files: got %v, want %d", statsRaw["total_files"], 3)
 	}
-	if got, ok := jsonMap["total_deletions"].(float64); !ok || int(got) != 50 {
-		t.Errorf("total_deletions: got %v, want %d", jsonMap["total_deletions"], 50)
+	if got, ok := statsRaw["total_additions"].(float64); !ok || int(got) != 100 {
+		t.Errorf("total_additions: got %v, want %d", statsRaw["total_additions"], 100)
+	}
+	if got, ok := statsRaw["total_deletions"].(float64); !ok || int(got) != 50 {
+		t.Errorf("total_deletions: got %v, want %d", statsRaw["total_deletions"], 50)
 	}
 
 	// Verify slice field values
@@ -465,13 +474,33 @@ func TestScopeResult_JSON(t *testing.T) {
 	}
 
 	verifyJSONSlice("languages", []string{"go"})
-	verifyJSONSlice("modified", []string{"file1.go"})
-	verifyJSONSlice("added", []string{"file2.go"})
-	verifyJSONSlice("deleted", []string{"file3.go"})
 	verifyJSONSlice("packages_affected", []string{"internal/service"})
+	filesRaw, ok := jsonMap["files"].(map[string]any)
+	if !ok {
+		t.Fatalf("files: expected object, got %T", jsonMap["files"])
+	}
+	verifyNestedSlice := func(container map[string]any, key string, expected []string) {
+		arr, ok := container[key].([]any)
+		if !ok {
+			t.Errorf("%s: expected array, got %T", key, container[key])
+			return
+		}
+		if len(arr) != len(expected) {
+			t.Errorf("%s: got %d elements, want %d", key, len(arr), len(expected))
+			return
+		}
+		for i, v := range arr {
+			if str, ok := v.(string); !ok || str != expected[i] {
+				t.Errorf("%s[%d]: got %v, want %q", key, i, v, expected[i])
+			}
+		}
+	}
+	verifyNestedSlice(filesRaw, "modified", []string{"file1.go"})
+	verifyNestedSlice(filesRaw, "added", []string{"file2.go"})
+	verifyNestedSlice(filesRaw, "deleted", []string{"file3.go"})
 
-	// Verify round-trip: unmarshal back into ScopeResult and compare
-	var roundTrip ScopeResult
+	// Verify round-trip: unmarshal back into ScopeJSON and compare
+	var roundTrip ScopeJSON
 	if err := json.Unmarshal(jsonData, &roundTrip); err != nil {
 		t.Fatalf("json.Unmarshal round-trip failed: %v", err)
 	}
@@ -488,26 +517,26 @@ func TestScopeResult_JSON(t *testing.T) {
 	if !slices.Equal(roundTrip.Languages, result.Languages) {
 		t.Errorf("round-trip Languages: got %v, want %v", roundTrip.Languages, result.Languages)
 	}
-	if roundTrip.TotalFiles != result.TotalFiles {
-		t.Errorf("round-trip TotalFiles: got %d, want %d", roundTrip.TotalFiles, result.TotalFiles)
+	if roundTrip.Stats.TotalFiles != result.Stats.TotalFiles {
+		t.Errorf("round-trip TotalFiles: got %d, want %d", roundTrip.Stats.TotalFiles, result.Stats.TotalFiles)
 	}
-	if roundTrip.TotalAdditions != result.TotalAdditions {
-		t.Errorf("round-trip TotalAdditions: got %d, want %d", roundTrip.TotalAdditions, result.TotalAdditions)
+	if roundTrip.Stats.TotalAdditions != result.Stats.TotalAdditions {
+		t.Errorf("round-trip TotalAdditions: got %d, want %d", roundTrip.Stats.TotalAdditions, result.Stats.TotalAdditions)
 	}
-	if roundTrip.TotalDeletions != result.TotalDeletions {
-		t.Errorf("round-trip TotalDeletions: got %d, want %d", roundTrip.TotalDeletions, result.TotalDeletions)
+	if roundTrip.Stats.TotalDeletions != result.Stats.TotalDeletions {
+		t.Errorf("round-trip TotalDeletions: got %d, want %d", roundTrip.Stats.TotalDeletions, result.Stats.TotalDeletions)
 	}
-	if !slices.Equal(roundTrip.ModifiedFiles, result.ModifiedFiles) {
-		t.Errorf("round-trip ModifiedFiles: got %v, want %v", roundTrip.ModifiedFiles, result.ModifiedFiles)
+	if !slices.Equal(roundTrip.Files.Modified, result.Files.Modified) {
+		t.Errorf("round-trip ModifiedFiles: got %v, want %v", roundTrip.Files.Modified, result.Files.Modified)
 	}
-	if !slices.Equal(roundTrip.AddedFiles, result.AddedFiles) {
-		t.Errorf("round-trip AddedFiles: got %v, want %v", roundTrip.AddedFiles, result.AddedFiles)
+	if !slices.Equal(roundTrip.Files.Added, result.Files.Added) {
+		t.Errorf("round-trip AddedFiles: got %v, want %v", roundTrip.Files.Added, result.Files.Added)
 	}
-	if !slices.Equal(roundTrip.DeletedFiles, result.DeletedFiles) {
-		t.Errorf("round-trip DeletedFiles: got %v, want %v", roundTrip.DeletedFiles, result.DeletedFiles)
+	if !slices.Equal(roundTrip.Files.Deleted, result.Files.Deleted) {
+		t.Errorf("round-trip DeletedFiles: got %v, want %v", roundTrip.Files.Deleted, result.Files.Deleted)
 	}
-	if !slices.Equal(roundTrip.PackagesAffected, result.PackagesAffected) {
-		t.Errorf("round-trip PackagesAffected: got %v, want %v", roundTrip.PackagesAffected, result.PackagesAffected)
+	if !slices.Equal(roundTrip.Packages, result.Packages) {
+		t.Errorf("round-trip PackagesAffected: got %v, want %v", roundTrip.Packages, result.Packages)
 	}
 }
 
@@ -625,6 +654,13 @@ func TestDetector_DetectFromRefs(t *testing.T) {
 				}
 			},
 		},
+		{
+			name:       "git diff error propagates",
+			baseRef:    "main",
+			headRef:    "HEAD",
+			mockResult: nil,
+			mockErr:    errors.New("git diff failed"),
+		},
 	}
 
 	for _, tt := range tests {
@@ -636,6 +672,16 @@ func TestDetector_DetectFromRefs(t *testing.T) {
 			}
 
 			result, err := d.DetectFromRefs(tt.baseRef, tt.headRef)
+			if tt.mockErr != nil {
+				if err == nil {
+					t.Fatalf("DetectFromRefs() expected error")
+				}
+				if !strings.Contains(err.Error(), tt.mockErr.Error()) {
+					t.Fatalf("DetectFromRefs() error = %v, want containing %q", err, tt.mockErr.Error())
+				}
+				return
+			}
+
 			if err != nil {
 				t.Errorf("DetectFromRefs() unexpected error: %v", err)
 				return
@@ -677,6 +723,11 @@ func TestDetector_DetectAllChanges(t *testing.T) {
 				}
 			},
 		},
+		{
+			name:       "all changes diff error propagates",
+			mockResult: nil,
+			mockErr:    errors.New("all changes failed"),
+		},
 	}
 
 	for _, tt := range tests {
@@ -688,6 +739,16 @@ func TestDetector_DetectAllChanges(t *testing.T) {
 			}
 
 			result, err := d.DetectAllChanges()
+			if tt.mockErr != nil {
+				if err == nil {
+					t.Fatalf("DetectAllChanges() expected error")
+				}
+				if !strings.Contains(err.Error(), tt.mockErr.Error()) {
+					t.Fatalf("DetectAllChanges() error = %v, want containing %q", err, tt.mockErr.Error())
+				}
+				return
+			}
+
 			if err != nil {
 				t.Errorf("DetectAllChanges() unexpected error: %v", err)
 				return
