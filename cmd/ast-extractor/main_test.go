@@ -2,12 +2,38 @@
 package main
 
 import (
+	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 
+	"github.com/lerianstudio/mithril/internal/ast"
 	"github.com/lerianstudio/mithril/internal/fileutil"
 )
+
+var validateScriptsDirWorkingDirMu sync.Mutex
+
+func setTestWorkingDir(t *testing.T, dir string) {
+	t.Helper()
+	validateScriptsDirWorkingDirMu.Lock()
+	oldWd, err := os.Getwd()
+	if err != nil {
+		validateScriptsDirWorkingDirMu.Unlock()
+		t.Fatalf("Failed to get current working directory: %v", err)
+	}
+	if err := os.Chdir(dir); err != nil {
+		validateScriptsDirWorkingDirMu.Unlock()
+		t.Fatalf("Failed to change directory: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := os.Chdir(oldWd); err != nil {
+			t.Errorf("Failed to restore working directory: %v", err)
+		}
+		validateScriptsDirWorkingDirMu.Unlock()
+	})
+}
 
 func TestValidateScriptsDir(t *testing.T) {
 	tests := []struct {
@@ -19,30 +45,62 @@ func TestValidateScriptsDir(t *testing.T) {
 		{
 			name: "valid_directory",
 			setup: func(t *testing.T) string {
-				return t.TempDir()
+				tmpDir := t.TempDir()
+				setTestWorkingDir(t, tmpDir)
+				scriptsDir := filepath.Join(tmpDir, "scripts")
+				if err := os.Mkdir(scriptsDir, 0o755); err != nil {
+					t.Fatalf("Failed to create scripts directory: %v", err)
+				}
+				return scriptsDir
 			},
 			wantErr: false,
 		},
 		{
 			name: "path_traversal_double_dot",
 			setup: func(t *testing.T) string {
-				return "../../../etc"
+				cwd := t.TempDir()
+				setTestWorkingDir(t, cwd)
+				return string(filepath.Separator)
 			},
 			wantErr:   true,
-			errSubstr: "path traversal",
+			errSubstr: "must be within",
 		},
 		{
 			name: "path_traversal_in_middle",
 			setup: func(t *testing.T) string {
-				return "/valid/path/../../../etc"
+				cwd := filepath.Join(t.TempDir(), "repo")
+				if err := os.MkdirAll(cwd, 0o755); err != nil {
+					t.Fatalf("Failed to create cwd: %v", err)
+				}
+				setTestWorkingDir(t, cwd)
+				return string(filepath.Separator)
 			},
 			wantErr:   true,
-			errSubstr: "path traversal",
+			errSubstr: "must be within",
+		},
+		{
+			name: "explicit_path_outside_allowed",
+			setup: func(t *testing.T) string {
+				tmpDir := t.TempDir()
+				repoDir := filepath.Join(tmpDir, "repo")
+				outside := filepath.Join(tmpDir, "external-scripts")
+				if err := os.MkdirAll(repoDir, 0o755); err != nil {
+					t.Fatalf("Failed to create repo directory: %v", err)
+				}
+				if err := os.MkdirAll(outside, 0o755); err != nil {
+					t.Fatalf("Failed to create external scripts directory: %v", err)
+				}
+				setTestWorkingDir(t, repoDir)
+				return outside
+			},
+			wantErr: false,
 		},
 		{
 			name: "nonexistent_directory",
 			setup: func(t *testing.T) string {
-				return "/nonexistent/path/that/does/not/exist"
+				tmpDir := t.TempDir()
+				setTestWorkingDir(t, tmpDir)
+				return filepath.Join(tmpDir, "missing", "scripts")
 			},
 			wantErr:   true,
 			errSubstr: "does not exist",
@@ -51,6 +109,7 @@ func TestValidateScriptsDir(t *testing.T) {
 			name: "file_instead_of_directory",
 			setup: func(t *testing.T) string {
 				tmpDir := t.TempDir()
+				setTestWorkingDir(t, tmpDir)
 				filePath := filepath.Join(tmpDir, "testfile.txt")
 				if err := os.WriteFile(filePath, []byte("test"), 0o644); err != nil {
 					t.Fatalf("Failed to create test file: %v", err)
@@ -77,16 +136,7 @@ func TestValidateScriptsDir(t *testing.T) {
 				if err := os.Mkdir(subDir, 0o755); err != nil {
 					t.Fatalf("Failed to create subdirectory: %v", err)
 				}
-				// Change to tmpDir and return relative path
-				oldWd, _ := os.Getwd()
-				t.Cleanup(func() {
-					if err := os.Chdir(oldWd); err != nil {
-						t.Fatalf("Failed to restore working directory: %v", err)
-					}
-				})
-				if err := os.Chdir(tmpDir); err != nil {
-					t.Fatalf("Failed to change directory: %v", err)
-				}
+				setTestWorkingDir(t, tmpDir)
 				return "scripts"
 			},
 			wantErr: false,
@@ -96,7 +146,11 @@ func TestValidateScriptsDir(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			scriptsDir := tt.setup(t)
-			err := validateScriptsDir(scriptsDir)
+			enforceBaseRestriction := true
+			if tt.name == "explicit_path_outside_allowed" {
+				enforceBaseRestriction = false
+			}
+			err := validateScriptsDir(scriptsDir, enforceBaseRestriction)
 
 			if tt.wantErr {
 				if err == nil {
@@ -338,6 +392,31 @@ func TestGetExtractorByLanguage(t *testing.T) {
 					tt.lang, extractor.Language(), tt.expectedLang)
 			}
 		})
+	}
+}
+
+func TestProcessBatch_ValidatesPairPaths(t *testing.T) {
+	tmpDir := t.TempDir()
+	batchPath := filepath.Join(tmpDir, "batch.json")
+
+	pairs := []map[string]string{
+		{"before_path": "../../etc/passwd", "after_path": ""},
+	}
+
+	data, err := json.Marshal(pairs)
+	if err != nil {
+		t.Fatalf("failed to marshal batch JSON: %v", err)
+	}
+	if err := os.WriteFile(batchPath, data, 0o644); err != nil {
+		t.Fatalf("failed to write batch file: %v", err)
+	}
+
+	err = processBatch(context.Background(), ast.NewRegistry(), batchPath)
+	if err == nil {
+		t.Fatal("expected path validation error for traversal path")
+	}
+	if !containsSubstring(err.Error(), "invalid before_path") {
+		t.Fatalf("expected invalid before_path error, got: %v", err)
 	}
 }
 

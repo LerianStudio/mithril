@@ -75,7 +75,7 @@ func (v *PathValidator) ValidatePath(path string) (string, error) {
 			realParent, err := filepath.EvalSymlinks(parentDir)
 			if err != nil {
 				if os.IsNotExist(err) {
-					return "", fmt.Errorf("parent directory does not exist: %s", parentDir)
+					return "", fmt.Errorf("parent directory does not exist")
 				}
 				return "", fmt.Errorf("failed to evaluate symlinks: %w", err)
 			}
@@ -93,7 +93,7 @@ func (v *PathValidator) ValidatePath(path string) (string, error) {
 	// Check if the path is within the base directory
 	// The path must either equal the base or be a child of it
 	if !strings.HasPrefix(cleanPath, cleanBase+string(filepath.Separator)) && cleanPath != cleanBase {
-		return "", fmt.Errorf("%w: path %q escapes base directory %q", ErrPathTraversal, path, v.baseDir)
+		return "", fmt.Errorf("%w: path escapes base directory", ErrPathTraversal)
 	}
 
 	return realPath, nil

@@ -7,6 +7,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+
+	"github.com/lerianstudio/mithril/internal/procenv"
 )
 
 // TypeScriptExtractor implements AST extraction for TypeScript files
@@ -62,8 +64,9 @@ func (t *TypeScriptExtractor) ExtractDiff(ctx context.Context, beforePath, after
 	}
 
 	args := []string{t.scriptPath, "--before", before, "--after", after}
+	args = append(args, "--base-dir", deriveBaseDir(beforePath, afterPath))
 	cmd := exec.CommandContext(ctx, t.nodeExecutable, args...) // #nosec G204 - args are controlled
-	cmd.Env = append([]string{"LC_ALL=C"}, os.Environ()...)
+	cmd.Env = procenv.Build()
 	output, err := cmd.Output()
 	if err != nil {
 		if exitErr, ok := err.(*exec.ExitError); ok {

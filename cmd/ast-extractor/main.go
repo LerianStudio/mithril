@@ -14,6 +14,27 @@ import (
 	"github.com/lerianstudio/mithril/internal/fileutil"
 )
 
+func canonicalDir(path string) (string, error) {
+	absPath, err := filepath.Abs(path)
+	if err != nil {
+		return "", fmt.Errorf("failed to resolve absolute path for %q: %w", path, err)
+	}
+
+	realPath, err := filepath.EvalSymlinks(absPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return "", fmt.Errorf("directory does not exist: %s", absPath)
+		}
+		return "", fmt.Errorf("failed to evaluate symlinks for %q: %w", absPath, err)
+	}
+
+	return realPath, nil
+}
+
+func pathWithinBase(path, base string) bool {
+	return path == base || strings.HasPrefix(path, base+string(filepath.Separator))
+}
+
 var (
 	beforeFile = flag.String("before", "", "Path to the before version of the file")
 	afterFile  = flag.String("after", "", "Path to the after version of the file")
@@ -56,16 +77,53 @@ func main() {
 }
 
 // validateScriptsDir validates the scripts directory path for security.
-// It prevents path traversal attacks and verifies the directory exists.
-func validateScriptsDir(scriptsDir string) error {
+// When enforceBaseRestriction is true, scriptsDir must be within cwd or the
+// executable root. Explicit --scripts paths are trusted and only existence/type
+// checks are enforced.
+func validateScriptsDir(scriptsDir string, enforceBaseRestriction bool) error {
 	if scriptsDir == "" {
 		return nil
 	}
-	if strings.Contains(scriptsDir, "..") {
-		return fmt.Errorf("path traversal detected in scripts directory")
+
+	resolvedScriptsDir, err := canonicalDir(scriptsDir)
+	if err != nil {
+		return err
 	}
-	_, err := fileutil.ValidateDirectory(scriptsDir, "")
-	return err
+
+	info, err := os.Stat(resolvedScriptsDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return fmt.Errorf("directory does not exist: %s", resolvedScriptsDir)
+		}
+		return fmt.Errorf("failed to stat directory: %w", err)
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("path is not a directory: %s", resolvedScriptsDir)
+	}
+
+	if !enforceBaseRestriction {
+		return nil
+	}
+
+	allowedBases := make([]string, 0, 2)
+	if cwd, err := os.Getwd(); err == nil {
+		allowedBases = append(allowedBases, cwd)
+	}
+	if execPath, err := os.Executable(); err == nil {
+		allowedBases = append(allowedBases, filepath.Join(filepath.Dir(execPath), "..", ".."))
+	}
+
+	for _, base := range allowedBases {
+		resolvedBase, err := canonicalDir(base)
+		if err != nil {
+			continue
+		}
+		if pathWithinBase(resolvedScriptsDir, resolvedBase) {
+			return nil
+		}
+	}
+
+	return fmt.Errorf("scripts directory must be within working directory or executable root: %s", scriptsDir)
 }
 
 func run() error {
@@ -82,7 +140,7 @@ func run() error {
 	}
 
 	// Validate scripts directory before use (ALWAYS, not just when flag provided)
-	if err := validateScriptsDir(scriptsPath); err != nil {
+	if err := validateScriptsDir(scriptsPath, *scriptDir == ""); err != nil {
 		return fmt.Errorf("scripts directory validation failed: %w", err)
 	}
 
@@ -204,6 +262,32 @@ func processBatch(ctx context.Context, registry *ast.Registry, batchPath string)
 	// Ensure pairs is not nil (can be nil for empty JSON array or null)
 	if pairs == nil {
 		pairs = []ast.FilePair{}
+	}
+
+	workDir, workErr := os.Getwd()
+	if workErr != nil {
+		return fmt.Errorf("failed to get working directory: %w", workErr)
+	}
+	validator, validatorErr := ast.NewPathValidator(workDir)
+	if validatorErr != nil {
+		return fmt.Errorf("failed to initialize path validator: %w", validatorErr)
+	}
+
+	for i := range pairs {
+		if pairs[i].BeforePath != "" {
+			validated, validateErr := validator.ValidatePath(pairs[i].BeforePath)
+			if validateErr != nil {
+				return fmt.Errorf("invalid before_path in batch entry %d: %w", i, validateErr)
+			}
+			pairs[i].BeforePath = validated
+		}
+		if pairs[i].AfterPath != "" {
+			validated, validateErr := validator.ValidatePath(pairs[i].AfterPath)
+			if validateErr != nil {
+				return fmt.Errorf("invalid after_path in batch entry %d: %w", i, validateErr)
+			}
+			pairs[i].AfterPath = validated
+		}
 	}
 
 	if *verbose {

@@ -2,6 +2,8 @@ import * as fs from "fs"
 import * as path from "path"
 import * as ts from "typescript"
 
+const MAX_AST_FILE_SIZE = 10 * 1024 * 1024
+
 interface Param {
   name: string
   type: string
@@ -43,7 +45,19 @@ interface TypeDiff {
 interface ImportDiff {
   path: string
   alias?: string
-  change_type: "added" | "removed"
+  change_type: "added" | "removed" | "modified"
+}
+
+interface VarDiff {
+  name: string
+  kind: "var" | "const"
+  change_type: "added" | "removed" | "modified"
+  old_type?: string
+  new_type?: string
+  old_value?: string
+  new_value?: string
+  start_line?: number
+  end_line?: number
 }
 
 interface ChangeSummary {
@@ -65,6 +79,7 @@ interface SemanticDiff {
   file_path: string
   functions: FunctionDiff[]
   types: TypeDiff[]
+  variables: VarDiff[]
   imports: ImportDiff[]
   summary: ChangeSummary
   error?: string
@@ -90,20 +105,79 @@ interface ParsedType {
   endLine: number
 }
 
+interface ParsedVar {
+  name: string
+  kind: "var" | "const"
+  type: string
+  value: string
+  startLine: number
+  endLine: number
+}
+
 interface ParsedFile {
   functions: Map<string, ParsedFunc>
   types: Map<string, ParsedType>
+  variables: Map<string, ParsedVar>
   imports: Map<string, string>
+}
+
+function isWithinBase(targetPath: string, basePath: string): boolean {
+  const rel = path.relative(basePath, targetPath)
+  return rel === "" || (!rel.startsWith("..") && !path.isAbsolute(rel))
+}
+
+function resolveBaseDir(baseDir: string): string {
+  const base = baseDir || process.cwd()
+  const resolved = fs.realpathSync(base)
+  const stat = fs.statSync(resolved)
+  if (!stat.isDirectory()) {
+    throw new Error(`base directory is not a directory: ${resolved}`)
+  }
+  return resolved
+}
+
+function validateInputPath(filePath: string, baseDir: string): string {
+  if (!filePath) {
+    return ""
+  }
+
+  const absolutePath = path.resolve(filePath)
+  if (!isWithinBase(absolutePath, baseDir)) {
+    throw new Error(`file path escapes base directory: ${filePath}`)
+  }
+
+  if (fs.existsSync(absolutePath)) {
+    const realPath = fs.realpathSync(absolutePath)
+    if (!isWithinBase(realPath, baseDir)) {
+      throw new Error(`file path escapes base directory via symlink: ${filePath}`)
+    }
+
+    const stat = fs.statSync(realPath)
+    if (!stat.isFile()) {
+      throw new Error(`path is not a file: ${realPath}`)
+    }
+    if (stat.size > MAX_AST_FILE_SIZE) {
+      throw new Error(`file exceeds maximum allowed size (${MAX_AST_FILE_SIZE} bytes): ${realPath}`)
+    }
+  }
+
+  return absolutePath
 }
 
 function parseFile(filePath: string): ParsedFile {
   const result: ParsedFile = {
     functions: new Map(),
     types: new Map(),
+    variables: new Map(),
     imports: new Map(),
   }
 
   if (!filePath || !fs.existsSync(filePath)) {
+    return result
+  }
+
+  const fileStat = fs.statSync(filePath)
+  if (fileStat.size > MAX_AST_FILE_SIZE) {
     return result
   }
 
@@ -172,6 +246,19 @@ function parseFile(filePath: string): ParsedFile {
     if (ts.isVariableStatement(node)) {
       const exported = isExported(node)
       node.declarationList.declarations.forEach((decl) => {
+		if (node.parent && ts.isSourceFile(node.parent) && ts.isIdentifier(decl.name)) {
+			const kind = (node.declarationList.flags & ts.NodeFlags.Const) !== 0 ? "const" : "var"
+			const parsedVar: ParsedVar = {
+				name: decl.name.text,
+				kind,
+				type: typeToString(decl.type),
+				value: decl.initializer ? decl.initializer.getText(sourceFile).trim() : "",
+				startLine: getLineNumber(decl.pos),
+				endLine: getLineNumber(decl.end),
+			}
+			result.variables.set(parsedVar.name, parsedVar)
+		}
+
         if (
           ts.isIdentifier(decl.name) &&
           decl.initializer &&
@@ -483,6 +570,16 @@ function compareImports(before: Map<string, string>, after: Map<string, string>)
         alias: alias || undefined,
         change_type: "removed",
       })
+      return
+    }
+
+    const afterAlias = after.get(importPath) || ""
+    if (afterAlias !== alias) {
+      diffs.push({
+        path: importPath,
+        alias: afterAlias || undefined,
+        change_type: "modified",
+      })
     }
   })
 
@@ -499,12 +596,63 @@ function compareImports(before: Map<string, string>, after: Map<string, string>)
   return diffs
 }
 
+function compareVariables(before: Map<string, ParsedVar>, after: Map<string, ParsedVar>): VarDiff[] {
+  const diffs: VarDiff[] = []
+
+  before.forEach((beforeVar, name) => {
+    const afterVar = after.get(name)
+    if (!afterVar) {
+      diffs.push({
+        name,
+        kind: beforeVar.kind,
+        change_type: "removed",
+        old_type: beforeVar.type,
+        old_value: beforeVar.value,
+        start_line: beforeVar.startLine,
+        end_line: beforeVar.endLine,
+      })
+      return
+    }
+
+    if (beforeVar.type !== afterVar.type || beforeVar.value !== afterVar.value) {
+      diffs.push({
+        name,
+        kind: afterVar.kind,
+        change_type: "modified",
+        old_type: beforeVar.type,
+        new_type: afterVar.type,
+        old_value: beforeVar.value,
+        new_value: afterVar.value,
+        start_line: afterVar.startLine,
+        end_line: afterVar.endLine,
+      })
+    }
+  })
+
+  after.forEach((afterVar, name) => {
+    if (!before.has(name)) {
+      diffs.push({
+        name,
+        kind: afterVar.kind,
+        change_type: "added",
+        new_type: afterVar.type,
+        new_value: afterVar.value,
+        start_line: afterVar.startLine,
+        end_line: afterVar.endLine,
+      })
+    }
+  })
+
+  return diffs
+}
+
 function extractDiff(beforePath: string, afterPath: string): SemanticDiff {
   const before = parseFile(beforePath)
   const after = parseFile(afterPath)
 
   const functions = compareFunctions(before.functions, after.functions)
   const types = compareTypes(before.types, after.types)
+  const variables = compareVariables(before.variables, after.variables)
   const imports = compareImports(before.imports, after.imports)
 
   const summary: ChangeSummary = {
@@ -514,9 +662,9 @@ function extractDiff(beforePath: string, afterPath: string): SemanticDiff {
     types_added: types.filter((t) => t.change_type === "added").length,
     types_removed: types.filter((t) => t.change_type === "removed").length,
     types_modified: types.filter((t) => t.change_type === "modified").length,
-    variables_added: 0,
-    variables_removed: 0,
-    variables_modified: 0,
+    variables_added: variables.filter((v) => v.change_type === "added").length,
+    variables_removed: variables.filter((v) => v.change_type === "removed").length,
+    variables_modified: variables.filter((v) => v.change_type === "modified").length,
     imports_added: imports.filter((i) => i.change_type === "added").length,
     imports_removed: imports.filter((i) => i.change_type === "removed").length,
   }
@@ -526,15 +674,17 @@ function extractDiff(beforePath: string, afterPath: string): SemanticDiff {
     file_path: afterPath || beforePath,
     functions,
     types,
+    variables,
     imports,
     summary,
   }
 }
 
 // CLI argument parsing
-function parseArgs(args: string[]): { before: string; after: string } {
+function parseArgs(args: string[]): { before: string; after: string; baseDir: string } {
   let before = ""
   let after = ""
+  let baseDir = ""
 
   for (let i = 0; i < args.length; i++) {
     const arg = args[i]
@@ -543,6 +693,9 @@ function parseArgs(args: string[]): { before: string; after: string } {
       i++
     } else if (arg === "--after" && i + 1 < args.length) {
       after = args[i + 1]
+      i++
+    } else if (arg === "--base-dir" && i + 1 < args.length) {
+      baseDir = args[i + 1]
       i++
     } else if (!arg.startsWith("--")) {
       // Positional arguments for backward compatibility
@@ -563,7 +716,7 @@ function parseArgs(args: string[]): { before: string; after: string } {
     after = ""
   }
 
-  return { before, after }
+  return { before, after, baseDir }
 }
 
 // CLI entry point
@@ -576,14 +729,19 @@ function main() {
     process.exit(1)
   }
 
-  const { before: beforePath, after: afterPath } = parseArgs(args)
-
-  if (!beforePath && !afterPath) {
-    console.error("Error: At least one of --before or --after must be specified")
-    process.exit(1)
-  }
+  const parsed = parseArgs(args)
+  let beforePath = parsed.before
+  let afterPath = parsed.after
 
   try {
+    const baseDir = resolveBaseDir(parsed.baseDir)
+    beforePath = validateInputPath(beforePath, baseDir)
+    afterPath = validateInputPath(afterPath, baseDir)
+
+    if (!beforePath && !afterPath) {
+      throw new Error("At least one of --before or --after must be specified")
+    }
+
     const diff = extractDiff(beforePath, afterPath)
     console.log(JSON.stringify(diff, null, 2))
   } catch (error) {
@@ -592,6 +750,7 @@ function main() {
       file_path: afterPath || beforePath,
       functions: [],
       types: [],
+      variables: [],
       imports: [],
       summary: {
         functions_added: 0,

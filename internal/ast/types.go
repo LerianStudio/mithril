@@ -7,7 +7,6 @@ const (
 	ChangeAdded    ChangeType = "added"
 	ChangeRemoved  ChangeType = "removed"
 	ChangeModified ChangeType = "modified"
-	ChangeRenamed  ChangeType = "renamed"
 )
 
 // Param represents a function parameter

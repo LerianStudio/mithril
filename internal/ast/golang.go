@@ -14,7 +14,10 @@ import (
 	"unicode"
 )
 
-// GoExtractor implements AST extraction for Go files
+const maxASTFileSize = 10 * 1024 * 1024
+
+// GoExtractor implements AST extraction for Go files.
+// It is intentionally stateless and uses value receivers.
 type GoExtractor struct{}
 
 // NewGoExtractor creates a new Go AST extractor
@@ -22,11 +25,11 @@ func NewGoExtractor() *GoExtractor {
 	return &GoExtractor{}
 }
 
-func (g *GoExtractor) Language() string {
+func (g GoExtractor) Language() string {
 	return "go"
 }
 
-func (g *GoExtractor) SupportedExtensions() []string {
+func (g GoExtractor) SupportedExtensions() []string {
 	return []string{".go"}
 }
 
@@ -81,20 +84,23 @@ type GoVar struct {
 	EndLine    int
 }
 
-func (g *GoExtractor) parseFile(path string) (*ParsedFile, error) {
+func (g GoExtractor) parseFile(path string) (*ParsedFile, error) {
 	if path == "" {
-		return &ParsedFile{
-			Functions: make(map[string]*GoFunc),
-			Types:     make(map[string]*GoType),
-			Variables: make(map[string]*GoVar),
-			Imports:   make(map[string]string),
-		}, nil
+		return nil, fmt.Errorf("file path cannot be empty")
 	}
 
 	validatedPath, err := ValidatePath(path, "")
 	if err != nil {
 		return nil, fmt.Errorf("invalid file path: %w", err)
 	}
+	info, err := os.Stat(validatedPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to stat file: %w", err)
+	}
+	if info.Size() > maxASTFileSize {
+		return nil, fmt.Errorf("file exceeds maximum allowed size (%d bytes)", maxASTFileSize)
+	}
+
 	content, err := os.ReadFile(validatedPath) // #nosec G304 - path validated via ast.ValidatePath
 	if err != nil {
 		return nil, fmt.Errorf("failed to read file: %w", err)
@@ -103,6 +109,9 @@ func (g *GoExtractor) parseFile(path string) (*ParsedFile, error) {
 	fset := token.NewFileSet()
 	file, err := parser.ParseFile(fset, path, content, parser.ParseComments)
 	if err != nil {
+		if file != nil {
+			return nil, fmt.Errorf("failed to parse Go file (partial AST discarded): %w", err)
+		}
 		return nil, fmt.Errorf("failed to parse Go file: %w", err)
 	}
 
@@ -167,7 +176,7 @@ func (g *GoExtractor) parseFile(path string) (*ParsedFile, error) {
 	return parsed, nil
 }
 
-func (g *GoExtractor) extractFunc(fset *token.FileSet, fn *ast.FuncDecl) *GoFunc {
+func (g GoExtractor) extractFunc(fset *token.FileSet, fn *ast.FuncDecl) *GoFunc {
 	isExported := false
 	if len(fn.Name.Name) > 0 {
 		isExported = unicode.IsUpper(rune(fn.Name.Name[0]))
@@ -213,14 +222,15 @@ func (g *GoExtractor) extractFunc(fset *token.FileSet, fn *ast.FuncDecl) *GoFunc
 	if fn.Body != nil {
 		var buf bytes.Buffer
 		if err := printer.Fprint(&buf, fset, fn.Body); err == nil {
-			goFn.BodyHash = fmt.Sprintf("%x", buf.Bytes())
+			hash := sha256.Sum256(buf.Bytes())
+			goFn.BodyHash = fmt.Sprintf("%x", hash[:])
 		}
 	}
 
 	return goFn
 }
 
-func (g *GoExtractor) extractVars(fset *token.FileSet, spec *ast.ValueSpec, tok token.Token) []*GoVar {
+func (g GoExtractor) extractVars(fset *token.FileSet, spec *ast.ValueSpec, tok token.Token) []*GoVar {
 	kind := "var"
 	if tok == token.CONST {
 		kind = "const"
@@ -252,7 +262,7 @@ func (g *GoExtractor) extractVars(fset *token.FileSet, spec *ast.ValueSpec, tok 
 			Kind:       kind,
 			Type:       varType,
 			Value:      valueHash,
-			IsExported: unicode.IsUpper(rune(name.Name[0])),
+			IsExported: len(name.Name) > 0 && unicode.IsUpper(rune(name.Name[0])),
 			StartLine:  startLine,
 			EndLine:    endLine,
 		})
@@ -261,10 +271,11 @@ func (g *GoExtractor) extractVars(fset *token.FileSet, spec *ast.ValueSpec, tok 
 	return vars
 }
 
-func (g *GoExtractor) extractType(fset *token.FileSet, ts *ast.TypeSpec) *GoType {
+func (g GoExtractor) extractType(fset *token.FileSet, ts *ast.TypeSpec) *GoType {
+	isExported := len(ts.Name.Name) > 0 && unicode.IsUpper(rune(ts.Name.Name[0]))
 	goType := &GoType{
 		Name:       ts.Name.Name,
-		IsExported: unicode.IsUpper(rune(ts.Name.Name[0])),
+		IsExported: isExported,
 		StartLine:  fset.Position(ts.Pos()).Line,
 		EndLine:    fset.Position(ts.End()).Line,
 	}
@@ -304,7 +315,9 @@ func (g *GoExtractor) extractType(fset *token.FileSet, ts *ast.TypeSpec) *GoType
 			for _, method := range t.Methods.List {
 				if len(method.Names) > 0 {
 					goType.Methods = append(goType.Methods, method.Names[0].Name)
+					continue
 				}
+				goType.Methods = append(goType.Methods, g.typeToString(method.Type))
 			}
 		}
 
@@ -315,7 +328,7 @@ func (g *GoExtractor) extractType(fset *token.FileSet, ts *ast.TypeSpec) *GoType
 	return goType
 }
 
-func (g *GoExtractor) typeToString(expr ast.Expr) string {
+func (g GoExtractor) typeToString(expr ast.Expr) string {
 	var buf bytes.Buffer
 	if err := printer.Fprint(&buf, token.NewFileSet(), expr); err != nil {
 		return ""
@@ -323,7 +336,7 @@ func (g *GoExtractor) typeToString(expr ast.Expr) string {
 	return buf.String()
 }
 
-func (g *GoExtractor) exprListToString(exprs []ast.Expr) string {
+func (g GoExtractor) exprListToString(exprs []ast.Expr) string {
 	if len(exprs) == 0 {
 		return ""
 	}
@@ -359,12 +372,12 @@ func hashValue(value string) string {
 }
 
 // ExtractDiff compares two Go files and returns semantic differences
-func (g *GoExtractor) ExtractDiff(ctx context.Context, beforePath, afterPath string) (*SemanticDiff, error) {
+func (g GoExtractor) ExtractDiff(ctx context.Context, beforePath, afterPath string) (*SemanticDiff, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 
-	before, err := g.parseFile(beforePath)
+	before, err := g.parsePathOrEmpty(beforePath)
 	if err != nil {
 		return nil, fmt.Errorf("parsing before file: %w", err)
 	}
@@ -373,7 +386,7 @@ func (g *GoExtractor) ExtractDiff(ctx context.Context, beforePath, afterPath str
 		return nil, err
 	}
 
-	after, err := g.parseFile(afterPath)
+	after, err := g.parsePathOrEmpty(afterPath)
 	if err != nil {
 		return nil, fmt.Errorf("parsing after file: %w", err)
 	}
@@ -405,7 +418,20 @@ func (g *GoExtractor) ExtractDiff(ctx context.Context, beforePath, afterPath str
 	return diff, nil
 }
 
-func (g *GoExtractor) compareFunctions(before, after map[string]*GoFunc) []FunctionDiff {
+func (g GoExtractor) parsePathOrEmpty(path string) (*ParsedFile, error) {
+	if path == "" {
+		return &ParsedFile{
+			Functions: make(map[string]*GoFunc),
+			Types:     make(map[string]*GoType),
+			Variables: make(map[string]*GoVar),
+			Imports:   make(map[string]string),
+		}, nil
+	}
+
+	return g.parseFile(path)
+}
+
+func (g GoExtractor) compareFunctions(before, after map[string]*GoFunc) []FunctionDiff {
 	var diffs []FunctionDiff
 
 	// Find removed and modified functions
@@ -447,7 +473,7 @@ func (g *GoExtractor) compareFunctions(before, after map[string]*GoFunc) []Funct
 	return diffs
 }
 
-func (g *GoExtractor) funcToSig(fn *GoFunc) *FuncSig {
+func (g GoExtractor) funcToSig(fn *GoFunc) *FuncSig {
 	if fn == nil {
 		return &FuncSig{}
 	}
@@ -462,7 +488,7 @@ func (g *GoExtractor) funcToSig(fn *GoFunc) *FuncSig {
 	}
 }
 
-func (g *GoExtractor) funcChanged(before, after *GoFunc) bool {
+func (g GoExtractor) funcChanged(before, after *GoFunc) bool {
 	// Check signature changes
 	if !g.paramsEqual(before.Params, after.Params) {
 		return true
@@ -480,7 +506,7 @@ func (g *GoExtractor) funcChanged(before, after *GoFunc) bool {
 	return false
 }
 
-func (g *GoExtractor) describeFuncChange(before, after *GoFunc) string {
+func (g GoExtractor) describeFuncChange(before, after *GoFunc) string {
 	var changes []string
 
 	if !g.paramsEqual(before.Params, after.Params) {
@@ -499,7 +525,7 @@ func (g *GoExtractor) describeFuncChange(before, after *GoFunc) string {
 	return strings.Join(changes, ", ")
 }
 
-func (g *GoExtractor) compareTypes(before, after map[string]*GoType) []TypeDiff {
+func (g GoExtractor) compareTypes(before, after map[string]*GoType) []TypeDiff {
 	var diffs []TypeDiff
 
 	// Find removed and modified types
@@ -546,7 +572,7 @@ func (g *GoExtractor) compareTypes(before, after map[string]*GoType) []TypeDiff 
 	return diffs
 }
 
-func (g *GoExtractor) compareVariables(before, after map[string]*GoVar) []VarDiff {
+func (g GoExtractor) compareVariables(before, after map[string]*GoVar) []VarDiff {
 	var diffs []VarDiff
 
 	for name, beforeVar := range before {
@@ -596,7 +622,7 @@ func (g *GoExtractor) compareVariables(before, after map[string]*GoVar) []VarDif
 	return diffs
 }
 
-func (g *GoExtractor) compareFields(before, after []GoField) []FieldDiff {
+func (g GoExtractor) compareFields(before, after []GoField) []FieldDiff {
 	var diffs []FieldDiff
 
 	beforeMap := make(map[string]GoField)
@@ -645,7 +671,7 @@ func (g *GoExtractor) compareFields(before, after []GoField) []FieldDiff {
 	return diffs
 }
 
-func (g *GoExtractor) compareImports(before, after map[string]string) []ImportDiff {
+func (g GoExtractor) compareImports(before, after map[string]string) []ImportDiff {
 	var diffs []ImportDiff
 
 	for path, beforeAlias := range before {
@@ -677,7 +703,7 @@ func (g *GoExtractor) compareImports(before, after map[string]string) []ImportDi
 	return diffs
 }
 
-func (g *GoExtractor) paramsEqual(a, b []Param) bool {
+func (g GoExtractor) paramsEqual(a, b []Param) bool {
 	if len(a) != len(b) {
 		return false
 	}
@@ -689,7 +715,7 @@ func (g *GoExtractor) paramsEqual(a, b []Param) bool {
 	return true
 }
 
-func (g *GoExtractor) stringsEqual(a, b []string) bool {
+func (g GoExtractor) stringsEqual(a, b []string) bool {
 	if len(a) != len(b) {
 		return false
 	}

@@ -5,8 +5,13 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
+	"sync"
 	"testing"
+	"unicode/utf8"
 )
+
+var workingDirMu sync.Mutex
 
 func codereviewRoot(t *testing.T) string {
 	t.Helper()
@@ -27,15 +32,21 @@ func codereviewRoot(t *testing.T) string {
 
 func setWorkingDir(t *testing.T, dir string) {
 	t.Helper()
+	workingDirMu.Lock()
 	cwd, err := os.Getwd()
 	if err != nil {
+		workingDirMu.Unlock()
 		t.Fatalf("failed to get working directory: %v", err)
 	}
 	if err := os.Chdir(dir); err != nil {
+		workingDirMu.Unlock()
 		t.Fatalf("failed to change directory: %v", err)
 	}
 	t.Cleanup(func() {
-		_ = os.Chdir(cwd)
+		if err := os.Chdir(cwd); err != nil {
+			t.Errorf("failed to restore working directory: %v", err)
+		}
+		workingDirMu.Unlock()
 	})
 }
 
@@ -161,6 +172,10 @@ func TestGoExtractor_NewFile(t *testing.T) {
 			t.Errorf("expected function %s to be added, got %s", f.Name, f.ChangeType)
 		}
 	}
+
+	if len(diff.Functions) == 0 {
+		t.Fatal("expected at least one added function for new file")
+	}
 }
 
 func TestGoExtractor_DeletedFile(t *testing.T) {
@@ -180,6 +195,10 @@ func TestGoExtractor_DeletedFile(t *testing.T) {
 		if f.ChangeType != ChangeRemoved {
 			t.Errorf("expected function %s to be removed, got %s", f.Name, f.ChangeType)
 		}
+	}
+
+	if len(diff.Functions) == 0 {
+		t.Fatal("expected at least one removed function for deleted file")
 	}
 }
 
@@ -209,7 +228,7 @@ func TestGoExtractor_ParseFile_InvalidPath(t *testing.T) {
 	}
 }
 
-func TestGoExtractor_ParseFile_RespectsScope(t *testing.T) {
+func TestGoExtractor_ExtractDiff_RespectsScope(t *testing.T) {
 	extractor := NewGoExtractor()
 	path := filepath.Join(t.TempDir(), "sample.go")
 	content := `package main
@@ -232,18 +251,95 @@ func main() {
 	}
 
 	setWorkingDir(t, filepath.Dir(path))
+	diff, err := extractor.ExtractDiff(context.Background(), "", path)
+	if err != nil {
+		t.Fatalf("ExtractDiff failed: %v", err)
+	}
+
+	if len(diff.Functions) != 3 {
+		t.Fatalf("expected 3 added functions (main + 2 init), got %d", len(diff.Functions))
+	}
+
+	for _, fn := range diff.Functions {
+		if fn.ChangeType != ChangeAdded {
+			t.Fatalf("expected added function change type, got %s", fn.ChangeType)
+		}
+	}
+}
+
+func TestGoExtractor_ParseFile_RejectsOversizedFile(t *testing.T) {
+	extractor := NewGoExtractor()
+	path := filepath.Join(t.TempDir(), "oversized.go")
+
+	content := make([]byte, maxASTFileSize+1)
+	for i := range content {
+		content[i] = 'a'
+	}
+
+	if err := os.WriteFile(path, content, 0o644); err != nil {
+		t.Fatalf("failed to write oversized file: %v", err)
+	}
+
+	setWorkingDir(t, filepath.Dir(path))
+	_, err := extractor.parseFile(path)
+	if err == nil {
+		t.Fatal("expected oversized file to be rejected")
+	}
+	if !strings.Contains(err.Error(), "maximum allowed size") {
+		t.Fatalf("expected size limit error, got: %v", err)
+	}
+}
+
+func TestGoExtractor_ParseFile_EmptyPath(t *testing.T) {
+	extractor := NewGoExtractor()
+	_, err := extractor.parseFile("")
+	if err == nil {
+		t.Fatal("expected empty path error")
+	}
+}
+
+func TestGoExtractor_ZeroValueSafeMethods(t *testing.T) {
+	var extractor GoExtractor
+	if extractor.Language() != "go" {
+		t.Fatalf("expected go language from zero value")
+	}
+	extensions := extractor.SupportedExtensions()
+	if len(extensions) != 1 || extensions[0] != ".go" {
+		t.Fatalf("unexpected extensions from zero value: %v", extensions)
+	}
+}
+
+func TestGoExtractor_BodyHashUsesSHA256(t *testing.T) {
+	extractor := NewGoExtractor()
+	path := filepath.Join(t.TempDir(), "hash.go")
+	content := `package main
+
+func greet(name string) string {
+	return "hello, " + name
+}`
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatalf("failed to write file: %v", err)
+	}
+
+	setWorkingDir(t, filepath.Dir(path))
 	parsed, err := extractor.parseFile(path)
 	if err != nil {
 		t.Fatalf("parseFile failed: %v", err)
 	}
 
-	if parsed.Variables["Config"] == nil {
-		t.Fatalf("expected global Config variable")
+	fn := parsed.Functions["greet"]
+	if fn == nil {
+		t.Fatal("expected greet function to be parsed")
 	}
-	if parsed.Types["ConfigType"] == nil {
-		t.Fatalf("expected global ConfigType")
+	if len(fn.BodyHash) != 64 {
+		t.Fatalf("expected SHA-256 hash length 64, got %d (%q)", len(fn.BodyHash), fn.BodyHash)
 	}
-	if len(parsed.Functions) != 3 {
-		t.Fatalf("expected 3 functions (main + 2 init), got %d", len(parsed.Functions))
+	for _, r := range fn.BodyHash {
+		if (r < '0' || r > '9') && (r < 'a' || r > 'f') {
+			t.Fatalf("expected lowercase hex hash, got %q", fn.BodyHash)
+		}
+	}
+	if utf8.RuneCountInString(fn.BodyHash) != 64 {
+		t.Fatalf("expected 64 runes in hash, got %d", utf8.RuneCountInString(fn.BodyHash))
 	}
 }

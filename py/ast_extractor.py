@@ -7,12 +7,15 @@ and compares before/after versions to generate semantic diffs.
 """
 
 import ast
+import argparse
 import hashlib
 import json
 import sys
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Optional
+
+MAX_AST_FILE_SIZE = 10 * 1024 * 1024
 
 
 @dataclass
@@ -67,6 +70,19 @@ class ImportDiff:
 
 
 @dataclass
+class VarDiff:
+    name: str
+    kind: str  # var, const
+    change_type: str
+    old_type: str = ""
+    new_type: str = ""
+    old_value: str = ""
+    new_value: str = ""
+    start_line: int = 0
+    end_line: int = 0
+
+
+@dataclass
 class ChangeSummary:
     functions_added: int = 0
     functions_removed: int = 0
@@ -87,6 +103,7 @@ class SemanticDiff:
     file_path: str
     functions: list[FunctionDiff]
     types: list[TypeDiff]
+    variables: list[VarDiff]
     imports: list[ImportDiff]
     summary: ChangeSummary
     error: str = ""
@@ -117,9 +134,20 @@ class ParsedClass:
 
 
 @dataclass
+class ParsedVar:
+    name: str
+    kind: str
+    type: str
+    value: str
+    start_line: int
+    end_line: int
+
+
+@dataclass
 class ParsedFile:
     functions: dict[str, ParsedFunc]
     classes: dict[str, ParsedClass]
+    variables: dict[str, ParsedVar]
     imports: dict[str, str]  # module -> alias
     error: str = ""
 
@@ -133,9 +161,14 @@ def get_annotation_str(node: Optional[ast.expr]) -> str:
 
 def parse_file(file_path: str) -> ParsedFile:
     """Parse a Python file and extract semantic information."""
-    result = ParsedFile(functions={}, classes={}, imports={})
+    result = ParsedFile(functions={}, classes={}, variables={}, imports={})
 
     if not file_path or not Path(file_path).exists():
+        return result
+
+    file_info = Path(file_path).stat()
+    if file_info.st_size > MAX_AST_FILE_SIZE:
+        result.error = f"file exceeds maximum allowed size ({MAX_AST_FILE_SIZE} bytes): {file_path}"
         return result
 
     content = Path(file_path).read_text()
@@ -174,6 +207,31 @@ def parse_file(file_path: str) -> ParsedFile:
                     method.name = f"{cls.name}.{method.name}"
                     result.functions[method.name] = method
 
+        elif isinstance(node, ast.Assign):
+            value = ast.unparse(node.value) if node.value is not None else ""
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    name = target.id
+                    result.variables[name] = ParsedVar(
+                        name=name,
+                        kind="const" if name.isupper() else "var",
+                        type="",
+                        value=value,
+                        start_line=node.lineno,
+                        end_line=node.end_lineno or node.lineno,
+                    )
+
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            name = node.target.id
+            result.variables[name] = ParsedVar(
+                name=name,
+                kind="const" if name.isupper() else "var",
+                type=get_annotation_str(node.annotation),
+                value=ast.unparse(node.value) if node.value is not None else "",
+                start_line=node.lineno,
+                end_line=node.end_lineno or node.lineno,
+            )
+
     return result
 
 
@@ -198,9 +256,10 @@ def _parse_function(
         elif isinstance(dec, ast.Attribute):
             decorators.append(ast.unparse(dec))
 
-    # Hash the body for change detection
+    # Hash the function implementation body (excluding signature/decorators)
     end_line = node.end_lineno if node.end_lineno else node.lineno
-    body_lines = content.split("\n")[node.lineno - 1 : end_line]
+    body_start_line = node.body[0].lineno if node.body else node.lineno
+    body_lines = content.split("\n")[body_start_line - 1 : end_line]
     body_hash = hashlib.sha256("\n".join(body_lines).encode("utf-8")).hexdigest()
 
     return ParsedFunc(
@@ -423,10 +482,68 @@ def compare_imports(before: dict[str, str], after: dict[str, str]) -> list[Impor
     for path, alias in before.items():
         if path not in after:
             diffs.append(ImportDiff(path=path, alias=alias, change_type="removed"))
+        elif after[path] != alias:
+            diffs.append(
+                ImportDiff(path=path, alias=after[path], change_type="modified")
+            )
 
     for path, alias in after.items():
         if path not in before:
             diffs.append(ImportDiff(path=path, alias=alias, change_type="added"))
+
+    return diffs
+
+
+def compare_variables(
+    before: dict[str, ParsedVar], after: dict[str, ParsedVar]
+) -> list[VarDiff]:
+    """Compare module-level variables between before and after versions."""
+    diffs = []
+
+    for name, before_var in before.items():
+        after_var = after.get(name)
+        if after_var is None:
+            diffs.append(
+                VarDiff(
+                    name=name,
+                    kind=before_var.kind,
+                    change_type="removed",
+                    old_type=before_var.type,
+                    old_value=before_var.value,
+                    start_line=before_var.start_line,
+                    end_line=before_var.end_line,
+                )
+            )
+            continue
+
+        if before_var.type != after_var.type or before_var.value != after_var.value:
+            diffs.append(
+                VarDiff(
+                    name=name,
+                    kind=after_var.kind,
+                    change_type="modified",
+                    old_type=before_var.type,
+                    new_type=after_var.type,
+                    old_value=before_var.value,
+                    new_value=after_var.value,
+                    start_line=after_var.start_line,
+                    end_line=after_var.end_line,
+                )
+            )
+
+    for name, after_var in after.items():
+        if name not in before:
+            diffs.append(
+                VarDiff(
+                    name=name,
+                    kind=after_var.kind,
+                    change_type="added",
+                    new_type=after_var.type,
+                    new_value=after_var.value,
+                    start_line=after_var.start_line,
+                    end_line=after_var.end_line,
+                )
+            )
 
     return diffs
 
@@ -438,6 +555,7 @@ def extract_diff(before_path: str, after_path: str) -> SemanticDiff:
 
     functions = compare_functions(before.functions, after.functions)
     types = compare_classes(before.classes, after.classes)
+    variables = compare_variables(before.variables, after.variables)
     imports = compare_imports(before.imports, after.imports)
 
     summary = ChangeSummary(
@@ -447,6 +565,9 @@ def extract_diff(before_path: str, after_path: str) -> SemanticDiff:
         types_added=sum(1 for t in types if t.change_type == "added"),
         types_removed=sum(1 for t in types if t.change_type == "removed"),
         types_modified=sum(1 for t in types if t.change_type == "modified"),
+        variables_added=sum(1 for v in variables if v.change_type == "added"),
+        variables_removed=sum(1 for v in variables if v.change_type == "removed"),
+        variables_modified=sum(1 for v in variables if v.change_type == "modified"),
         imports_added=sum(1 for i in imports if i.change_type == "added"),
         imports_removed=sum(1 for i in imports if i.change_type == "removed"),
     )
@@ -456,13 +577,18 @@ def extract_diff(before_path: str, after_path: str) -> SemanticDiff:
         file_path=after_path or before_path,
         functions=functions,
         types=types,
+        variables=variables,
         imports=imports,
         summary=summary,
     )
 
 
 def dataclass_to_dict(obj):
-    """Recursively convert dataclass to dict, omitting empty values."""
+    """Recursively convert dataclass to dict, omitting empty values.
+
+    NOTE: dataclass field names are part of the JSON contract consumed by Go.
+    Renaming fields is a breaking change for downstream consumers.
+    """
     if hasattr(obj, "__dataclass_fields__"):
         result = {}
         for key, value in asdict(obj).items():
@@ -481,45 +607,83 @@ def dataclass_to_dict(obj):
     return obj
 
 
+def _is_within_base(path: Path, base: Path) -> bool:
+    try:
+        path.relative_to(base)
+        return True
+    except ValueError:
+        return False
+
+
+def resolve_base_dir(base_dir: str) -> Path:
+    raw = Path(base_dir) if base_dir else Path.cwd()
+    try:
+        resolved = raw.resolve(strict=True)
+    except FileNotFoundError as exc:
+        raise ValueError(f"base directory does not exist: {raw}") from exc
+    if not resolved.is_dir():
+        raise ValueError(f"base directory is not a directory: {resolved}")
+    return resolved
+
+
+def validate_input_path(file_path: str, base_dir: Path) -> str:
+    if not file_path:
+        return ""
+
+    candidate = Path(file_path)
+    if not candidate.is_absolute():
+        candidate = Path.cwd() / candidate
+    normalized = candidate.resolve(strict=False)
+
+    if not _is_within_base(normalized, base_dir):
+        raise ValueError(f"file path escapes base directory: {file_path}")
+
+    if candidate.exists():
+        real = candidate.resolve(strict=True)
+        if not _is_within_base(real, base_dir):
+            raise ValueError(
+                f"file path escapes base directory via symlink: {file_path}"
+            )
+        if real.is_dir():
+            raise ValueError(f"path is not a file: {real}")
+        if real.stat().st_size > MAX_AST_FILE_SIZE:
+            raise ValueError(
+                f"file exceeds maximum allowed size ({MAX_AST_FILE_SIZE} bytes): {real}"
+            )
+
+    return str(normalized)
+
+
 def main():
     """CLI entry point."""
-    # Parse command line arguments
-    before_path = ""
-    after_path = ""
+    parser = argparse.ArgumentParser(
+        prog="ast_extractor.py",
+        description="Extract semantic diff between before/after Python files.",
+    )
+    parser.add_argument("--before", default="", help="Path to before version")
+    parser.add_argument("--after", default="", help="Path to after version")
+    parser.add_argument(
+        "--base-dir", default="", help="Allowed base directory for input paths"
+    )
+    parser.add_argument(
+        "paths",
+        nargs="*",
+        help='Optional positional paths for backward compatibility: <before> <after>. Use empty string "" for new/deleted files.',
+    )
 
-    i = 1
-    while i < len(sys.argv):
-        arg = sys.argv[i]
-        if arg == "--before":
-            if i + 1 < len(sys.argv):
-                before_path = sys.argv[i + 1]
-                i += 2
-            else:
-                print("Error: --before requires a path argument", file=sys.stderr)
-                sys.exit(1)
-        elif arg == "--after":
-            if i + 1 < len(sys.argv):
-                after_path = sys.argv[i + 1]
-                i += 2
-            else:
-                print("Error: --after requires a path argument", file=sys.stderr)
-                sys.exit(1)
-        elif arg in ("--help", "-h"):
-            print("Usage: ast_extractor.py --before <path> --after <path>")
-            print()
-            print("Options:")
-            print("  --before <path>  Path to the before version of the file")
-            print("  --after <path>   Path to the after version of the file")
-            print()
-            print('Use empty string "" for new/deleted files')
-            sys.exit(0)
-        else:
-            # Positional arguments for backward compatibility
-            if not before_path:
-                before_path = arg
-            elif not after_path:
-                after_path = arg
-            i += 1
+    args = parser.parse_args()
+
+    before_path = args.before
+    after_path = args.after
+    base_dir = args.base_dir
+
+    if args.paths:
+        if not before_path and len(args.paths) >= 1:
+            before_path = args.paths[0]
+        if not after_path and len(args.paths) >= 2:
+            after_path = args.paths[1]
+        if len(args.paths) > 2:
+            parser.error("too many positional arguments; expected at most 2")
 
     # Handle empty string markers
     if before_path in ('""', "''"):
@@ -528,8 +692,14 @@ def main():
         after_path = ""
 
     if not before_path and not after_path:
-        print("Usage: ast_extractor.py --before <path> --after <path>", file=sys.stderr)
-        print('Use empty string "" for new/deleted files', file=sys.stderr)
+        parser.error("at least one of --before or --after must be provided")
+
+    try:
+        resolved_base_dir = resolve_base_dir(base_dir)
+        before_path = validate_input_path(before_path, resolved_base_dir)
+        after_path = validate_input_path(after_path, resolved_base_dir)
+    except ValueError as e:
+        print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)
 
     try:
@@ -542,6 +712,7 @@ def main():
             file_path=after_path or before_path,
             functions=[],
             types=[],
+            variables=[],
             imports=[],
             summary=ChangeSummary(),
             error=str(e),

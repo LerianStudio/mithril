@@ -156,6 +156,11 @@ func TestRenderMarkdown_EmptyDiff(t *testing.T) {
 	assert.NotContains(t, output, "## Imports")
 }
 
+func TestRenderMarkdown_NilDiff(t *testing.T) {
+	output := RenderMarkdown(nil)
+	assert.Contains(t, output, "No semantic changes available")
+}
+
 func TestGetChangeIcon(t *testing.T) {
 	tests := []struct {
 		name       string
@@ -176,11 +181,6 @@ func TestGetChangeIcon(t *testing.T) {
 			name:       "modified change",
 			changeType: ChangeModified,
 			expected:   "~",
-		},
-		{
-			name:       "renamed change",
-			changeType: ChangeRenamed,
-			expected:   ">",
 		},
 		{
 			name:       "unknown change type",
@@ -306,7 +306,7 @@ func TestFormatSignature(t *testing.T) {
 				Params:  []Param{{Name: "msg", Type: "string"}},
 				Returns: []string{},
 			},
-			expected: "func log(msg: string) -> void\n",
+			expected: "func log(msg: string)\n",
 		},
 		{
 			name:     "parameter without type",
@@ -315,7 +315,7 @@ func TestFormatSignature(t *testing.T) {
 				Params:  []Param{{Name: "data"}},
 				Returns: []string{},
 			},
-			expected: "func process(data) -> void\n",
+			expected: "func process(data)\n",
 		},
 		{
 			name:     "multiple parameters",

@@ -2,6 +2,7 @@ package ast
 
 import (
 	"context"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"testing"
@@ -41,6 +42,7 @@ func TestTypeScriptExtractor_ExtractDiff(t *testing.T) {
 	if _, err := exec.LookPath("node"); err != nil {
 		t.Skip("node not available, skipping TypeScript extraction test")
 	}
+	skipIfTypeScriptModuleUnavailable(t)
 
 	// scriptDir is relative to this test file's location (internal/ast/)
 	// The ts/dist directory is at ../../ts/dist from here
@@ -68,19 +70,19 @@ func TestTypeScriptExtractor_ExtractDiff(t *testing.T) {
 	}
 
 	// greet should be modified (added parameter)
-	if ct, ok := funcChanges["greet"]; ok {
-		assert.Equal(t, ChangeModified, ct, "greet should be modified")
-	}
+	ct, ok := funcChanges["greet"]
+	require.True(t, ok, "greet should exist in function changes")
+	assert.Equal(t, ChangeModified, ct, "greet should be modified")
 
 	// formatName should be removed
-	if ct, ok := funcChanges["formatName"]; ok {
-		assert.Equal(t, ChangeRemoved, ct, "formatName should be removed")
-	}
+	ct, ok = funcChanges["formatName"]
+	require.True(t, ok, "formatName should exist in function changes")
+	assert.Equal(t, ChangeRemoved, ct, "formatName should be removed")
 
 	// validateEmail should be added
-	if ct, ok := funcChanges["validateEmail"]; ok {
-		assert.Equal(t, ChangeAdded, ct, "validateEmail should be added")
-	}
+	ct, ok = funcChanges["validateEmail"]
+	require.True(t, ok, "validateEmail should exist in function changes")
+	assert.Equal(t, ChangeAdded, ct, "validateEmail should be added")
 
 	// Verify type changes
 	typeChanges := make(map[string]ChangeType)
@@ -89,14 +91,14 @@ func TestTypeScriptExtractor_ExtractDiff(t *testing.T) {
 	}
 
 	// User interface should be modified (fields added)
-	if ct, ok := typeChanges["User"]; ok {
-		assert.Equal(t, ChangeModified, ct, "User should be modified")
-	}
+	ct, ok = typeChanges["User"]
+	require.True(t, ok, "User should exist in type changes")
+	assert.Equal(t, ChangeModified, ct, "User should be modified")
 
 	// Config interface should be added
-	if ct, ok := typeChanges["Config"]; ok {
-		assert.Equal(t, ChangeAdded, ct, "Config should be added")
-	}
+	ct, ok = typeChanges["Config"]
+	require.True(t, ok, "Config should exist in type changes")
+	assert.Equal(t, ChangeAdded, ct, "Config should be added")
 
 	// Verify import changes
 	importChanges := make(map[string]ChangeType)
@@ -105,14 +107,14 @@ func TestTypeScriptExtractor_ExtractDiff(t *testing.T) {
 	}
 
 	// axios should be removed
-	if ct, ok := importChanges["axios"]; ok {
-		assert.Equal(t, ChangeRemoved, ct, "axios should be removed")
-	}
+	ct, ok = importChanges["axios"]
+	require.True(t, ok, "axios import should exist in import changes")
+	assert.Equal(t, ChangeRemoved, ct, "axios should be removed")
 
 	// ./api should be added
-	if ct, ok := importChanges["./api"]; ok {
-		assert.Equal(t, ChangeAdded, ct, "./api should be added")
-	}
+	ct, ok = importChanges["./api"]
+	require.True(t, ok, "./api import should exist in import changes")
+	assert.Equal(t, ChangeAdded, ct, "./api should be added")
 
 	// Verify summary has reasonable values
 	assert.GreaterOrEqual(t, diff.Summary.FunctionsAdded, 0, "FunctionsAdded should be >= 0")
@@ -125,6 +127,7 @@ func TestTypeScriptExtractor_NewFile(t *testing.T) {
 	if _, err := exec.LookPath("node"); err != nil {
 		t.Skip("node not available, skipping TypeScript extraction test")
 	}
+	skipIfTypeScriptModuleUnavailable(t)
 
 	scriptDir := filepath.Join("..", "..")
 	extractor := NewTypeScriptExtractor(scriptDir)
@@ -150,6 +153,7 @@ func TestTypeScriptExtractor_DeletedFile(t *testing.T) {
 	if _, err := exec.LookPath("node"); err != nil {
 		t.Skip("node not available, skipping TypeScript extraction test")
 	}
+	skipIfTypeScriptModuleUnavailable(t)
 
 	scriptDir := filepath.Join("..", "..")
 	extractor := NewTypeScriptExtractor(scriptDir)
@@ -175,6 +179,7 @@ func TestTypeScriptExtractor_NonexistentFileTreatedAsEmpty(t *testing.T) {
 	if _, err := exec.LookPath("node"); err != nil {
 		t.Skip("node not available, skipping TypeScript extraction test")
 	}
+	skipIfTypeScriptModuleUnavailable(t)
 
 	scriptDir := filepath.Join("..", "..")
 	extractor := NewTypeScriptExtractor(scriptDir)
@@ -195,4 +200,81 @@ func TestTypeScriptExtractor_InvalidScript(t *testing.T) {
 	_, err := extractor.ExtractDiff(context.Background(), "test.ts", "")
 
 	require.Error(t, err, "expected error for nonexistent script")
+}
+
+func skipIfTypeScriptModuleUnavailable(t *testing.T) {
+	t.Helper()
+	check := exec.Command("node", "-e", "require('typescript')")
+	if err := check.Run(); err != nil {
+		t.Skip("typescript module not available, skipping TypeScript extraction test")
+	}
+}
+
+func TestTypeScriptExtractor_ImportAliasModificationDetected(t *testing.T) {
+	if _, err := exec.LookPath("node"); err != nil {
+		t.Skip("node not available, skipping TypeScript extraction test")
+	}
+	skipIfTypeScriptModuleUnavailable(t)
+
+	scriptDir := filepath.Join("..", "..")
+	extractor := NewTypeScriptExtractor(scriptDir)
+	tempDir := t.TempDir()
+
+	beforePath := filepath.Join(tempDir, "before.ts")
+	afterPath := filepath.Join(tempDir, "after.ts")
+
+	before := "import axios from 'axios'\nexport const x = 1\n"
+	after := "import httpClient from 'axios'\nexport const x = 1\n"
+
+	require.NoError(t, os.WriteFile(beforePath, []byte(before), 0o644))
+	require.NoError(t, os.WriteFile(afterPath, []byte(after), 0o644))
+
+	diff, err := extractor.ExtractDiff(context.Background(), beforePath, afterPath)
+	require.NoError(t, err)
+
+	var aliasDiff *ImportDiff
+	for i := range diff.Imports {
+		if diff.Imports[i].Path == "axios" {
+			aliasDiff = &diff.Imports[i]
+			break
+		}
+	}
+	require.NotNil(t, aliasDiff, "expected axios import diff")
+	assert.Equal(t, ChangeModified, aliasDiff.ChangeType)
+	assert.Equal(t, "httpClient", aliasDiff.Alias)
+}
+
+func TestTypeScriptExtractor_VariableDiffDetected(t *testing.T) {
+	if _, err := exec.LookPath("node"); err != nil {
+		t.Skip("node not available, skipping TypeScript extraction test")
+	}
+	skipIfTypeScriptModuleUnavailable(t)
+
+	scriptDir := filepath.Join("..", "..")
+	extractor := NewTypeScriptExtractor(scriptDir)
+	tempDir := t.TempDir()
+
+	beforePath := filepath.Join(tempDir, "before.ts")
+	afterPath := filepath.Join(tempDir, "after.ts")
+
+	before := "const API_VERSION = 1\nlet name = 'old'\n"
+	after := "const API_VERSION = 2\nconst createdAt = Date.now()\n"
+
+	require.NoError(t, os.WriteFile(beforePath, []byte(before), 0o644))
+	require.NoError(t, os.WriteFile(afterPath, []byte(after), 0o644))
+
+	diff, err := extractor.ExtractDiff(context.Background(), beforePath, afterPath)
+	require.NoError(t, err)
+
+	changes := make(map[string]ChangeType)
+	for _, v := range diff.Variables {
+		changes[v.Name] = v.ChangeType
+	}
+
+	assert.Equal(t, ChangeModified, changes["API_VERSION"])
+	assert.Equal(t, ChangeRemoved, changes["name"])
+	assert.Equal(t, ChangeAdded, changes["createdAt"])
+	assert.Equal(t, 1, diff.Summary.VariablesAdded)
+	assert.Equal(t, 1, diff.Summary.VariablesRemoved)
+	assert.Equal(t, 1, diff.Summary.VariablesModified)
 }

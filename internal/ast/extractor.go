@@ -3,6 +3,7 @@ package ast
 import (
 	"context"
 	"fmt"
+	"log"
 	"path/filepath"
 	"strings"
 )
@@ -33,6 +34,11 @@ func NewRegistry() *Registry {
 
 // Register adds an extractor to the registry
 func (r *Registry) Register(e Extractor) {
+	if e == nil {
+		log.Printf("warning: nil extractor ignored during registry registration")
+		return
+	}
+
 	for _, ext := range e.SupportedExtensions() {
 		r.extractors[ext] = e
 	}
@@ -92,7 +98,7 @@ func ComputeSummary(funcs []FunctionDiff, types []TypeDiff, vars []VarDiff, impo
 			summary.FunctionsAdded++
 		case ChangeRemoved:
 			summary.FunctionsRemoved++
-		case ChangeModified, ChangeRenamed:
+		case ChangeModified:
 			summary.FunctionsModified++
 		}
 	}
@@ -103,7 +109,7 @@ func ComputeSummary(funcs []FunctionDiff, types []TypeDiff, vars []VarDiff, impo
 			summary.TypesAdded++
 		case ChangeRemoved:
 			summary.TypesRemoved++
-		case ChangeModified, ChangeRenamed:
+		case ChangeModified:
 			summary.TypesModified++
 		}
 	}
@@ -114,7 +120,7 @@ func ComputeSummary(funcs []FunctionDiff, types []TypeDiff, vars []VarDiff, impo
 			summary.VariablesAdded++
 		case ChangeRemoved:
 			summary.VariablesRemoved++
-		case ChangeModified, ChangeRenamed:
+		case ChangeModified:
 			summary.VariablesModified++
 		}
 	}

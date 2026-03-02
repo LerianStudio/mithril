@@ -8,6 +8,10 @@ import (
 
 // RenderMarkdown converts a SemanticDiff to markdown format
 func RenderMarkdown(diff *SemanticDiff) string {
+	if diff == nil {
+		return "# Semantic Changes\n\nNo semantic changes available.\n"
+	}
+
 	var sb strings.Builder
 
 	sb.WriteString(fmt.Sprintf("# Semantic Changes: %s\n\n", diff.FilePath))
@@ -144,9 +148,6 @@ func formatSignature(name string, sig *FuncSig) string {
 	}
 
 	returns := strings.Join(sig.Returns, ", ")
-	if returns == "" {
-		returns = "void"
-	}
 
 	prefix := ""
 	if sig.IsAsync {
@@ -156,7 +157,12 @@ func formatSignature(name string, sig *FuncSig) string {
 		prefix += fmt.Sprintf("(%s) ", sig.Receiver)
 	}
 
-	return fmt.Sprintf("%sfunc %s(%s) -> %s\n", prefix, name, strings.Join(params, ", "), returns)
+	signature := fmt.Sprintf("%sfunc %s(%s)", prefix, name, strings.Join(params, ", "))
+	if returns != "" {
+		signature += fmt.Sprintf(" -> %s", returns)
+	}
+
+	return signature + "\n"
 }
 
 func getChangeIcon(changeType ChangeType) string {
@@ -167,8 +173,6 @@ func getChangeIcon(changeType ChangeType) string {
 		return "-"
 	case ChangeModified:
 		return "~"
-	case ChangeRenamed:
-		return ">"
 	default:
 		return "?"
 	}
