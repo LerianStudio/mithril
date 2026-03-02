@@ -12,7 +12,6 @@ import (
 
 	"github.com/lerianstudio/mithril/internal/callgraph"
 	"github.com/lerianstudio/mithril/internal/fileutil"
-	"github.com/lerianstudio/mithril/internal/output"
 )
 
 // FuncSig is a partial representation of ast.FuncSig, extracting only fields
@@ -59,17 +58,18 @@ func init() {
 
 func main() {
 	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, "Usage: %s [options]\n\n", os.Args[0])
+		cmd := filepath.Base(os.Args[0])
+		fmt.Fprintf(os.Stderr, "Usage: %s [options]\n\n", cmd)
 		fmt.Fprintf(os.Stderr, "Call Graph Analyzer - Analyze call relationships for modified functions\n\n")
 		fmt.Fprintf(os.Stderr, "Options:\n")
 		flag.PrintDefaults()
 		fmt.Fprintf(os.Stderr, "\nExamples:\n")
 		fmt.Fprintf(os.Stderr, "  # Analyze Go code changes:\n")
-		fmt.Fprintf(os.Stderr, "  %s -ast .ring/codereview/go-ast.json\n\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "  %s -ast .ring/codereview/go-ast.json\n\n", cmd)
 		fmt.Fprintf(os.Stderr, "  # Analyze TypeScript with explicit language:\n")
-		fmt.Fprintf(os.Stderr, "  %s -ast ast-output.json -lang typescript\n\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "  %s -ast ast-output.json -lang typescript\n\n", cmd)
 		fmt.Fprintf(os.Stderr, "  # Custom output directory and timeout:\n")
-		fmt.Fprintf(os.Stderr, "  %s -ast go-ast.json -output ./output -timeout 60\n\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "  %s -ast go-ast.json -output ./output -timeout 60\n\n", cmd)
 		fmt.Fprintf(os.Stderr, "Supported languages: %s\n", strings.Join(callgraph.SupportedLanguagesNormalized(), ", "))
 	}
 	flag.Parse()
@@ -334,55 +334,4 @@ func extractPackageFromPath(filePath string) string {
 		return filepath.Base(dir)
 	}
 	return filepath.ToSlash(dir)
-}
-
-// writeResults writes call graph results to output files.
-func writeResults(result *callgraph.CallGraphResult) error {
-	writer := output.NewCallGraphWriter(*outputDir)
-	if err := writer.EnsureDir(); err != nil {
-		return fmt.Errorf("failed to create output directory: %w", err)
-	}
-
-	// Write JSON output
-	if err := writer.WriteResult(result); err != nil {
-		return fmt.Errorf("failed to write JSON output: %w", err)
-	}
-
-	// Write impact summary markdown
-	if err := writer.WriteSummary(result); err != nil {
-		return fmt.Errorf("failed to write impact summary: %w", err)
-	}
-
-	// Print summary to stdout
-	printSummary(result)
-
-	return nil
-}
-
-// printSummary prints analysis summary to stdout.
-func printSummary(result *callgraph.CallGraphResult) {
-	fmt.Printf("Call graph analysis complete:\n")
-	fmt.Printf("  Language: %s\n", result.Language)
-	fmt.Printf("  Functions analyzed: %d\n", len(result.ModifiedFunctions))
-	fmt.Printf("  Direct callers: %d\n", result.ImpactAnalysis.DirectCallers)
-	fmt.Printf("  Transitive callers: %d\n", result.ImpactAnalysis.TransitiveCallers)
-	fmt.Printf("  Affected tests: %d\n", result.ImpactAnalysis.AffectedTests)
-	fmt.Printf("  Affected packages: %d\n", len(result.ImpactAnalysis.AffectedPackages))
-
-	if result.TimeBudgetExceeded {
-		fmt.Printf("  Warning: Time budget exceeded, results may be partial\n")
-	}
-	if result.PartialResults {
-		fmt.Printf("  Warning: Partial results due to analysis limitations\n")
-	}
-
-	fmt.Printf("  Output: %s/%s-calls.json\n", *outputDir, result.Language)
-	fmt.Printf("  Summary: %s/impact-summary.md\n", *outputDir)
-
-	if len(result.Warnings) > 0 {
-		fmt.Printf("\nWarnings:\n")
-		for _, w := range result.Warnings {
-			fmt.Printf("  - %s\n", w)
-		}
-	}
 }

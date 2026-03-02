@@ -66,8 +66,12 @@ func TestPrintUsage(t *testing.T) {
 
 	expected := []string{
 		"Mithril CLI",
-		"mithril [run-all flags]",
+		"mithril [flags]",
 		"run-all",
+		"--unstaged",
+		"--staged",
+		"--all-modified",
+		"--compare --base=main --head=HEAD",
 		"scope-detector",
 		"static-analysis",
 		"ast-extractor",
@@ -101,5 +105,48 @@ func TestExecuteCommand_UsesInProcessRunner(t *testing.T) {
 	}
 	if !called {
 		t.Fatal("expected in-process runner to be called")
+	}
+}
+
+func TestRun_NoArgsExecutesRunAll(t *testing.T) {
+	original := commandRunners
+	defer func() { commandRunners = original }()
+
+	called := false
+	commandRunners = map[string]commandRunner{
+		"run-all": func(args []string, stdout io.Writer, stderr io.Writer) error {
+			called = true
+			return nil
+		},
+	}
+
+	if err := Run("dev", nil, &bytes.Buffer{}, &bytes.Buffer{}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !called {
+		t.Fatal("expected run-all runner to be called")
+	}
+}
+
+func TestRun_ScopeDetectorExecutesRunner(t *testing.T) {
+	original := commandRunners
+	defer func() { commandRunners = original }()
+
+	called := false
+	commandRunners = map[string]commandRunner{
+		"scope-detector": func(args []string, stdout io.Writer, stderr io.Writer) error {
+			called = true
+			if len(args) != 1 || args[0] != "--unstaged" {
+				t.Fatalf("unexpected args: %v", args)
+			}
+			return nil
+		},
+	}
+
+	if err := Run("dev", []string{"scope-detector", "--unstaged"}, &bytes.Buffer{}, &bytes.Buffer{}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !called {
+		t.Fatal("expected scope-detector runner to be called")
 	}
 }

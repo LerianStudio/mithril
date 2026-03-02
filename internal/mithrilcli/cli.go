@@ -7,7 +7,6 @@ import (
 )
 
 var supportedCommands = []string{
-	"run-all",
 	"scope-detector",
 	"static-analysis",
 	"ast-extractor",
@@ -51,6 +50,8 @@ func parseInvocation(args []string) (string, []string, bool) {
 		return "help", nil, true
 	case "version", "-v", "--version":
 		return "version", nil, true
+	case "run-all":
+		return "run-all", args[1:], true
 	}
 
 	if strings.HasPrefix(first, "-") {
@@ -84,8 +85,14 @@ func executeCommand(command string, args []string, stdout io.Writer, stderr io.W
 func printUsage(out io.Writer) {
 	_, _ = fmt.Fprintf(out, "Mithril CLI\n\n")
 	_, _ = fmt.Fprintf(out, "Usage:\n")
-	_, _ = fmt.Fprintf(out, "  mithril [run-all flags]\n")
+	_, _ = fmt.Fprintf(out, "  mithril [flags]\n")
 	_, _ = fmt.Fprintf(out, "  mithril <command> [flags]\n\n")
+	_, _ = fmt.Fprintf(out, "Main pipeline flags (use with `mithril`):\n")
+	_, _ = fmt.Fprintf(out, "  --unstaged                     Analyze only unstaged + untracked changes\n")
+	_, _ = fmt.Fprintf(out, "  --staged                       Analyze only staged changes\n")
+	_, _ = fmt.Fprintf(out, "  --all-modified                 Analyze all modified files (staged + unstaged)\n")
+	_, _ = fmt.Fprintf(out, "  --compare --base=main --head=HEAD  Compare two refs\n")
+	_, _ = fmt.Fprintf(out, "  --output=.ring/codereview      Set output directory\n\n")
 	_, _ = fmt.Fprintf(out, "Commands:\n")
 	_, _ = fmt.Fprintf(out, "  run-all          Execute the full codereview pipeline (default)\n")
 	_, _ = fmt.Fprintf(out, "  scope-detector   Detect changed files and language\n")
@@ -101,7 +108,11 @@ func printUsage(out io.Writer) {
 	_, _ = fmt.Fprintf(out, "  - No sibling binary lookup and no `go run` fallback\n\n")
 	_, _ = fmt.Fprintf(out, "Examples:\n")
 	_, _ = fmt.Fprintf(out, "  mithril\n")
-	_, _ = fmt.Fprintf(out, "  mithril --base=main --head=HEAD\n")
+	_, _ = fmt.Fprintf(out, "  mithril --unstaged\n")
+	_, _ = fmt.Fprintf(out, "  mithril --staged\n")
+	_, _ = fmt.Fprintf(out, "  mithril --all-modified\n")
+	_, _ = fmt.Fprintf(out, "  mithril --compare --base=main --head=HEAD\n")
 	_, _ = fmt.Fprintf(out, "  mithril run-all --unstaged\n")
 	_, _ = fmt.Fprintf(out, "  mithril scope-detector --base=main --head=HEAD\n")
+	_, _ = fmt.Fprintf(out, "  mithril static-analysis --scope .ring/codereview/scope.json\n")
 }

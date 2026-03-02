@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"path/filepath"
 
 	"github.com/lerianstudio/mithril/internal/context"
 )
@@ -83,7 +84,8 @@ func run() error {
 }
 
 func printUsage() {
-	fmt.Fprintf(os.Stderr, "Usage: %s [options]\n\n", os.Args[0])
+	cmd := filepath.Base(os.Args[0])
+	fmt.Fprintf(os.Stderr, "Usage: %s [options]\n\n", cmd)
 	fmt.Fprintf(os.Stderr, "Context Compiler - Phase 5 of the codereview system\n\n")
 	fmt.Fprintf(os.Stderr, "Aggregates outputs from previous phases and generates reviewer-specific\n")
 	fmt.Fprintf(os.Stderr, "context files in Markdown format.\n\n")
@@ -103,9 +105,9 @@ func printUsage() {
 	flag.PrintDefaults()
 	fmt.Fprintf(os.Stderr, "\nExamples:\n")
 	fmt.Fprintf(os.Stderr, "  # Compile context using default directories:\n")
-	fmt.Fprintf(os.Stderr, "  %s\n\n", os.Args[0])
+	fmt.Fprintf(os.Stderr, "  %s\n\n", cmd)
 	fmt.Fprintf(os.Stderr, "  # Compile from custom input directory:\n")
-	fmt.Fprintf(os.Stderr, "  %s --input /path/to/codereview --verbose\n\n", os.Args[0])
+	fmt.Fprintf(os.Stderr, "  %s --input /path/to/codereview --verbose\n\n", cmd)
 	fmt.Fprintf(os.Stderr, "  # Output to different directory:\n")
-	fmt.Fprintf(os.Stderr, "  %s --input .ring/codereview --output ./review-context\n", os.Args[0])
+	fmt.Fprintf(os.Stderr, "  %s --input .ring/codereview --output ./review-context\n", cmd)
 }

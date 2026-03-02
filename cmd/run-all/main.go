@@ -352,7 +352,8 @@ func parseFlags() *config {
 
 // printUsage prints comprehensive help information.
 func printUsage() {
-	fmt.Fprintf(os.Stderr, "Usage: run-all [options]\n\n")
+	cmd := filepath.Base(os.Args[0])
+	fmt.Fprintf(os.Stderr, "Usage: %s [options]\n\n", cmd)
 	fmt.Fprintf(os.Stderr, "Orchestrates all 6 phases of the codereview pre-analysis pipeline.\n\n")
 	fmt.Fprintf(os.Stderr, "Phases (executed in order):\n")
 	fmt.Fprintf(os.Stderr, "  1. scope          Detect changed files and project language (30s timeout)\n")
@@ -365,26 +366,26 @@ func printUsage() {
 	flag.PrintDefaults()
 	fmt.Fprintf(os.Stderr, "\nExamples:\n")
 	fmt.Fprintf(os.Stderr, "  # Run all phases comparing main to HEAD:\n")
-	fmt.Fprintf(os.Stderr, "  run-all\n\n")
+	fmt.Fprintf(os.Stderr, "  %s\n\n", cmd)
 	fmt.Fprintf(os.Stderr, "  # Compare specific branches:\n")
-	fmt.Fprintf(os.Stderr, "  run-all --base=develop --head=feature/my-branch\n\n")
+	fmt.Fprintf(os.Stderr, "  %s --base=develop --head=feature/my-branch\n\n", cmd)
 
 	fmt.Fprintf(os.Stderr, "  # Analyze specific files:\n")
-	fmt.Fprintf(os.Stderr, "  run-all --files=cmd/*.go,scripts/**/*.ts\n\n")
+	fmt.Fprintf(os.Stderr, "  %s --files=cmd/*.go,scripts/**/*.ts\n\n", cmd)
 
 	fmt.Fprintf(os.Stderr, "  # Analyze files from a list:\n")
-	fmt.Fprintf(os.Stderr, "  run-all --files-from=.ring/filelist.txt\n\n")
+	fmt.Fprintf(os.Stderr, "  %s --files-from=.ring/filelist.txt\n\n", cmd)
 
 	fmt.Fprintf(os.Stderr, "  # Analyze unstaged + untracked files:\n")
-	fmt.Fprintf(os.Stderr, "  run-all --unstaged\n\n")
+	fmt.Fprintf(os.Stderr, "  %s --unstaged\n\n", cmd)
 
 	fmt.Fprintf(os.Stderr, "  # Custom output directory:\n")
-	fmt.Fprintf(os.Stderr, "  run-all --output=./review-output\n\n")
+	fmt.Fprintf(os.Stderr, "  %s --output=./review-output\n\n", cmd)
 
 	fmt.Fprintf(os.Stderr, "  # Skip specific phases:\n")
-	fmt.Fprintf(os.Stderr, "  run-all --skip=static-analysis,dataflow\n\n")
+	fmt.Fprintf(os.Stderr, "  %s --skip=static-analysis,dataflow\n\n", cmd)
 	fmt.Fprintf(os.Stderr, "  # Verbose mode with custom binary directory:\n")
-	fmt.Fprintf(os.Stderr, "  run-all --verbose --bin-dir=/path/to/binaries\n\n")
+	fmt.Fprintf(os.Stderr, "  %s --verbose --bin-dir=/path/to/binaries\n\n", cmd)
 	fmt.Fprintf(os.Stderr, "Phase skip aliases:\n")
 	fmt.Fprintf(os.Stderr, "  scope, static-analysis, ast, callgraph, dataflow, context\n\n")
 	fmt.Fprintf(os.Stderr, "Output files (in output directory):\n")

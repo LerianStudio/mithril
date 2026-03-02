@@ -52,19 +52,20 @@ func init() {
 
 func main() {
 	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, "Usage: %s [options]\n\n", os.Args[0])
+		cmd := filepath.Base(os.Args[0])
+		fmt.Fprintf(os.Stderr, "Usage: %s [options]\n\n", cmd)
 		fmt.Fprintf(os.Stderr, "AST Extractor - Extract semantic diffs from source files\n\n")
 		fmt.Fprintf(os.Stderr, "Options:\n")
 		flag.PrintDefaults()
 		fmt.Fprintf(os.Stderr, "\nExamples:\n")
 		fmt.Fprintf(os.Stderr, "  # Compare two Go files:\n")
-		fmt.Fprintf(os.Stderr, "  %s -before old.go -after new.go\n\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "  %s -before old.go -after new.go\n\n", cmd)
 		fmt.Fprintf(os.Stderr, "  # New file (no before version):\n")
-		fmt.Fprintf(os.Stderr, "  %s -after new.go\n\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "  %s -after new.go\n\n", cmd)
 		fmt.Fprintf(os.Stderr, "  # Deleted file (no after version):\n")
-		fmt.Fprintf(os.Stderr, "  %s -before old.go\n\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "  %s -before old.go\n\n", cmd)
 		fmt.Fprintf(os.Stderr, "  # Batch mode with JSON input:\n")
-		fmt.Fprintf(os.Stderr, "  %s -batch files.json -output markdown\n\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "  %s -batch files.json -output markdown\n\n", cmd)
 		fmt.Fprintf(os.Stderr, "Batch file format:\n")
 		fmt.Fprintf(os.Stderr, `  [{"before_path": "old.go", "after_path": "new.go"}]`+"\n")
 	}

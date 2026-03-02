@@ -48,7 +48,8 @@ var (
 
 func main() {
 	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, "Usage: %s [options]\n\n", os.Args[0])
+		cmd := filepath.Base(os.Args[0])
+		fmt.Fprintf(os.Stderr, "Usage: %s [options]\n\n", cmd)
 		fmt.Fprintf(os.Stderr, "Data Flow Analyzer - Security-focused data flow analysis\n\n")
 		fmt.Fprintf(os.Stderr, "Analyzes source code to detect:\n")
 		fmt.Fprintf(os.Stderr, "  - Untrusted data sources (HTTP inputs, env vars, files)\n")
@@ -59,11 +60,11 @@ func main() {
 		flag.PrintDefaults()
 		fmt.Fprintf(os.Stderr, "\nExamples:\n")
 		fmt.Fprintf(os.Stderr, "  # Analyze all languages from scope.json:\n")
-		fmt.Fprintf(os.Stderr, "  %s -scope .ring/codereview/scope.json\n\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "  %s -scope .ring/codereview/scope.json\n\n", cmd)
 		fmt.Fprintf(os.Stderr, "  # Analyze only Go files:\n")
-		fmt.Fprintf(os.Stderr, "  %s -scope scope.json -lang go\n\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "  %s -scope scope.json -lang go\n\n", cmd)
 		fmt.Fprintf(os.Stderr, "  # Output JSON only (no markdown):\n")
-		fmt.Fprintf(os.Stderr, "  %s -scope scope.json -json\n\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "  %s -scope scope.json -json\n\n", cmd)
 		fmt.Fprintf(os.Stderr, "Supported languages: go, python, typescript\n")
 	}
 	flag.Parse()
