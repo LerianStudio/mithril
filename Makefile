@@ -8,6 +8,8 @@ BIN_DIR := bin
 # All binaries to build
 BINARIES := scope-detector static-analysis ast-extractor call-graph data-flow compile-context run-all
 
+VERSION ?= dev
+
 all: build
 
 build: $(BINARIES) mithril
@@ -22,7 +24,7 @@ $(BINARIES):
 mithril:
 	@echo "Building mithril..."
 	@mkdir -p $(BIN_DIR)
-	@go build -o $(BIN_DIR)/mithril .
+	@go build -ldflags "-X main.version=$(VERSION)" -o $(BIN_DIR)/mithril .
 
 # Convenience target for Phase 5 binaries only
 build-context: compile-context run-all
