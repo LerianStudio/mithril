@@ -84,9 +84,14 @@ func (s *Staticcheck) Run(ctx context.Context, projectDir string, packages []str
 
 	// Add packages to analyze
 	if len(packages) > 0 {
+		if err := validateTargetArgs(packages); err != nil {
+			result.Errors = append(result.Errors, fmt.Sprintf("staticcheck target validation failed: %v", err))
+			return result, nil
+		}
 		args = append(args, packages...)
 	} else {
-		args = append(args, "./...")
+		result.Errors = append(result.Errors, "staticcheck target list is empty")
+		return result, nil
 	}
 
 	execResult := s.executor.Run(ctx, projectDir, "staticcheck", args...)

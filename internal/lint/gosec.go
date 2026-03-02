@@ -94,9 +94,14 @@ func (g *Gosec) Run(ctx context.Context, projectDir string, packages []string) (
 
 	// Add packages to analyze
 	if len(packages) > 0 {
+		if err := validateTargetArgs(packages); err != nil {
+			result.Errors = append(result.Errors, fmt.Sprintf("gosec target validation failed: %v", err))
+			return result, nil
+		}
 		args = append(args, packages...)
 	} else {
-		args = append(args, "./...")
+		result.Errors = append(result.Errors, "gosec target list is empty")
+		return result, nil
 	}
 
 	execResult := g.executor.Run(ctx, projectDir, "gosec", args...)
@@ -114,13 +119,13 @@ func (g *Gosec) Run(ctx context.Context, projectDir string, packages []string) (
 
 	// Convert to common format
 	for _, issue := range output.Issues {
-		line, err := strconv.Atoi(issue.Line)
+		line, err := parseGosecPosition(issue.Line)
 		if err != nil {
 			result.Errors = append(result.Errors, fmt.Sprintf("gosec output parse warning: file=%s line=%q column=%q err=%v", issue.File, issue.Line, issue.Column, err))
 			line = 0
 		}
 
-		col, err := strconv.Atoi(issue.Column)
+		col, err := parseGosecPosition(issue.Column)
 		if err != nil {
 			result.Errors = append(result.Errors, fmt.Sprintf("gosec output parse warning: file=%s line=%q column=%q err=%v", issue.File, issue.Line, issue.Column, err))
 			col = 0
@@ -140,6 +145,18 @@ func (g *Gosec) Run(ctx context.Context, projectDir string, packages []string) (
 	}
 
 	return result, nil
+}
+
+func parseGosecPosition(value string) (int, error) {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		return 0, fmt.Errorf("empty position")
+	}
+	if strings.Contains(trimmed, "-") {
+		parts := strings.SplitN(trimmed, "-", 2)
+		trimmed = strings.TrimSpace(parts[0])
+	}
+	return strconv.Atoi(trimmed)
 }
 
 // mapGosecSeverity maps gosec severity and confidence to common severity.

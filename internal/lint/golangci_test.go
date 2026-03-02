@@ -115,6 +115,12 @@ func TestNormalizeFilePath(t *testing.T) {
 			filePath:   "/other/file.go",
 			expected:   "../other/file.go",
 		},
+		{
+			name:       "relative path with dot prefix is normalized",
+			projectDir: "/project",
+			filePath:   "./src/main.py",
+			expected:   "src/main.py",
+		},
 	}
 
 	for _, tt := range tests {
@@ -187,4 +193,24 @@ func TestGolangciLintRun_Success(t *testing.T) {
 	require.Len(t, result.Findings, 1)
 	assert.Equal(t, SeverityWarning, result.Findings[0].Severity)
 	assert.Equal(t, CategorySecurity, result.Findings[0].Category)
+}
+
+func TestGolangciLintRun_IncludesIssuesExitCodeFlag(t *testing.T) {
+	linter := NewGolangciLint()
+	linter.versionFn = func(ctx context.Context) (string, error) {
+		return "1.2.3", nil
+	}
+
+	var capturedArgs []string
+	executor := NewExecutor()
+	executor.SetRunFn(func(ctx context.Context, dir string, name string, args ...string) *ExecResult {
+		capturedArgs = append([]string{}, args...)
+		return &ExecResult{Stdout: []byte(`{"Issues":[]}`)}
+	})
+	linter.executor = executor
+
+	result, err := linter.Run(context.Background(), "/project", []string{"./..."})
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	assert.Contains(t, capturedArgs, "--issues-exit-code=0")
 }

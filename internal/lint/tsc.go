@@ -47,7 +47,7 @@ func (t *TSC) Available(ctx context.Context) bool {
 	defer cancel()
 
 	// Prefer project-local tsc via npx; ensure it is runnable
-	res := t.executor.Run(checkCtx, "", "npx", "tsc", "--version")
+	res := t.executor.Run(checkCtx, "", "npx", "--no-install", "tsc", "--version")
 	if res.Err == nil && res.ExitCode == 0 {
 		return true
 	}
@@ -59,7 +59,7 @@ func (t *TSC) Available(ctx context.Context) bool {
 // Version returns the tsc version.
 func (t *TSC) Version(ctx context.Context) (string, error) {
 	// Try npx tsc first (project-local)
-	version, err := t.executor.GetVersion(ctx, "npx", "tsc", "--version")
+	version, err := t.executor.GetVersion(ctx, "npx", "--no-install", "tsc", "--version")
 	if err != nil {
 		// Fall back to global tsc
 		version, err = t.executor.GetVersion(ctx, "tsc", "--version")
@@ -91,15 +91,19 @@ func (t *TSC) Run(ctx context.Context, projectDir string, files []string) (*Resu
 	}
 
 	// Run tsc --noEmit to type check without emitting files
-	args := []string{"tsc", "--noEmit", "--pretty", "false"}
+	args := []string{"--no-install", "tsc", "--noEmit", "--pretty", "false"}
 	if len(files) > 0 {
+		if err := validateTargetArgs(files); err != nil {
+			result.Errors = append(result.Errors, fmt.Sprintf("tsc target validation failed: %v", err))
+			return result, nil
+		}
 		args = append(args, files...)
 	}
 
 	execResult := t.executor.Run(ctx, projectDir, "npx", args...)
 	if execResult.Err != nil {
 		// Try global tsc
-		execResult = t.executor.Run(ctx, projectDir, "tsc", args[1:]...)
+		execResult = t.executor.Run(ctx, projectDir, "tsc", args[2:]...)
 		if execResult.Err != nil {
 			result.Errors = append(result.Errors, fmt.Sprintf("tsc execution failed: %v", execResult.Err))
 			return result, nil

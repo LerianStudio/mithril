@@ -90,6 +90,10 @@ func (p *Pylint) Run(ctx context.Context, projectDir string, files []string) (*R
 
 	// Add files to lint
 	if len(files) > 0 {
+		if err := validateTargetArgs(files); err != nil {
+			result.Errors = append(result.Errors, fmt.Sprintf("pylint target validation failed: %v", err))
+			return result, nil
+		}
 		args = append(args, files...)
 	} else {
 		args = append(args, ".")

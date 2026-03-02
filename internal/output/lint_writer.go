@@ -6,9 +6,12 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 
 	"github.com/lerianstudio/mithril/internal/lint"
 )
+
+var safeLanguageTokenPattern = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
 
 // LintWriter handles writing lint analysis results.
 type LintWriter struct {
@@ -34,8 +37,26 @@ func (w *LintWriter) WriteResult(result *lint.Result) error {
 
 // WriteLanguageResult writes a language-specific result file.
 func (w *LintWriter) WriteLanguageResult(lang lint.Language, result *lint.Result) error {
-	filename := fmt.Sprintf("%s-lint.json", lang)
+	token, err := sanitizeLanguageToken(string(lang))
+	if err != nil {
+		return err
+	}
+
+	filename := fmt.Sprintf("%s-lint.json", token)
 	return w.writeJSON(filename, result)
+}
+
+func sanitizeLanguageToken(raw string) (string, error) {
+	base := filepath.Base(raw)
+	if base != raw {
+		return "", fmt.Errorf("invalid language token %q: path separators are not allowed", raw)
+	}
+
+	if !safeLanguageTokenPattern.MatchString(base) {
+		return "", fmt.Errorf("invalid language token %q: only alphanumeric, dash, underscore allowed", raw)
+	}
+
+	return base, nil
 }
 
 // writeJSON writes data as formatted JSON to a file.

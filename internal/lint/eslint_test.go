@@ -1,10 +1,13 @@
 package lint
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestMapESLintSeverity(t *testing.T) {
@@ -61,4 +64,61 @@ func TestESLint_Name(t *testing.T) {
 func TestESLint_Language(t *testing.T) {
 	e := NewESLint()
 	assert.Equal(t, LanguageTypeScript, e.Language())
+}
+
+func TestESLintRun_ExecutionFailure(t *testing.T) {
+	linter := NewESLint()
+	executor := NewExecutor()
+	executor.SetRunFn(func(ctx context.Context, dir string, name string, args ...string) *ExecResult {
+		if dir == "" {
+			return &ExecResult{Stdout: []byte("v8.56.0")}
+		}
+		return &ExecResult{Err: errors.New("boom"), ExitCode: 2}
+	})
+	linter.executor = executor
+
+	result, err := linter.Run(context.Background(), "/tmp", []string{"src/index.ts"})
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	require.NotEmpty(t, result.Errors)
+	assert.Contains(t, result.Errors[0], "eslint execution failed")
+}
+
+func TestESLintRun_ParseFailure(t *testing.T) {
+	linter := NewESLint()
+	executor := NewExecutor()
+	executor.SetRunFn(func(ctx context.Context, dir string, name string, args ...string) *ExecResult {
+		if dir == "" {
+			return &ExecResult{Stdout: []byte("v8.56.0")}
+		}
+		return &ExecResult{Stdout: []byte("{broken")}
+	})
+	linter.executor = executor
+
+	result, err := linter.Run(context.Background(), "/tmp", []string{"src/index.ts"})
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	require.NotEmpty(t, result.Errors)
+	assert.Contains(t, result.Errors[0], "eslint output parse warning")
+	assert.Empty(t, result.Findings)
+}
+
+func TestESLintRun_Success(t *testing.T) {
+	linter := NewESLint()
+	executor := NewExecutor()
+	executor.SetRunFn(func(ctx context.Context, dir string, name string, args ...string) *ExecResult {
+		if dir == "" {
+			return &ExecResult{Stdout: []byte("v8.56.0")}
+		}
+		return &ExecResult{Stdout: []byte(`[{"filePath":"/project/src/index.ts","messages":[{"ruleId":"no-unused-vars","severity":1,"message":"'x' is defined but never used","line":10,"column":7}]}]`)}
+	})
+	linter.executor = executor
+
+	result, err := linter.Run(context.Background(), "/project", []string{"src/index.ts"})
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	require.Len(t, result.Findings, 1)
+	assert.Equal(t, SeverityWarning, result.Findings[0].Severity)
+	assert.Equal(t, CategoryUnused, result.Findings[0].Category)
+	assert.Equal(t, "no-unused-vars", result.Findings[0].Rule)
 }

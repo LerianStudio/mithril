@@ -8,6 +8,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/lerianstudio/mithril/internal/lint"
@@ -47,7 +48,10 @@ func main() {
 	}
 	s, err := scope.ReadScopeJSON(*scopePath)
 	if err != nil {
-		log.Fatalf("Failed to read scope: %v", err)
+		if *verbose {
+			log.Printf("scope read detail: %v", err)
+		}
+		log.Fatalf("Failed to read scope")
 	}
 
 	// Get language
@@ -111,17 +115,26 @@ func main() {
 	// Ensure output directory exists
 	writer := output.NewLintWriter(*outputPath)
 	if err := writer.EnsureDir(); err != nil {
-		log.Fatalf("Failed to create output directory: %v", err)
+		if *verbose {
+			log.Printf("output directory detail: %v", err)
+		}
+		log.Fatalf("Failed to create output directory")
 	}
 
 	// Write results
 	if err := writer.WriteResult(aggregateResult); err != nil {
-		log.Fatalf("Failed to write results: %v", err)
+		if *verbose {
+			log.Printf("write result detail: %v", err)
+		}
+		log.Fatalf("Failed to write results")
 	}
 
 	// Write language-specific result
 	if err := writer.WriteLanguageResult(lang, aggregateResult); err != nil {
-		log.Fatalf("Failed to write language result: %v", err)
+		if *verbose {
+			log.Printf("write language detail: %v", err)
+		}
+		log.Fatalf("Failed to write language result")
 	}
 
 	if lang == lint.LanguageMixed {
@@ -134,7 +147,8 @@ func main() {
 			if normalized == "" {
 				continue
 			}
-			if err := writer.WriteLanguageResult(normalized, aggregateResult); err != nil {
+			perLanguage := filterFindingsByLanguage(aggregateResult, normalized)
+			if err := writer.WriteLanguageResult(normalized, perLanguage); err != nil {
 				log.Printf("Warning: Failed to write %s language result: %v", normalized, err)
 			}
 		}
@@ -155,6 +169,40 @@ func main() {
 		for _, e := range aggregateResult.Errors {
 			fmt.Printf("  - %s\n", e)
 		}
+	}
+}
+
+func filterFindingsByLanguage(result *lint.Result, language lint.Language) *lint.Result {
+	if result == nil {
+		return lint.NewResult()
+	}
+
+	filtered := lint.NewResult()
+	for name, version := range result.ToolVersions {
+		filtered.ToolVersions[name] = version
+	}
+	filtered.Errors = append(filtered.Errors, result.Errors...)
+
+	for _, finding := range result.Findings {
+		if normalizeFindingLanguage(finding.File) == language {
+			filtered.AddFinding(finding)
+		}
+	}
+
+	return filtered
+}
+
+func normalizeFindingLanguage(filePath string) lint.Language {
+	ext := strings.ToLower(filepath.Ext(filePath))
+	switch ext {
+	case ".go":
+		return lint.LanguageGo
+	case ".ts", ".tsx", ".js", ".jsx":
+		return lint.LanguageTypeScript
+	case ".py":
+		return lint.LanguagePython
+	default:
+		return lint.Language("")
 	}
 }
 
@@ -244,7 +292,7 @@ func registerLinters(r *lint.Registry) {
 
 // deduplicateFindings removes duplicate findings based on file:line:message.
 func deduplicateFindings(result *lint.Result) {
-	seen := make(map[string]bool)
+	seen := make(map[string]int)
 	unique := make([]lint.Finding, 0)
 
 	// Reset summary
@@ -252,28 +300,50 @@ func deduplicateFindings(result *lint.Result) {
 
 	for _, f := range result.Findings {
 		key := fmt.Sprintf("%s:%d:%s", f.File, f.Line, f.Message)
-		if !seen[key] {
-			seen[key] = true
+		idx, exists := seen[key]
+		if !exists {
+			seen[key] = len(unique)
 			unique = append(unique, f)
+			continue
+		}
 
-			// Update summary
-			switch f.Severity {
-			case lint.SeverityCritical:
-				result.Summary.Critical++
-			case lint.SeverityHigh:
-				result.Summary.High++
-			case lint.SeverityWarning:
-				result.Summary.Warning++
-			case lint.SeverityInfo:
-				result.Summary.Info++
-			default:
-				result.Summary.Unknown++
-				msg := fmt.Sprintf("unknown severity %q for finding %s:%d (%s)", f.Severity, f.File, f.Line, f.Message)
-				result.Errors = append(result.Errors, msg)
-				log.Printf("Warning: %s", msg)
-			}
+		if severityRank(f.Severity) > severityRank(unique[idx].Severity) {
+			unique[idx] = f
+		}
+	}
+
+	for _, f := range unique {
+		switch f.Severity {
+		case lint.SeverityCritical:
+			result.Summary.Critical++
+		case lint.SeverityHigh:
+			result.Summary.High++
+		case lint.SeverityWarning:
+			result.Summary.Warning++
+		case lint.SeverityInfo:
+			result.Summary.Info++
+		default:
+			result.Summary.Unknown++
+			msg := fmt.Sprintf("unknown severity %q for finding %s:%d (%s)", f.Severity, f.File, f.Line, f.Message)
+			result.Errors = append(result.Errors, msg)
+			log.Printf("Warning: %s", msg)
 		}
 	}
 
 	result.Findings = unique
+}
+
+func severityRank(severity lint.Severity) int {
+	switch severity {
+	case lint.SeverityCritical:
+		return 4
+	case lint.SeverityHigh:
+		return 3
+	case lint.SeverityWarning:
+		return 2
+	case lint.SeverityInfo:
+		return 1
+	default:
+		return 0
+	}
 }

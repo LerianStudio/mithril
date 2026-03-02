@@ -1,9 +1,12 @@
 package lint
 
 import (
+	"context"
+	"errors"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestMapPylintSeverity(t *testing.T) {
@@ -69,4 +72,59 @@ func TestPylint_Name(t *testing.T) {
 func TestPylint_Language(t *testing.T) {
 	p := NewPylint()
 	assert.Equal(t, LanguagePython, p.Language())
+}
+
+func TestPylintRun_ExecutionFailure(t *testing.T) {
+	linter := NewPylint()
+	executor := NewExecutor()
+	executor.SetRunFn(func(ctx context.Context, dir string, name string, args ...string) *ExecResult {
+		if dir == "" {
+			return &ExecResult{Stdout: []byte("pylint 3.0.3")}
+		}
+		return &ExecResult{Err: errors.New("boom")}
+	})
+	linter.executor = executor
+
+	result, err := linter.Run(context.Background(), "/tmp", []string{"main.py"})
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	assert.NotEmpty(t, result.Errors)
+}
+
+func TestPylintRun_ParseFailure(t *testing.T) {
+	linter := NewPylint()
+	executor := NewExecutor()
+	executor.SetRunFn(func(ctx context.Context, dir string, name string, args ...string) *ExecResult {
+		if dir == "" {
+			return &ExecResult{Stdout: []byte("pylint 3.0.3")}
+		}
+		return &ExecResult{Stdout: []byte("{broken")}
+	})
+	linter.executor = executor
+
+	result, err := linter.Run(context.Background(), "/tmp", []string{"main.py"})
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	assert.NotEmpty(t, result.Errors)
+	assert.Empty(t, result.Findings)
+}
+
+func TestPylintRun_Success(t *testing.T) {
+	linter := NewPylint()
+	executor := NewExecutor()
+	executor.SetRunFn(func(ctx context.Context, dir string, name string, args ...string) *ExecResult {
+		if dir == "" {
+			return &ExecResult{Stdout: []byte("pylint 3.0.3")}
+		}
+		return &ExecResult{Stdout: []byte(`[{"type":"convention","module":"main","obj":"","line":1,"column":0,"path":"main.py","symbol":"missing-module-docstring","message":"Missing module docstring","message-id":"C0114"}]`)}
+	})
+	linter.executor = executor
+
+	result, err := linter.Run(context.Background(), "/project", []string{"main.py"})
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	require.Len(t, result.Findings, 1)
+	assert.Equal(t, SeverityInfo, result.Findings[0].Severity)
+	assert.Equal(t, CategoryStyle, result.Findings[0].Category)
+	assert.Equal(t, "C0114", result.Findings[0].Rule)
 }

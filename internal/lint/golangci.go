@@ -95,9 +95,14 @@ func (g *GolangciLint) Run(ctx context.Context, projectDir string, packages []st
 
 	// Add packages to analyze
 	if len(packages) > 0 {
+		if err := validateTargetArgs(packages); err != nil {
+			result.Errors = append(result.Errors, fmt.Sprintf("golangci-lint target validation failed: %v", err))
+			return result, nil
+		}
 		args = append(args, packages...)
 	} else {
-		args = append(args, "./...")
+		result.Errors = append(result.Errors, "golangci-lint target list is empty")
+		return result, nil
 	}
 
 	execResult := g.executor.Run(ctx, projectDir, "golangci-lint", args...)
@@ -173,8 +178,15 @@ func mapGolangciCategory(linter string) Category {
 func normalizeFilePath(projectDir, filePath string) string {
 	if filepath.IsAbs(filePath) {
 		if rel, err := filepath.Rel(projectDir, filePath); err == nil {
-			return rel
+			filePath = rel
 		}
 	}
-	return filePath
+
+	normalized := filepath.Clean(filePath)
+	if normalized == "." {
+		return normalized
+	}
+
+	prefix := "." + string(filepath.Separator)
+	return strings.TrimPrefix(normalized, prefix)
 }

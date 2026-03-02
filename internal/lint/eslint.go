@@ -54,8 +54,7 @@ func (e *ESLint) TargetKind() TargetKind {
 func (e *ESLint) Available(ctx context.Context) bool {
 	// Prefer direct eslint binary when present.
 	if e.executor.CommandAvailable(ctx, "eslint") {
-		result := e.executor.Run(ctx, "", "eslint", "--version")
-		return result.Err == nil && result.ExitCode == 0
+		return true
 	}
 
 	// Fall back to npx invocation without installing packages.
@@ -69,7 +68,7 @@ func (e *ESLint) Available(ctx context.Context) bool {
 
 // Version returns the eslint version.
 func (e *ESLint) Version(ctx context.Context) (string, error) {
-	version, err := e.executor.GetVersion(ctx, "npx", "eslint", "--version")
+	version, err := e.executor.GetVersion(ctx, "npx", "--no-install", "eslint", "--version")
 	if err != nil {
 		return "", err
 	}
@@ -96,12 +95,16 @@ func (e *ESLint) Run(ctx context.Context, projectDir string, files []string) (*R
 
 	// Add files to lint
 	if len(files) > 0 {
+		if err := validateTargetArgs(files); err != nil {
+			result.Errors = append(result.Errors, fmt.Sprintf("eslint target validation failed: %v", err))
+			return result, nil
+		}
 		args = append(args, files...)
 	} else {
 		args = append(args, ".")
 	}
 
-	execResult := e.executor.Run(ctx, projectDir, "npx", args...)
+	execResult := e.executor.Run(ctx, projectDir, "npx", append([]string{"--no-install"}, args...)...)
 	if execResult.Err != nil && (len(execResult.Stdout) == 0 || execResult.ExitCode == 2) {
 		result.Errors = append(result.Errors, fmt.Sprintf("eslint execution failed: %v", execResult.Err))
 		return result, nil

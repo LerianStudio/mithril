@@ -18,7 +18,6 @@ const (
 type TargetKind string
 
 const (
-	TargetKindAuto     TargetKind = "auto"     // Let caller decide based on language
 	TargetKindPackages TargetKind = "packages" // Linter prefers package import paths
 	TargetKindFiles    TargetKind = "files"    // Linter prefers explicit file paths
 	TargetKindProject  TargetKind = "project"  // Linter wants to operate on the project root

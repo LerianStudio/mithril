@@ -10,7 +10,6 @@ import (
 // banditOutput represents bandit JSON output.
 type banditOutput struct {
 	Results []banditResult `json:"results"`
-	Metrics banditMetrics  `json:"metrics"`
 }
 
 type banditResult struct {
@@ -24,10 +23,6 @@ type banditResult struct {
 	MoreInfo        string `json:"more_info"`
 	TestID          string `json:"test_id"`
 	TestName        string `json:"test_name"`
-}
-
-type banditMetrics struct {
-	TotalIssues int `json:"issues"`
 }
 
 // Bandit implements the bandit security scanner wrapper.
@@ -95,6 +90,10 @@ func (b *Bandit) Run(ctx context.Context, projectDir string, files []string) (*R
 
 	// Add files to scan
 	if len(files) > 0 {
+		if err := validateTargetArgs(files); err != nil {
+			result.Errors = append(result.Errors, fmt.Sprintf("bandit target validation failed: %v", err))
+			return result, nil
+		}
 		args = append(args, files...)
 	} else {
 		args = append(args, "-r", ".") // Recursive scan

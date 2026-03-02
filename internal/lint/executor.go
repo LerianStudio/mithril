@@ -5,10 +5,15 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
 	"os/exec"
+	"path/filepath"
+	"runtime"
 	"strings"
+	"sync"
+	"syscall"
 	"time"
+
+	"github.com/lerianstudio/mithril/internal/procenv"
 )
 
 // DefaultTimeout is the default timeout for linter execution.
@@ -24,14 +29,17 @@ type ExecResult struct {
 
 // Executor runs external commands.
 type Executor struct {
-	timeout time.Duration
-	runFn   func(ctx context.Context, dir string, name string, args ...string) *ExecResult
+	timeout       time.Duration
+	runFn         func(ctx context.Context, dir string, name string, args ...string) *ExecResult
+	mu            sync.RWMutex
+	resolvedPaths map[string]string
 }
 
 // NewExecutor creates a new command executor.
 func NewExecutor() *Executor {
 	return &Executor{
-		timeout: DefaultTimeout,
+		timeout:       DefaultTimeout,
+		resolvedPaths: make(map[string]string),
 	}
 }
 
@@ -41,29 +49,88 @@ func (e *Executor) SetRunFn(runFn func(ctx context.Context, dir string, name str
 
 // WithTimeout sets a custom timeout.
 func (e *Executor) WithTimeout(d time.Duration) *Executor {
-	copy := *e
-	copy.timeout = d
-	return &copy
+	cloned := &Executor{
+		timeout:       d,
+		runFn:         e.runFn,
+		resolvedPaths: make(map[string]string),
+	}
+
+	e.mu.RLock()
+	for name, path := range e.resolvedPaths {
+		cloned.resolvedPaths[name] = path
+	}
+	e.mu.RUnlock()
+
+	return cloned
 }
 
 // Run executes a command and returns the result.
 func (e *Executor) Run(ctx context.Context, dir string, name string, args ...string) *ExecResult {
 	if e.runFn != nil {
-		return e.runFn(ctx, dir, name, args...)
+		result := e.runFn(ctx, dir, name, args...)
+		if result == nil {
+			return &ExecResult{Err: fmt.Errorf("executor runFn returned nil result")}
+		}
+		return result
 	}
 
 	ctx, cancel := context.WithTimeout(ctx, e.timeout)
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, name, args...) // #nosec G204 - name/args come from registered linters
+	cmdName := name
+	if !filepath.IsAbs(name) {
+		e.mu.RLock()
+		resolved := e.resolvedPaths[name]
+		e.mu.RUnlock()
+		if resolved != "" {
+			cmdName = resolved
+		} else {
+			resolvedPath, resolveErr := exec.LookPath(name)
+			if resolveErr != nil {
+				return &ExecResult{Err: fmt.Errorf("command not found: %w", resolveErr)}
+			}
+			cmdName = resolvedPath
+			e.mu.Lock()
+			if e.resolvedPaths == nil {
+				e.resolvedPaths = make(map[string]string)
+			}
+			e.resolvedPaths[name] = resolvedPath
+			e.mu.Unlock()
+		}
+	}
+
+	cmd := exec.Command(cmdName, args...) // #nosec G204 - name/args come from registered linters
 	cmd.Dir = dir
-	cmd.Env = append([]string{"LC_ALL=C"}, os.Environ()...)
+	cmd.Env = procenv.Build()
+	if runtime.GOOS != "windows" {
+		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	}
 
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 
-	err := cmd.Run()
+	if err := cmd.Start(); err != nil {
+		return &ExecResult{Err: err}
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		done <- cmd.Wait()
+	}()
+
+	var err error
+	select {
+	case err = <-done:
+	case <-ctx.Done():
+		if cmd.Process != nil {
+			if runtime.GOOS != "windows" {
+				_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+			}
+			_ = cmd.Process.Kill()
+		}
+		err = <-done
+	}
 
 	result := &ExecResult{
 		Stdout: stdout.Bytes(),
@@ -71,13 +138,16 @@ func (e *Executor) Run(ctx context.Context, dir string, name string, args ...str
 	}
 
 	if err != nil {
+		if ctx.Err() == context.DeadlineExceeded {
+			result.Err = fmt.Errorf("command timed out after %v", e.timeout)
+			return result
+		}
+
 		var exitErr *exec.ExitError
 		if errors.As(err, &exitErr) {
 			result.ExitCode = exitErr.ExitCode()
-			// Many linters return non-zero on findings, which is not an error
+			// Many linters return non-zero on findings, which is not an error.
 			result.Err = nil
-		} else if ctx.Err() == context.DeadlineExceeded {
-			result.Err = fmt.Errorf("command timed out after %v", e.timeout)
 		} else {
 			result.Err = err
 		}
@@ -88,19 +158,26 @@ func (e *Executor) Run(ctx context.Context, dir string, name string, args ...str
 
 // CommandAvailable checks if a command is available in PATH.
 func (e *Executor) CommandAvailable(ctx context.Context, name string) bool {
-	resultCh := make(chan error, 1)
-
-	go func() {
-		_, err := exec.LookPath(name)
-		resultCh <- err
-	}()
-
-	select {
-	case <-ctx.Done():
+	if ctx.Err() != nil {
 		return false
-	case err := <-resultCh:
-		return err == nil
 	}
+
+	path, err := exec.LookPath(name)
+	if err != nil {
+		return false
+	}
+	if ctx.Err() != nil {
+		return false
+	}
+
+	e.mu.Lock()
+	if e.resolvedPaths == nil {
+		e.resolvedPaths = make(map[string]string)
+	}
+	e.resolvedPaths[name] = path
+	e.mu.Unlock()
+
+	return true
 }
 
 // GetVersion runs a command with --version and extracts the version string.

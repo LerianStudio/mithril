@@ -93,6 +93,10 @@ func (r *Ruff) Run(ctx context.Context, projectDir string, files []string) (*Res
 
 	// Add files to lint
 	if len(files) > 0 {
+		if err := validateTargetArgs(files); err != nil {
+			result.Errors = append(result.Errors, fmt.Sprintf("ruff target validation failed: %v", err))
+			return result, nil
+		}
 		args = append(args, files...)
 	} else {
 		args = append(args, ".")
