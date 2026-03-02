@@ -5,11 +5,13 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -17,37 +19,56 @@ import (
 // testBinaryName is the name of the test binary.
 const testBinaryName = "run-all-test"
 
+var (
+	buildOnce     sync.Once
+	buildErr      error
+	binaryAbsPath string
+)
+
+func TestMain(m *testing.M) {
+	code := m.Run()
+	if binaryAbsPath != "" {
+		if err := os.Remove(binaryAbsPath); err != nil && !os.IsNotExist(err) {
+			fmt.Fprintf(os.Stderr, "Warning: failed to remove test binary %s: %v\n", binaryAbsPath, err)
+		}
+	}
+	os.Exit(code)
+}
+
 // buildTestBinary builds the run-all binary for testing.
 // Returns the path to the built binary.
 func buildTestBinary(t *testing.T) string {
 	t.Helper()
 
-	// Build in the current directory (where main.go is)
-	binaryPath := filepath.Join(".", testBinaryName)
+	buildOnce.Do(func() {
+		binaryPath := filepath.Join(".", testBinaryName)
+		buildCmd := exec.Command("go", "build", "-o", binaryPath, ".")
+		buildCmd.Dir = "."
 
-	buildCmd := exec.Command("go", "build", "-o", binaryPath, ".")
-	buildCmd.Dir = "." // Ensure we're in the right directory
+		output, err := buildCmd.CombinedOutput()
+		if err != nil {
+			buildErr = fmt.Errorf("failed to build binary: %w\nOutput: %s", err, string(output))
+			return
+		}
 
-	output, err := buildCmd.CombinedOutput()
-	if err != nil {
-		t.Fatalf("Failed to build binary: %v\nOutput: %s", err, string(output))
+		binaryAbsPath, err = filepath.Abs(binaryPath)
+		if err != nil {
+			buildErr = err
+		}
+	})
+
+	if buildErr != nil {
+		t.Fatalf("%v", buildErr)
 	}
 
-	// Return absolute path for reliable execution
-	absPath, err := filepath.Abs(binaryPath)
-	if err != nil {
-		t.Fatalf("Failed to get absolute path: %v", err)
-	}
-
-	return absPath
+	return binaryAbsPath
 }
 
 // cleanupTestBinary removes the test binary.
 func cleanupTestBinary(t *testing.T, binaryPath string) {
 	t.Helper()
-
-	if err := os.Remove(binaryPath); err != nil && !os.IsNotExist(err) {
-		t.Logf("Warning: failed to remove test binary %s: %v", binaryPath, err)
+	if binaryPath == "" {
+		t.Error("expected test binary path to be set")
 	}
 }
 
@@ -411,10 +432,29 @@ func TestExecutePhase_ContextCancellation(t *testing.T) {
 
 	// Create cancellable context
 	ctx, cancel := context.WithCancel(context.Background())
+	readyFile := filepath.Join(tempDir, "ready.signal")
 
-	// Cancel after a short delay
+	if runtime.GOOS == "windows" {
+		script := "@echo off\necho ready > \"" + readyFile + "\"\nping -n 30 127.0.0.1 > nul\n"
+		if err := os.WriteFile(sleepBinaryPath, []byte(script), 0o755); err != nil {
+			t.Fatalf("Failed to update slow script with ready signal: %v", err)
+		}
+	} else {
+		script := "#!/bin/sh\necho ready > \"" + readyFile + "\"\nsleep 30\n"
+		if err := os.WriteFile(sleepBinaryPath, []byte(script), 0o755); err != nil {
+			t.Fatalf("Failed to update slow script with ready signal: %v", err)
+		}
+	}
+
 	go func() {
-		time.Sleep(100 * time.Millisecond)
+		deadline := time.Now().Add(2 * time.Second)
+		for time.Now().Before(deadline) {
+			if _, err := os.Stat(readyFile); err == nil {
+				cancel()
+				return
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
 		cancel()
 	}()
 
@@ -485,7 +525,7 @@ func buildCompileContextBinary(t *testing.T, dir string) string {
 	t.Helper()
 	binaryPath := filepath.Join(dir, "compile-context")
 	buildCmd := exec.Command("go", "build", "-o", binaryPath, "./cmd/compile-context")
-	buildCmd.Dir = filepath.Join(repoRoot(t), "scripts", "codereview")
+	buildCmd.Dir = repoRoot(t)
 	output, err := buildCmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("Failed to build compile-context binary: %v\nOutput: %s", err, string(output))
@@ -499,7 +539,7 @@ func repoRoot(t *testing.T) string {
 	if !ok {
 		t.Fatal("failed to determine test file path")
 	}
-	root := filepath.Join(filepath.Dir(filename), "..", "..", "..", "..")
+	root := filepath.Join(filepath.Dir(filename), "..", "..")
 	absRoot, err := filepath.Abs(root)
 	if err != nil {
 		t.Fatalf("failed to resolve repo root: %v", err)
@@ -999,7 +1039,7 @@ func TestShouldSkipForNoFilesOrUnknownLanguage_UnknownLanguage(t *testing.T) {
 
 func TestExtractFileFromGit_Success(t *testing.T) {
 	tempDir := t.TempDir()
-	path, err := extractFileFromGit("HEAD", "scripts/codereview/cmd/run-all/main.go", tempDir)
+	path, err := extractFileFromGit("HEAD", "cmd/run-all/main.go", tempDir)
 	if err != nil {
 		t.Fatalf("Expected success extracting file, got error: %v", err)
 	}
@@ -1059,6 +1099,201 @@ func TestExtractFileFromGit_GitShowFailure(t *testing.T) {
 	if !strings.Contains(err.Error(), "git show failed") {
 		t.Fatalf("Expected git show failure, got %v", err)
 	}
+}
+
+func TestGenerateASTBatchFile(t *testing.T) {
+	tempDir := t.TempDir()
+	scope := map[string]interface{}{
+		"base_ref":  "HEAD",
+		"head_ref":  "HEAD",
+		"language":  "go",
+		"languages": []string{"go"},
+		"files": map[string]interface{}{
+			"modified": []string{"cmd/run-all/main.go"},
+			"added":    []string{"new_file.go"},
+			"deleted":  []string{"cmd/run-all/main.go"},
+		},
+	}
+	writeMockJSON(t, filepath.Join(tempDir, "scope.json"), scope)
+
+	cfg := &config{outputDir: tempDir, baseRef: "HEAD", verbose: true}
+	batchPath, extractedTempDir, err := generateASTBatchFile(cfg)
+	if err != nil {
+		t.Fatalf("generateASTBatchFile returned error: %v", err)
+	}
+	if batchPath == "" {
+		t.Fatal("expected batchPath to be set")
+	}
+	if extractedTempDir == "" {
+		t.Fatal("expected tempDir to be set")
+	}
+	if !strings.HasPrefix(filepath.Clean(extractedTempDir), filepath.Clean(tempDir)+string(filepath.Separator)) {
+		t.Fatalf("expected AST temp dir to be created under output dir, got %s", extractedTempDir)
+	}
+
+	content, err := os.ReadFile(batchPath)
+	if err != nil {
+		t.Fatalf("failed to read generated batch file: %v", err)
+	}
+
+	var pairs []filePair
+	if err := json.Unmarshal(content, &pairs); err != nil {
+		t.Fatalf("failed to parse generated batch file: %v", err)
+	}
+	if len(pairs) != 3 {
+		t.Fatalf("expected 3 file pairs, got %d", len(pairs))
+	}
+
+	var modifiedPair, addedPair, deletedPair *filePair
+	for i := range pairs {
+		p := &pairs[i]
+		switch {
+		case p.BeforePath != "" && p.AfterPath == "cmd/run-all/main.go":
+			modifiedPair = p
+		case p.BeforePath == "" && p.AfterPath == "new_file.go":
+			addedPair = p
+		case p.BeforePath != "" && p.AfterPath == "":
+			deletedPair = p
+		}
+	}
+
+	if modifiedPair == nil {
+		t.Fatal("expected modified pair in batch output")
+	}
+	if addedPair == nil {
+		t.Fatal("expected added pair in batch output")
+	}
+	if deletedPair == nil {
+		t.Fatal("expected deleted pair in batch output")
+	}
+
+	cleanTemp := filepath.Clean(extractedTempDir)
+	if !strings.HasPrefix(filepath.Clean(modifiedPair.BeforePath), cleanTemp+string(filepath.Separator)) {
+		t.Fatalf("expected modified before path to be in temp dir: %s", modifiedPair.BeforePath)
+	}
+	if !strings.HasPrefix(filepath.Clean(deletedPair.BeforePath), cleanTemp+string(filepath.Separator)) {
+		t.Fatalf("expected deleted before path to be in temp dir: %s", deletedPair.BeforePath)
+	}
+}
+
+func TestGenerateASTBatchFile_ModifiedExtractionFailure(t *testing.T) {
+	tempDir := t.TempDir()
+	before := listASTTempDirs(t, tempDir)
+	scope := map[string]interface{}{
+		"base_ref":  "HEAD",
+		"head_ref":  "HEAD",
+		"language":  "go",
+		"languages": []string{"go"},
+		"files": map[string]interface{}{
+			"modified": []string{"no-such-file.go"},
+			"added":    []string{},
+			"deleted":  []string{},
+		},
+	}
+	writeMockJSON(t, filepath.Join(tempDir, "scope.json"), scope)
+
+	cfg := &config{outputDir: tempDir, baseRef: "HEAD"}
+	_, _, err := generateASTBatchFile(cfg)
+	if err == nil {
+		t.Fatal("expected error when modified file cannot be extracted from git")
+	}
+	if !strings.Contains(err.Error(), "failed to extract") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	after := listASTTempDirs(t, tempDir)
+	if len(after) != len(before) {
+		t.Fatalf("expected no leaked ast temp dirs on failure, before=%d after=%d", len(before), len(after))
+	}
+}
+
+func TestGenerateASTBatchFile_UsesScopeBaseRefOverConfigBaseRef(t *testing.T) {
+	tempDir := t.TempDir()
+	scope := map[string]interface{}{
+		"base_ref":  "missing-ref-for-test",
+		"head_ref":  "HEAD",
+		"language":  "go",
+		"languages": []string{"go"},
+		"files": map[string]interface{}{
+			"modified": []string{"cmd/run-all/main.go"},
+			"added":    []string{},
+			"deleted":  []string{},
+		},
+	}
+	writeMockJSON(t, filepath.Join(tempDir, "scope.json"), scope)
+
+	cfg := &config{outputDir: tempDir, baseRef: "HEAD"}
+	_, _, err := generateASTBatchFile(cfg)
+	if err == nil {
+		t.Fatal("expected error when scope base_ref is invalid")
+	}
+	if !strings.Contains(err.Error(), "missing-ref-for-test") {
+		t.Fatalf("expected error to mention scope base_ref, got %v", err)
+	}
+}
+
+func TestGenerateASTBatchFile_DeletedExtractionFailureContinues(t *testing.T) {
+	tempDir := t.TempDir()
+	scope := map[string]interface{}{
+		"base_ref":  "HEAD",
+		"head_ref":  "HEAD",
+		"language":  "go",
+		"languages": []string{"go"},
+		"files": map[string]interface{}{
+			"modified": []string{},
+			"added":    []string{"new_file.go"},
+			"deleted":  []string{"no-such-deleted.go"},
+		},
+	}
+	writeMockJSON(t, filepath.Join(tempDir, "scope.json"), scope)
+
+	cfg := &config{outputDir: tempDir, baseRef: "HEAD", verbose: true}
+	batchPath, _, err := generateASTBatchFile(cfg)
+	if err != nil {
+		t.Fatalf("expected success when only deleted extraction fails, got: %v", err)
+	}
+	content, readErr := os.ReadFile(batchPath)
+	if readErr != nil {
+		t.Fatalf("failed to read batch file: %v", readErr)
+	}
+	var pairs []filePair
+	if unmarshalErr := json.Unmarshal(content, &pairs); unmarshalErr != nil {
+		t.Fatalf("failed to parse batch file: %v", unmarshalErr)
+	}
+	if len(pairs) != 1 {
+		t.Fatalf("expected only added file pair to remain, got %d", len(pairs))
+	}
+	if pairs[0].AfterPath != "new_file.go" || pairs[0].BeforePath != "" {
+		t.Fatalf("unexpected pair content: %+v", pairs[0])
+	}
+}
+
+func TestValidateBinDir(t *testing.T) {
+	validDir := t.TempDir()
+	if err := validateBinDir(validDir); err != nil {
+		t.Fatalf("expected valid bin dir to pass validation: %v", err)
+	}
+
+	filePath := filepath.Join(validDir, "not-a-dir")
+	if err := os.WriteFile(filePath, []byte("x"), 0o644); err != nil {
+		t.Fatalf("failed to create file fixture: %v", err)
+	}
+	if err := validateBinDir(filePath); err == nil {
+		t.Fatal("expected file path to fail bin dir validation")
+	}
+
+	if err := validateBinDir("../outside"); err == nil {
+		t.Fatal("expected traversal path to fail bin dir validation")
+	}
+}
+
+func listASTTempDirs(t *testing.T, parentDir string) []string {
+	t.Helper()
+	matches, err := filepath.Glob(filepath.Join(parentDir, "ast-before-*"))
+	if err != nil {
+		t.Fatalf("failed to list ast temp dirs: %v", err)
+	}
+	return matches
 }
 
 // containsArg checks if an argument is in the args slice.
@@ -1142,7 +1377,7 @@ func createMockPhaseOutputs(t *testing.T, dir string) {
 	// Create go-calls.json
 	callsData := map[string]interface{}{
 		"modified_functions": []map[string]interface{}{},
-		"impact_summary":     map[string]interface{}{},
+		"impact_analysis":    map[string]interface{}{},
 	}
 	writeMockJSON(t, filepath.Join(dir, "go-calls.json"), callsData)
 

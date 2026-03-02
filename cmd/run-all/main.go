@@ -13,47 +13,19 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"syscall"
 	"time"
 
 	"github.com/lerianstudio/mithril/internal/fileutil"
 	"github.com/lerianstudio/mithril/internal/git"
+	"github.com/lerianstudio/mithril/internal/procenv"
+	"github.com/lerianstudio/mithril/internal/scope"
 )
 
-// scopeJSON represents the structure of scope.json from Phase 0.
-type scopeJSON struct {
-	BaseRef   string        `json:"base_ref"`
-	HeadRef   string        `json:"head_ref"`
-	Language  string        `json:"language"`
-	Languages []string      `json:"languages"`
-	Files     filesByStatus `json:"files"`
-}
-
-// filesByStatus holds categorized file lists from scope.json.
-type filesByStatus struct {
-	Modified []string `json:"modified"`
-	Added    []string `json:"added"`
-	Deleted  []string `json:"deleted"`
-}
-
-func normalizeScopeJSON(scope *scopeJSON) {
-	if scope == nil {
-		return
-	}
-	if scope.Files.Modified == nil {
-		scope.Files.Modified = []string{}
-	}
-	if scope.Files.Added == nil {
-		scope.Files.Added = []string{}
-	}
-	if scope.Files.Deleted == nil {
-		scope.Files.Deleted = []string{}
-	}
-	if scope.Languages == nil {
-		scope.Languages = []string{}
-	}
-}
+// scopeJSON aliases the canonical scope.ScopeJSON structure.
+type scopeJSON = scope.ScopeJSON
 
 // filePair represents a before/after file pair for AST extraction.
 type filePair struct {
@@ -61,27 +33,15 @@ type filePair struct {
 	AfterPath  string `json:"after_path"`
 }
 
-// astTempState holds temporary state for AST phase execution.
-var astTempState struct {
-	batchFile string
-	tempDir   string
-}
-
 // readScopeJSON reads and parses scope.json from the output directory.
 func readScopeJSON(outputDir string) (*scopeJSON, error) {
 	scopePath := filepath.Join(outputDir, "scope.json")
-	data, err := fileutil.ReadJSONFileWithLimit(scopePath)
+	scopeData, err := scope.ReadScopeJSON(scopePath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read scope.json: %w", err)
 	}
 
-	var scope scopeJSON
-	if err := json.Unmarshal(data, &scope); err != nil {
-		return nil, fmt.Errorf("failed to parse scope.json: %w", err)
-	}
-	normalizeScopeJSON(&scope)
-
-	return &scope, nil
+	return scopeData, nil
 }
 
 // shouldSkipForNoFiles skips phases if no files are detected.
@@ -146,19 +106,34 @@ func generateASTBatchFile(cfg *config) (string, string, error) {
 		return "", "", err
 	}
 
-	// Create temp directory for "before" files
-	tempDir, err := os.MkdirTemp("", "ast-before-*")
+	beforeRef := strings.TrimSpace(scope.BaseRef)
+	if beforeRef == "" {
+		beforeRef = cfg.baseRef
+	}
+
+	// Create temp directory for "before" files under outputDir so batch paths
+	// remain valid for ast-extractor path validation (must be within cwd).
+	tempDir, err := os.MkdirTemp(cfg.outputDir, "ast-before-*")
 	if err != nil {
 		return "", "", fmt.Errorf("failed to create temp directory: %w", err)
 	}
+	cleanupTempDir := true
+	defer func() {
+		if !cleanupTempDir {
+			return
+		}
+		if removeErr := os.RemoveAll(tempDir); removeErr != nil && cfg.verbose {
+			fmt.Fprintf(os.Stderr, "Warning: failed to clean up temp directory %s: %v\n", tempDir, removeErr)
+		}
+	}()
 
 	var pairs []filePair
 
 	// Handle modified files - need both before (from git) and after (current)
 	for _, file := range scope.Files.Modified {
-		beforePath, err := extractFileFromGit(cfg.baseRef, file, tempDir)
+		beforePath, err := extractFileFromGit(beforeRef, file, tempDir)
 		if err != nil {
-			return "", "", fmt.Errorf("failed to extract %s from %s: %w", file, cfg.baseRef, err)
+			return "", "", fmt.Errorf("failed to extract %s from %s: %w", file, beforeRef, err)
 		}
 		pairs = append(pairs, filePair{
 			BeforePath: beforePath,
@@ -176,10 +151,10 @@ func generateASTBatchFile(cfg *config) (string, string, error) {
 
 	// Handle deleted files - only before path (extract from git)
 	for _, file := range scope.Files.Deleted {
-		beforePath, err := extractFileFromGit(cfg.baseRef, file, tempDir)
+		beforePath, err := extractFileFromGit(beforeRef, file, tempDir)
 		if err != nil {
 			if cfg.verbose {
-				fmt.Fprintf(os.Stderr, "Warning: could not extract deleted file %s from %s: %v\n", file, cfg.baseRef, err)
+				fmt.Fprintf(os.Stderr, "Warning: could not extract deleted file %s from %s: %v\n", file, beforeRef, err)
 			}
 			continue
 		}
@@ -193,18 +168,14 @@ func generateASTBatchFile(cfg *config) (string, string, error) {
 	batchPath := filepath.Join(cfg.outputDir, "ast-batch.json")
 	data, err := json.MarshalIndent(pairs, "", "  ")
 	if err != nil {
-		if removeErr := os.RemoveAll(tempDir); removeErr != nil {
-			fmt.Fprintf(os.Stderr, "Warning: failed to clean up temp directory %s: %v\n", tempDir, removeErr)
-		}
 		return "", "", fmt.Errorf("failed to marshal batch file: %w", err)
 	}
 
 	if err := os.WriteFile(batchPath, data, 0o600); err != nil {
-		if removeErr := os.RemoveAll(tempDir); removeErr != nil {
-			fmt.Fprintf(os.Stderr, "Warning: failed to clean up temp directory %s: %v\n", tempDir, removeErr)
-		}
 		return "", "", fmt.Errorf("failed to write batch file: %w", err)
 	}
+
+	cleanupTempDir = false
 
 	return batchPath, tempDir, nil
 }
@@ -267,10 +238,10 @@ func extractFileFromGit(ref, filePath, tempDir string) (string, error) {
 func detectASTOutputFile(outputDir string) (string, error) {
 	// Check for language-specific AST files in priority order
 	candidates := []string{
+		filepath.Join(outputDir, "mixed-ast.json"),
 		filepath.Join(outputDir, "go-ast.json"),
 		filepath.Join(outputDir, "typescript-ast.json"),
 		filepath.Join(outputDir, "python-ast.json"),
-		filepath.Join(outputDir, "mixed-ast.json"),
 	}
 
 	for _, path := range candidates {
@@ -283,13 +254,14 @@ func detectASTOutputFile(outputDir string) (string, error) {
 }
 
 // cleanupASTTempFiles removes temporary files created during AST phase.
-func cleanupASTTempFiles() {
-	if astTempState.tempDir != "" {
-		if err := os.RemoveAll(astTempState.tempDir); err != nil {
-			fmt.Fprintf(os.Stderr, "Warning: failed to clean up temp directory %s: %v\n", astTempState.tempDir, err)
-		}
-		astTempState.tempDir = ""
+func cleanupASTTempFiles(cfg *config) {
+	if cfg == nil || cfg.astTempDir == "" {
+		return
 	}
+	if err := os.RemoveAll(cfg.astTempDir); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: failed to clean up temp directory %s: %v\n", cfg.astTempDir, err)
+	}
+	cfg.astTempDir = ""
 }
 
 // version is set via ldflags during build.
@@ -316,6 +288,7 @@ type config struct {
 	skip        string
 	verbose     bool
 	showVersion bool
+	astTempDir  string
 }
 
 // PhaseResult captures the outcome of a phase execution.
@@ -474,9 +447,7 @@ func getPhases() []Phase {
 					fmt.Fprintf(os.Stderr, "Warning: failed to generate AST batch file: %v\n", err)
 					return nil
 				}
-				// Store temp state for cleanup
-				astTempState.batchFile = batchPath
-				astTempState.tempDir = tempDir
+				cfg.astTempDir = tempDir
 				return []string{
 					"--batch", batchPath,
 					"--output", "json",
@@ -506,6 +477,10 @@ func getPhases() []Phase {
 					"--output", cfg.outputDir,
 				}
 				if len(callgraphLangs) > 1 {
+					mixedAST := filepath.Join(cfg.outputDir, "mixed-ast.json")
+					if _, statErr := os.Stat(mixedAST); statErr == nil {
+						args[1] = mixedAST
+					}
 					if err := writeCallgraphLanguageFile(cfg.outputDir, callgraphLangs); err != nil {
 						fmt.Fprintf(os.Stderr, "Warning: %v\n", err)
 						return nil
@@ -623,7 +598,7 @@ func run() error {
 		select {
 		case <-ctx.Done():
 			fmt.Fprintf(os.Stderr, "\nInterrupted. Stopping execution.\n")
-			cleanupASTTempFiles() // Cleanup on interrupt
+			cleanupASTTempFiles(cfg) // Cleanup on interrupt
 			interruptSummary := buildSummary(results)
 			printSummary(interruptSummary, time.Since(startTime))
 			return fmt.Errorf("execution interrupted")
@@ -635,7 +610,7 @@ func run() error {
 
 		// Cleanup AST temp files after AST phase completes
 		if phase.Name == "ast" {
-			cleanupASTTempFiles()
+			cleanupASTTempFiles(cfg)
 		}
 
 		// Print progress
@@ -754,7 +729,7 @@ func executePhase(ctx context.Context, cfg *config, phase Phase, skipSet map[str
 
 	// Use CommandContext for automatic process cleanup on cancellation/timeout
 	cmd := exec.CommandContext(phaseCtx, binaryPath, args...) // #nosec G204 - binary and args are internal/validated
-	cmd.Env = append([]string{"LC_ALL=C"}, os.Environ()...)
+	cmd.Env = procenv.Build()
 
 	wd, err := os.Getwd()
 	if err != nil {
@@ -800,21 +775,89 @@ func executePhase(ctx context.Context, cfg *config, phase Phase, skipSet map[str
 			result.Error = fmt.Errorf("failed to read scope.json for AST output: %w", scopeErr)
 			result.Success = false
 		} else {
-			language := scope.Language
-			if language == "" {
-				language = "unknown"
-			}
-			astOutputPath := filepath.Join(cfg.outputDir, fmt.Sprintf("%s-ast.json", language))
-			if writeErr := os.WriteFile(astOutputPath, stdoutBuf.Bytes(), 0o600); writeErr != nil {
-				result.Error = fmt.Errorf("failed to write AST output to %s: %w", astOutputPath, writeErr)
+			written, writeErr := writeASTOutputsByLanguage(cfg.outputDir, stdoutBuf.Bytes(), scope.Language)
+			if writeErr != nil {
+				result.Error = fmt.Errorf("failed to write AST outputs: %w", writeErr)
 				result.Success = false
 			} else if cfg.verbose {
-				fmt.Fprintf(os.Stderr, "  AST output written to: %s\n", astOutputPath)
+				for _, outputPath := range written {
+					fmt.Fprintf(os.Stderr, "  AST output written to: %s\n", outputPath)
+				}
 			}
 		}
 	}
 
 	return result
+}
+
+func writeASTOutputsByLanguage(outputDir string, payload []byte, defaultLanguage string) ([]string, error) {
+	trimmed := bytes.TrimSpace(payload)
+	if len(trimmed) == 0 {
+		return nil, fmt.Errorf("empty AST payload")
+	}
+
+	var docs []map[string]interface{}
+	if err := json.Unmarshal(trimmed, &docs); err != nil {
+		var single map[string]interface{}
+		if errSingle := json.Unmarshal(trimmed, &single); errSingle != nil {
+			return nil, fmt.Errorf("invalid AST payload: %w", err)
+		}
+		docs = []map[string]interface{}{single}
+	}
+
+	byLanguage := make(map[string][]map[string]interface{})
+	for _, doc := range docs {
+		lang := sanitizedASTLanguageToken(doc, defaultLanguage)
+		byLanguage[lang] = append(byLanguage[lang], doc)
+	}
+
+	written := make([]string, 0, len(byLanguage)+1)
+	mixedPayload, err := json.MarshalIndent(docs, "", "  ")
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal mixed AST payload: %w", err)
+	}
+	mixedPath := filepath.Join(outputDir, "mixed-ast.json")
+	if err := os.WriteFile(mixedPath, mixedPayload, 0o600); err != nil {
+		return nil, fmt.Errorf("failed to write %s: %w", mixedPath, err)
+	}
+	written = append(written, mixedPath)
+
+	for language, docsForLang := range byLanguage {
+		astOutputPath := filepath.Join(outputDir, fmt.Sprintf("%s-ast.json", language))
+		languagePayload, err := json.MarshalIndent(docsForLang, "", "  ")
+		if err != nil {
+			return nil, fmt.Errorf("failed to marshal %s AST payload: %w", language, err)
+		}
+		if err := os.WriteFile(astOutputPath, languagePayload, 0o600); err != nil {
+			return nil, fmt.Errorf("failed to write %s: %w", astOutputPath, err)
+		}
+		written = append(written, astOutputPath)
+	}
+
+	return written, nil
+}
+
+var astLanguageTokenPattern = regexp.MustCompile(`^[a-z0-9_-]+$`)
+
+func sanitizedASTLanguageToken(doc map[string]interface{}, defaultLanguage string) string {
+	candidates := []string{}
+	if raw, ok := doc["language"].(string); ok {
+		candidates = append(candidates, raw)
+	}
+	candidates = append(candidates, defaultLanguage)
+
+	for _, candidate := range candidates {
+		normalized := normalizeCallgraphLanguage(candidate)
+		if normalized == "" {
+			continue
+		}
+		normalized = strings.ToLower(strings.TrimSpace(normalized))
+		if astLanguageTokenPattern.MatchString(normalized) {
+			return normalized
+		}
+	}
+
+	return "unknown"
 }
 
 type summary struct {
