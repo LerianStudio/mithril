@@ -8,14 +8,12 @@ import (
 	"strings"
 
 	"github.com/lerianstudio/mithril/internal/fileutil"
+	scopepkg "github.com/lerianstudio/mithril/internal/scope"
 )
 
 // highImpactCallerThreshold is the minimum number of callers for a function
 // to be considered high-impact. Used consistently across all analysis.
 const highImpactCallerThreshold = 3
-
-// maxJSONFileSize is the maximum allowed size for JSON input files (50MB).
-const maxJSONFileSize = 50 * 1024 * 1024
 
 // reviewerDataBuilder is a function that populates template data for a specific reviewer.
 type reviewerDataBuilder func(c *Compiler, data *TemplateData, outputs *PhaseOutputs)
@@ -27,6 +25,11 @@ var reviewerDataBuilders = map[string]reviewerDataBuilder{
 	"business-logic-reviewer": (*Compiler).buildBusinessLogicReviewerData,
 	"test-reviewer":           (*Compiler).buildTestReviewerData,
 	"nil-safety-reviewer":     (*Compiler).buildNilSafetyReviewerData,
+}
+
+func hasReviewerDataBuilder(reviewer string) bool {
+	_, ok := reviewerDataBuilders[reviewer]
+	return ok
 }
 
 // Compiler aggregates phase outputs and generates reviewer context files.
@@ -65,15 +68,11 @@ func readJSONFileWithLimit(path string) ([]byte, error) {
 	return fileutil.ReadJSONFileWithLimit(path)
 }
 
-// NewCompiler creates a new context compiler.
+// NewCompiler creates a new context compiler with input/output validation.
 // inputDir: directory containing phase outputs (e.g., .ring/codereview/)
 // outputDir: directory to write context files (typically same as inputDir)
-// Returns an error if paths contain traversal sequences.
-func NewCompiler(inputDir, outputDir string) *Compiler {
-	return &Compiler{
-		inputDir:  inputDir,
-		outputDir: outputDir,
-	}
+func NewCompiler(inputDir, outputDir string) (*Compiler, error) {
+	return NewCompilerWithValidation(inputDir, outputDir)
 }
 
 // NewCompilerWithValidation creates a new context compiler with path validation.
@@ -99,10 +98,17 @@ func NewCompilerWithValidation(inputDir, outputDir string) (*Compiler, error) {
 
 // Compile reads all phase outputs and generates reviewer context files.
 func (c *Compiler) Compile() error {
+	if err := reviewerConfigurationError(); err != nil {
+		return fmt.Errorf("reviewer configuration invalid: %w", err)
+	}
+
 	// Read all phase outputs
 	outputs, err := c.readPhaseOutputs()
 	if err != nil {
 		return fmt.Errorf("failed to read phase outputs: %w", err)
+	}
+	if len(outputs.Errors) > 0 {
+		return fmt.Errorf("one or more phase outputs could not be read or parsed: %s", strings.Join(outputs.Errors, "; "))
 	}
 
 	// Determine language from scope
@@ -127,16 +133,20 @@ func (c *Compiler) readPhaseOutputs() (*PhaseOutputs, error) {
 
 	// Read scope.json (Phase 0)
 	scopePath := filepath.Join(c.inputDir, "scope.json")
-	if data, err := readJSONFileWithLimit(scopePath); err == nil {
-		var scope ScopeData
-		if err := json.Unmarshal(data, &scope); err == nil {
-			applyScopeDerivedFields(&scope)
-			outputs.Scope = &scope
-		} else {
-			outputs.Errors = append(outputs.Errors, fmt.Sprintf("scope.json parse error: %v", err))
+	if canonicalScope, err := scopepkg.ReadScopeJSON(scopePath); err == nil {
+		scopeData := ScopeData{
+			BaseRef:          canonicalScope.BaseRef,
+			HeadRef:          canonicalScope.HeadRef,
+			Language:         canonicalScope.Language,
+			Languages:        append([]string{}, canonicalScope.Languages...),
+			Files:            ScopeFiles(canonicalScope.Files),
+			Stats:            ScopeStats(canonicalScope.Stats),
+			PackagesAffected: append([]string{}, canonicalScope.Packages...),
 		}
-	} else if !os.IsNotExist(err) {
-		outputs.Errors = append(outputs.Errors, fmt.Sprintf("scope.json read error: %v", err))
+		applyScopeDerivedFields(&scopeData)
+		outputs.Scope = &scopeData
+	} else if !isFileNotFound(err) {
+		outputs.Errors = append(outputs.Errors, "scope.json read error")
 	}
 
 	// Read static-analysis.json (Phase 1)
@@ -146,10 +156,10 @@ func (c *Compiler) readPhaseOutputs() (*PhaseOutputs, error) {
 		if err := json.Unmarshal(data, &static); err == nil {
 			outputs.StaticAnalysis = &static
 		} else {
-			outputs.Errors = append(outputs.Errors, fmt.Sprintf("static-analysis.json parse error: %v", err))
+			outputs.Errors = append(outputs.Errors, "static-analysis.json parse error")
 		}
-	} else if !os.IsNotExist(err) {
-		outputs.Errors = append(outputs.Errors, fmt.Sprintf("static-analysis.json read error: %v", err))
+	} else if !isFileNotFound(err) {
+		outputs.Errors = append(outputs.Errors, "static-analysis.json read error")
 	}
 
 	// Read language-specific AST (Phase 2) - support multi-language projects
@@ -157,18 +167,18 @@ func (c *Compiler) readPhaseOutputs() (*PhaseOutputs, error) {
 	for _, lang := range c.languagesFromScope(outputs.Scope) {
 		astPath := filepath.Join(c.inputDir, fmt.Sprintf("%s-ast.json", lang))
 		if data, err := readJSONFileWithLimit(astPath); err == nil {
-			var ast ASTData
-			if err := json.Unmarshal(data, &ast); err == nil {
-				outputs.ASTByLanguage[lang] = &ast
+			astData, parseErr := parseASTData(data)
+			if parseErr == nil {
+				outputs.ASTByLanguage[lang] = astData
 				// Keep backward compatibility: first language found becomes primary
 				if outputs.AST == nil {
-					outputs.AST = &ast
+					outputs.AST = astData
 				}
 			} else {
-				outputs.Errors = append(outputs.Errors, fmt.Sprintf("%s-ast.json parse error: %v", lang, err))
+				outputs.Errors = append(outputs.Errors, fmt.Sprintf("%s-ast.json parse error", lang))
 			}
-		} else if !os.IsNotExist(err) {
-			outputs.Errors = append(outputs.Errors, fmt.Sprintf("%s-ast.json read error: %v", lang, err))
+		} else if !isFileNotFound(err) {
+			outputs.Errors = append(outputs.Errors, fmt.Sprintf("%s-ast.json read error", lang))
 		}
 	}
 
@@ -185,10 +195,10 @@ func (c *Compiler) readPhaseOutputs() (*PhaseOutputs, error) {
 					outputs.CallGraph = &calls
 				}
 			} else {
-				outputs.Errors = append(outputs.Errors, fmt.Sprintf("%s-calls.json parse error: %v", lang, err))
+				outputs.Errors = append(outputs.Errors, fmt.Sprintf("%s-calls.json parse error", lang))
 			}
-		} else if !os.IsNotExist(err) {
-			outputs.Errors = append(outputs.Errors, fmt.Sprintf("%s-calls.json read error: %v", lang, err))
+		} else if !isFileNotFound(err) {
+			outputs.Errors = append(outputs.Errors, fmt.Sprintf("%s-calls.json read error", lang))
 		}
 	}
 
@@ -197,18 +207,18 @@ func (c *Compiler) readPhaseOutputs() (*PhaseOutputs, error) {
 	for _, lang := range c.languagesFromScope(outputs.Scope) {
 		flowPath := filepath.Join(c.inputDir, fmt.Sprintf("%s-flow.json", lang))
 		if data, err := readJSONFileWithLimit(flowPath); err == nil {
-			var flow DataFlowData
-			if err := json.Unmarshal(data, &flow); err == nil {
-				outputs.DataFlowByLanguage[lang] = &flow
+			flowData, parseErr := parseDataFlowData(data)
+			if parseErr == nil {
+				outputs.DataFlowByLanguage[lang] = flowData
 				// Keep backward compatibility: first language found becomes primary
 				if outputs.DataFlow == nil {
-					outputs.DataFlow = &flow
+					outputs.DataFlow = flowData
 				}
 			} else {
-				outputs.Errors = append(outputs.Errors, fmt.Sprintf("%s-flow.json parse error: %v", lang, err))
+				outputs.Errors = append(outputs.Errors, fmt.Sprintf("%s-flow.json parse error", lang))
 			}
-		} else if !os.IsNotExist(err) {
-			outputs.Errors = append(outputs.Errors, fmt.Sprintf("%s-flow.json read error: %v", lang, err))
+		} else if !isFileNotFound(err) {
+			outputs.Errors = append(outputs.Errors, fmt.Sprintf("%s-flow.json read error", lang))
 		}
 	}
 
@@ -228,6 +238,16 @@ func applyScopeDerivedFields(scope *ScopeData) {
 	if scope.Languages == nil {
 		scope.Languages = []string{}
 	}
+}
+
+func isFileNotFound(err error) bool {
+	if err == nil {
+		return false
+	}
+	if os.IsNotExist(err) {
+		return true
+	}
+	return strings.Contains(strings.ToLower(err.Error()), "no such file or directory")
 }
 
 func (c *Compiler) languagesFromScope(scope *ScopeData) []string {
@@ -352,6 +372,9 @@ func (c *Compiler) buildBusinessLogicReviewerData(data *TemplateData, outputs *P
 	// Call graph for impact analysis
 	if outputs.CallGraph != nil {
 		data.HasCallGraph = true
+		data.CallGraphPartialResults = outputs.CallGraph.PartialResults
+		data.CallGraphTimeBudgetExceeded = outputs.CallGraph.TimeBudgetExceeded
+		data.CallGraphWarnings = append([]string{}, outputs.CallGraph.Warnings...)
 		data.HighImpactFunctions = GetHighImpactFunctions(outputs.CallGraph, highImpactCallerThreshold)
 	}
 
@@ -370,6 +393,9 @@ func (c *Compiler) buildTestReviewerData(data *TemplateData, outputs *PhaseOutpu
 	// Call graph for test coverage
 	if outputs.CallGraph != nil {
 		data.HasCallGraph = true
+		data.CallGraphPartialResults = outputs.CallGraph.PartialResults
+		data.CallGraphTimeBudgetExceeded = outputs.CallGraph.TimeBudgetExceeded
+		data.CallGraphWarnings = append([]string{}, outputs.CallGraph.Warnings...)
 		// Use AllModifiedFunctionsGraph for template (holds FunctionCallGraph)
 		data.AllModifiedFunctionsGraph = outputs.CallGraph.ModifiedFunctions
 		data.UncoveredFunctions = GetUncoveredFunctions(outputs.CallGraph)

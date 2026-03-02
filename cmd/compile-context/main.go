@@ -19,6 +19,10 @@ var (
 	showVersion = flag.Bool("version", false, "Show version and exit")
 )
 
+func init() {
+	flag.BoolVar(verbose, "v", false, "Enable verbose output (shorthand)")
+}
+
 func main() {
 	flag.Usage = printUsage
 	flag.Parse()

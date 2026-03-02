@@ -97,7 +97,7 @@ func TestRenderTemplate_SecurityReviewer(t *testing.T) {
 	if !strings.Contains(result, "High Risk Flows") {
 		t.Error("Missing high risk flows section")
 	}
-	if !strings.Contains(result, "http_request") {
+	if !strings.Contains(result, "http\\_request") {
 		t.Error("Missing source type")
 	}
 }
@@ -132,7 +132,10 @@ func TestRenderTemplate_NilSafetyReviewer(t *testing.T) {
 
 func TestRenderTemplate_BusinessLogicReviewer(t *testing.T) {
 	data := &TemplateData{
-		HasCallGraph: true,
+		HasCallGraph:                true,
+		CallGraphPartialResults:     true,
+		CallGraphTimeBudgetExceeded: true,
+		CallGraphWarnings:           []string{"Skipped 2 files due to parser errors"},
 		HighImpactFunctions: []FunctionCallGraph{
 			{
 				Function: "ProcessPayment",
@@ -170,11 +173,16 @@ func TestRenderTemplate_BusinessLogicReviewer(t *testing.T) {
 	if !strings.Contains(result, "HandleCheckout") {
 		t.Error("Missing caller")
 	}
+	if !strings.Contains(result, "Call Graph Warnings") {
+		t.Error("Missing call graph warnings section")
+	}
 }
 
 func TestRenderTemplate_TestReviewer(t *testing.T) {
 	data := &TemplateData{
-		HasCallGraph: true,
+		HasCallGraph:            true,
+		CallGraphPartialResults: true,
+		CallGraphWarnings:       []string{"Package loading timed out"},
 		AllModifiedFunctionsGraph: []FunctionCallGraph{
 			{
 				Function: "CreateUser",
@@ -208,6 +216,9 @@ func TestRenderTemplate_TestReviewer(t *testing.T) {
 	}
 	if !strings.Contains(result, "No tests found") {
 		t.Error("Missing no tests indicator")
+	}
+	if !strings.Contains(result, "Package loading timed out") {
+		t.Error("Missing call graph warning in test template")
 	}
 }
 
@@ -335,20 +346,6 @@ func TestTemplateFuncs_RiskLevel(t *testing.T) {
 	}
 }
 
-func TestTemplateFuncs_TestStatus(t *testing.T) {
-	fn := templateFuncs["testStatus"].(func(FunctionCallGraph) string)
-
-	noTests := FunctionCallGraph{TestCoverage: nil}
-	if fn(noTests) != "No tests" {
-		t.Errorf("testStatus with no tests should return 'No tests', got %q", fn(noTests))
-	}
-
-	withTests := FunctionCallGraph{TestCoverage: []TestCoverage{{}, {}}}
-	if fn(withTests) != "2 tests" {
-		t.Errorf("testStatus with 2 tests should return '2 tests', got %q", fn(withTests))
-	}
-}
-
 func TestTemplateFuncs_FieldChanges(t *testing.T) {
 	fn := templateFuncs["fieldChanges"].(func(TypeDiff) []FieldChange)
 
@@ -440,10 +437,10 @@ func TestRenderTemplate_CodeReviewerWithSignatureChange(t *testing.T) {
 	if !strings.Contains(result, "```diff") {
 		t.Error("Should show diff block for signature change")
 	}
-	if !strings.Contains(result, "- func Process(ctx context.Context)") {
+	if !strings.Contains(result, "- func Process\\(ctx context.Context\\)") {
 		t.Error("Should show old signature in diff")
 	}
-	if !strings.Contains(result, "+ func Process(ctx context.Context, id string)") {
+	if !strings.Contains(result, "+ func Process\\(ctx context.Context, id string\\)") {
 		t.Error("Should show new signature in diff")
 	}
 }
@@ -477,7 +474,7 @@ func TestRenderTemplate_SecurityReviewerWithMediumRiskFlows(t *testing.T) {
 	if !strings.Contains(result, "Medium Risk Flows") {
 		t.Error("Should show medium risk flows section")
 	}
-	if !strings.Contains(result, "config_file") {
+	if !strings.Contains(result, "config\\_file") {
 		t.Error("Should show medium risk flow source type")
 	}
 }
@@ -508,7 +505,10 @@ func TestRenderTemplate_NilSafetyWithCheckedSource(t *testing.T) {
 
 func TestRenderTemplate_TestReviewerAllCovered(t *testing.T) {
 	data := &TemplateData{
-		HasCallGraph:       true,
+		HasCallGraph: true,
+		AllModifiedFunctionsGraph: []FunctionCallGraph{
+			{Function: "CreateUser", File: "user.go", TestCoverage: []TestCoverage{{TestFunction: "TestCreateUser", File: "user_test.go", Line: 10}}},
+		},
 		UncoveredFunctions: nil, // All functions covered
 	}
 
@@ -519,6 +519,46 @@ func TestRenderTemplate_TestReviewerAllCovered(t *testing.T) {
 
 	if !strings.Contains(result, "All modified code has test coverage") {
 		t.Error("Should show 'All modified code has test coverage' when no uncovered functions")
+	}
+}
+
+func TestRenderTemplate_TestReviewerNoCallgraphData(t *testing.T) {
+	data := &TemplateData{HasCallGraph: true, UncoveredFunctions: nil, AllModifiedFunctionsGraph: nil}
+
+	result, err := RenderTemplate(testReviewerTemplate, data)
+	if err != nil {
+		t.Fatalf("RenderTemplate failed: %v", err)
+	}
+
+	if !strings.Contains(result, "No callgraph data available") {
+		t.Error("Should show no-data message when callgraph has zero modified functions")
+	}
+}
+
+func TestRenderTemplate_EscapesMarkdownControlCharacters(t *testing.T) {
+	data := &TemplateData{
+		FindingCount: 1,
+		Findings: []Finding{{
+			Tool:     "tool|name",
+			Rule:     "R#1",
+			Severity: "high",
+			File:     "a.go",
+			Line:     1,
+			Message:  "bad\nmessage",
+			Category: "bug",
+		}},
+	}
+
+	result, err := RenderTemplate(codeReviewerTemplate, data)
+	if err != nil {
+		t.Fatalf("RenderTemplate failed: %v", err)
+	}
+
+	if strings.Contains(result, "bad\nmessage") {
+		t.Error("expected newline to be sanitized in rendered markdown")
+	}
+	if !strings.Contains(result, "tool\\|name") {
+		t.Error("expected markdown table delimiter to be escaped")
 	}
 }
 

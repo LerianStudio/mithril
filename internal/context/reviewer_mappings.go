@@ -1,6 +1,12 @@
 package context
 
-import "fmt"
+import (
+	"fmt"
+	"log"
+	"strings"
+)
+
+var reviewerConfigErr error
 
 // DataSource represents a data source for a reviewer.
 type DataSource struct {
@@ -41,13 +47,48 @@ var reviewerOrder = []string{
 }
 
 func init() {
-	// Validate that all reviewers in reviewerOrder exist in reviewerDataSources.
+	reviewerConfigErr = validateReviewerConfiguration()
+}
+
+func validateReviewerConfiguration() error {
+	reviewerSet := make(map[string]struct{}, len(reviewerOrder))
+
+	// Validate that all reviewers in reviewerOrder exist in all required registries.
 	// This catches drift at startup rather than at runtime.
 	for _, name := range reviewerOrder {
+		reviewerSet[name] = struct{}{}
 		if _, ok := reviewerDataSources[name]; !ok {
-			panic(fmt.Sprintf("reviewer %q in reviewerOrder but not in reviewerDataSources", name))
+			return fmt.Errorf("reviewer %q in reviewerOrder but not in reviewerDataSources", name)
+		}
+		if !hasReviewerDataBuilder(name) {
+			return fmt.Errorf("reviewer %q in reviewerOrder but not in reviewerDataBuilders", name)
+		}
+		if !hasTemplateForReviewer(name) {
+			return fmt.Errorf("reviewer %q in reviewerOrder but not in reviewerTemplates", name)
 		}
 	}
+
+	for name := range reviewerDataSources {
+		if _, ok := reviewerSet[name]; !ok {
+			return fmt.Errorf("reviewer %q in reviewerDataSources but not in reviewerOrder", name)
+		}
+	}
+	for name := range reviewerDataBuilders {
+		if _, ok := reviewerSet[name]; !ok {
+			return fmt.Errorf("reviewer %q in reviewerDataBuilders but not in reviewerOrder", name)
+		}
+	}
+	for name := range reviewerTemplates {
+		if _, ok := reviewerSet[name]; !ok {
+			return fmt.Errorf("reviewer %q in reviewerTemplates but not in reviewerOrder", name)
+		}
+	}
+
+	return nil
+}
+
+func reviewerConfigurationError() error {
+	return reviewerConfigErr
 }
 
 // severityOrder defines severity ranking for filtering.
@@ -101,8 +142,9 @@ func GetReviewerDataSources(reviewer string) []DataSource {
 // FilterFindingsByCategory filters findings to only those in the specified category.
 func FilterFindingsByCategory(findings []Finding, category string) []Finding {
 	var filtered []Finding
+	normalizedCategory := normalizeCategory(category)
 	for _, f := range findings {
-		if f.Category == category {
+		if normalizeCategory(f.Category) == normalizedCategory {
 			filtered = append(filtered, f)
 		}
 	}
@@ -135,10 +177,22 @@ func FilterFindingsBySeverity(findings []Finding, minSeverity string) []Finding 
 // FilterFindingsForCodeReviewer filters findings relevant to code quality.
 func FilterFindingsForCodeReviewer(findings []Finding) []Finding {
 	var filtered []Finding
+	seenUnknown := make(map[string]struct{})
 	for _, f := range findings {
-		if codeQualityCategories[f.Category] {
+		category := normalizeCategory(f.Category)
+		if codeQualityCategories[category] {
 			filtered = append(filtered, f)
+			continue
 		}
+		if securityCategories[category] {
+			continue
+		}
+
+		if _, ok := seenUnknown[category]; !ok {
+			seenUnknown[category] = struct{}{}
+			log.Printf("Warning: unmapped finding category %q routed to code-reviewer fallback", category)
+		}
+		filtered = append(filtered, f)
 	}
 	return filtered
 }
@@ -147,11 +201,15 @@ func FilterFindingsForCodeReviewer(findings []Finding) []Finding {
 func FilterFindingsForSecurityReviewer(findings []Finding) []Finding {
 	var filtered []Finding
 	for _, f := range findings {
-		if securityCategories[f.Category] {
+		if securityCategories[normalizeCategory(f.Category)] {
 			filtered = append(filtered, f)
 		}
 	}
 	return filtered
+}
+
+func normalizeCategory(category string) string {
+	return strings.ToLower(strings.TrimSpace(category))
 }
 
 // FilterNilSourcesByRisk filters nil sources by risk level.

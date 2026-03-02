@@ -76,6 +76,7 @@ type FindingSummary struct {
 	High     int `json:"high"`
 	Warning  int `json:"warning"`
 	Info     int `json:"info"`
+	Unknown  int `json:"unknown"`
 }
 
 // ASTData represents Phase 2 output ({lang}-ast.json).
@@ -243,8 +244,12 @@ type ErrorCheck struct {
 
 // CallGraphData represents Phase 3 output ({lang}-calls.json).
 type CallGraphData struct {
-	ModifiedFunctions []FunctionCallGraph `json:"modified_functions"`
-	ImpactAnalysis    ImpactSummary       `json:"impact_analysis"`
+	Language           string              `json:"language,omitempty"`
+	ModifiedFunctions  []FunctionCallGraph `json:"modified_functions"`
+	ImpactAnalysis     ImpactSummary       `json:"impact_analysis"`
+	PartialResults     bool                `json:"partial_results,omitempty"`
+	TimeBudgetExceeded bool                `json:"time_budget_exceeded,omitempty"`
+	Warnings           []string            `json:"warnings,omitempty"`
 }
 
 // FunctionCallGraph holds call graph data for a function.
@@ -295,7 +300,7 @@ type DataFlow struct {
 	Sink      FlowSink   `json:"sink"`
 	Sanitized bool       `json:"sanitized"`
 	Risk      string     `json:"risk"`
-	Notes     string     `json:"notes,omitempty"`
+	Notes     string     `json:"description,omitempty"`
 }
 
 // FlowSource represents where data enters.
@@ -334,7 +339,7 @@ type NilSource struct {
 	File            string `json:"file"`
 	Line            int    `json:"line"`
 	Expression      string `json:"expression"`
-	Checked         bool   `json:"checked"`
+	Checked         bool   `json:"is_checked"`
 	CheckLine       int    `json:"check_line,omitempty"`
 	CheckExpression string `json:"check_expression,omitempty"`
 	Risk            string `json:"risk,omitempty"`

@@ -17,7 +17,10 @@ func TestCompiler_Compile(t *testing.T) {
 	createSamplePhaseOutputs(t, inputDir)
 
 	// Create compiler and run
-	compiler := NewCompiler(inputDir, outputDir)
+	compiler, err := NewCompiler(inputDir, outputDir)
+	if err != nil {
+		t.Fatalf("NewCompiler() error = %v", err)
+	}
 	if err := compiler.Compile(); err != nil {
 		t.Fatalf("Compile() error = %v", err)
 	}
@@ -103,7 +106,10 @@ func TestCompiler_ReviewerContexts(t *testing.T) {
 			outputDir := t.TempDir()
 			createSamplePhaseOutputs(t, inputDir)
 
-			compiler := NewCompiler(inputDir, outputDir)
+			compiler, err := NewCompiler(inputDir, outputDir)
+			if err != nil {
+				t.Fatalf("NewCompiler() error = %v", err)
+			}
 			if err := compiler.Compile(); err != nil {
 				t.Fatalf("Compile() error = %v", err)
 			}
@@ -131,7 +137,10 @@ func TestCompiler_MissingInputs(t *testing.T) {
 	inputDir := t.TempDir()
 	outputDir := t.TempDir()
 
-	compiler := NewCompiler(inputDir, outputDir)
+	compiler, err := NewCompiler(inputDir, outputDir)
+	if err != nil {
+		t.Fatalf("NewCompiler() error = %v", err)
+	}
 
 	// Should not fail, just produce minimal output
 	if err := compiler.Compile(); err != nil {
@@ -169,7 +178,10 @@ func TestCompiler_PartialInputs(t *testing.T) {
 		t.Fatalf("Failed to write scope.json: %v", err)
 	}
 
-	compiler := NewCompiler(inputDir, outputDir)
+	compiler, err := NewCompiler(inputDir, outputDir)
+	if err != nil {
+		t.Fatalf("NewCompiler() error = %v", err)
+	}
 	if err := compiler.Compile(); err != nil {
 		t.Fatalf("Compile() error with partial inputs: %v", err)
 	}
@@ -187,7 +199,10 @@ func TestCompiler_SameInputOutputDir(t *testing.T) {
 	dir := t.TempDir()
 	createSamplePhaseOutputs(t, dir)
 
-	compiler := NewCompiler(dir, dir)
+	compiler, err := NewCompiler(dir, dir)
+	if err != nil {
+		t.Fatalf("NewCompiler() error = %v", err)
+	}
 	if err := compiler.Compile(); err != nil {
 		t.Fatalf("Compile() error with same input/output dir: %v", err)
 	}
@@ -206,7 +221,10 @@ func TestCompiler_FocusAreasGenerated(t *testing.T) {
 	outputDir := t.TempDir()
 	createSamplePhaseOutputs(t, inputDir)
 
-	compiler := NewCompiler(inputDir, outputDir)
+	compiler, err := NewCompiler(inputDir, outputDir)
+	if err != nil {
+		t.Fatalf("NewCompiler() error = %v", err)
+	}
 	if err := compiler.Compile(); err != nil {
 		t.Fatalf("Compile() error = %v", err)
 	}
@@ -233,7 +251,10 @@ func TestCompiler_HighRiskNilSources(t *testing.T) {
 	outputDir := t.TempDir()
 	createSamplePhaseOutputs(t, inputDir)
 
-	compiler := NewCompiler(inputDir, outputDir)
+	compiler, err := NewCompiler(inputDir, outputDir)
+	if err != nil {
+		t.Fatalf("NewCompiler() error = %v", err)
+	}
 	if err := compiler.Compile(); err != nil {
 		t.Fatalf("Compile() error = %v", err)
 	}
@@ -279,7 +300,10 @@ func TestCompiler_UncoveredFunctions(t *testing.T) {
 	}
 	writeJSON(t, inputDir, "go-calls.json", calls)
 
-	compiler := NewCompiler(inputDir, outputDir)
+	compiler, err := NewCompiler(inputDir, outputDir)
+	if err != nil {
+		t.Fatalf("NewCompiler() error = %v", err)
+	}
 	if err := compiler.Compile(); err != nil {
 		t.Fatalf("Compile() error = %v", err)
 	}
@@ -304,29 +328,16 @@ func TestCompiler_InvalidJSONHandling(t *testing.T) {
 		t.Fatalf("Failed to write invalid scope.json: %v", err)
 	}
 
-	compiler := NewCompiler(inputDir, outputDir)
-	// Should not fail, but should continue with other files
-	if err := compiler.Compile(); err != nil {
-		t.Fatalf("Compile() should handle invalid JSON gracefully: %v", err)
-	}
-
-	// Context files should still be created
-	contextPath := filepath.Join(outputDir, "context-code-reviewer.md")
-	if _, err := os.Stat(contextPath); os.IsNotExist(err) {
-		t.Error("Context file should be created even with invalid JSON")
-	}
-
-	// Verify context file indicates parse error was handled
-	// The compiler should produce output even when parsing fails
-	content, err := os.ReadFile(contextPath)
+	compiler, err := NewCompiler(inputDir, outputDir)
 	if err != nil {
-		t.Fatalf("Failed to read context file: %v", err)
+		t.Fatalf("NewCompiler() error = %v", err)
 	}
-
-	// Context file should still have structure (with "no data" messages for missing data)
-	contentStr := string(content)
-	if !strings.Contains(contentStr, "# Pre-Analysis Context") {
-		t.Error("Context file should contain header even with invalid JSON input")
+	err = compiler.Compile()
+	if err == nil {
+		t.Fatal("Compile() expected error for invalid JSON, got nil")
+	}
+	if !strings.Contains(err.Error(), "scope.json") {
+		t.Fatalf("expected compile error to mention scope.json parse failure, got: %v", err)
 	}
 }
 
@@ -472,7 +483,10 @@ func TestCompiler_TestReviewerNewErrorPaths(t *testing.T) {
 		t.Fatalf("failed to write go-ast.json: %v", err)
 	}
 
-	compiler := NewCompiler(inputDir, outputDir)
+	compiler, err := NewCompiler(inputDir, outputDir)
+	if err != nil {
+		t.Fatalf("NewCompiler() error = %v", err)
+	}
 	if err := compiler.Compile(); err != nil {
 		t.Fatalf("Compile() error: %v", err)
 	}

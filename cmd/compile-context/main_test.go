@@ -4,39 +4,61 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 )
 
 // testBinaryName is the name of the test binary.
 const testBinaryName = "compile-context-test"
 
+var (
+	buildOnce     sync.Once
+	buildErr      error
+	binaryAbsPath string
+)
+
+func TestMain(m *testing.M) {
+	code := m.Run()
+	if binaryAbsPath != "" {
+		if err := os.Remove(binaryAbsPath); err != nil && !os.IsNotExist(err) {
+			fmt.Fprintf(os.Stderr, "Warning: failed to remove test binary %s: %v\n", binaryAbsPath, err)
+		}
+	}
+	os.Exit(code)
+}
+
 // buildTestBinary builds the compile-context binary for testing.
 // Returns the path to the built binary.
 func buildTestBinary(t *testing.T) string {
 	t.Helper()
 
-	// Build in the current directory (where main.go is)
-	binaryPath := filepath.Join(".", testBinaryName)
+	buildOnce.Do(func() {
+		binaryPath := filepath.Join(".", testBinaryName)
+		buildCmd := exec.Command("go", "build", "-o", binaryPath, ".")
+		buildCmd.Dir = "."
 
-	buildCmd := exec.Command("go", "build", "-o", binaryPath, ".")
-	buildCmd.Dir = "." // Ensure we're in the right directory
+		output, err := buildCmd.CombinedOutput()
+		if err != nil {
+			buildErr = fmt.Errorf("failed to build binary: %w\nOutput: %s", err, string(output))
+			return
+		}
 
-	output, err := buildCmd.CombinedOutput()
-	if err != nil {
-		t.Fatalf("Failed to build binary: %v\nOutput: %s", err, string(output))
+		binaryAbsPath, err = filepath.Abs(binaryPath)
+		if err != nil {
+			buildErr = err
+		}
+	})
+
+	if buildErr != nil {
+		t.Fatalf("%v", buildErr)
 	}
 
-	// Return absolute path for reliable execution
-	absPath, err := filepath.Abs(binaryPath)
-	if err != nil {
-		t.Fatalf("Failed to get absolute path: %v", err)
-	}
-
-	return absPath
+	return binaryAbsPath
 }
 
 // cleanupTestBinary removes the test binary.
@@ -44,20 +66,8 @@ func buildTestBinary(t *testing.T) string {
 // transient (e.g., file locked on Windows) and do not affect test correctness.
 func cleanupTestBinary(t *testing.T, binaryPath string) {
 	t.Helper()
-
-	err := os.Remove(binaryPath)
-	switch {
-	case err == nil:
-		// Successfully removed
-	case os.IsNotExist(err):
-		// Already removed or never created - not an issue
-	case os.IsPermission(err):
-		// Permission denied - log for debugging but don't fail
-		// This can happen on some platforms when the binary is still in use
-		t.Logf("Warning: permission denied removing test binary %s (may still be in use): %v", binaryPath, err)
-	default:
-		// Other errors - log with details for debugging
-		t.Logf("Warning: failed to remove test binary %s: %v", binaryPath, err)
+	if binaryPath == "" {
+		t.Error("expected test binary path to be set")
 	}
 }
 
@@ -100,7 +110,7 @@ func createMockPhaseOutputs(t *testing.T, dir string) {
 	// Create go-calls.json
 	callsData := map[string]interface{}{
 		"modified_functions": []map[string]interface{}{},
-		"impact_summary":     map[string]interface{}{},
+		"impact_analysis":    map[string]interface{}{},
 	}
 	writeMockJSON(t, filepath.Join(dir, "go-calls.json"), callsData)
 
@@ -381,9 +391,11 @@ func TestRun_PermissionDenied(t *testing.T) {
 		t.Fatalf("Failed to create read-only directory: %v", err)
 	}
 	// Ensure cleanup can still work
-	defer func() {
-		_ = os.Chmod(readOnlyDir, 0o755)
-	}()
+	t.Cleanup(func() {
+		if err := os.Chmod(readOnlyDir, 0o755); err != nil {
+			t.Fatalf("failed to restore permissions for %s: %v", readOnlyDir, err)
+		}
+	})
 
 	// Try to write to a subdirectory of the read-only directory
 	targetOutput := filepath.Join(readOnlyDir, "subdir")
@@ -447,7 +459,7 @@ func TestRun_VerboseOutput(t *testing.T) {
 	}
 }
 
-// TestRun_MalformedJSON verifies handling of malformed phase output files.
+// TestRun_MalformedJSON verifies malformed phase outputs fail fast.
 func TestRun_MalformedJSON(t *testing.T) {
 	binaryPath := buildTestBinary(t)
 	defer cleanupTestBinary(t, binaryPath)
@@ -461,21 +473,19 @@ func TestRun_MalformedJSON(t *testing.T) {
 		t.Fatalf("Failed to write malformed JSON: %v", err)
 	}
 
-	// Should still succeed (graceful degradation)
+	// Should fail fast when required phase output is malformed
 	cmd := exec.Command(binaryPath, "--input="+tempDir)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 
-	if err := cmd.Run(); err != nil {
-		t.Fatalf("Expected success with graceful degradation, got error: %v\nStderr: %s",
-			err, stderr.String())
+	err := cmd.Run()
+	if err == nil {
+		t.Fatalf("Expected non-zero exit for malformed phase output, got success\nStderr: %s", stderr.String())
 	}
 
-	// Context files should still be created
-	expectedFile := filepath.Join(tempDir, "context-code-reviewer.md")
-	if _, err := os.Stat(expectedFile); os.IsNotExist(err) {
-		t.Errorf("Context file not created despite malformed input: %s", expectedFile)
+	if !strings.Contains(stderr.String(), "compilation failed") {
+		t.Errorf("Expected compilation failure message, got stderr: %s", stderr.String())
 	}
 }
 
@@ -586,9 +596,17 @@ func TestRun_DefaultInputDir(t *testing.T) {
 	cmd := exec.Command(binaryPath)
 	cmd.Dir = workDir
 	output, err := cmd.CombinedOutput()
-	// This should succeed if default directory exists and has content
 	if err != nil {
-		t.Logf("Note: Default directory test - command returned: %v\nOutput: %s", err, string(output))
+		t.Fatalf("expected default input dir run to succeed: %v\nOutput: %s", err, string(output))
+	}
+
+	contextPath := filepath.Join(defaultInputDir, "context-code-reviewer.md")
+	content, readErr := os.ReadFile(contextPath)
+	if readErr != nil {
+		t.Fatalf("expected context output file %s, got error: %v", contextPath, readErr)
+	}
+	if !strings.Contains(string(content), "# Pre-Analysis Context") {
+		t.Fatalf("expected generated context markdown header in %s", contextPath)
 	}
 }
 

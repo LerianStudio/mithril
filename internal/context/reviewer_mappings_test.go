@@ -20,6 +20,39 @@ func TestReviewerNames(t *testing.T) {
 	}
 }
 
+func TestReviewerRegistriesAreSynchronized(t *testing.T) {
+	reviewerSet := make(map[string]struct{})
+	for _, name := range GetReviewerNames() {
+		reviewerSet[name] = struct{}{}
+
+		if _, ok := reviewerDataSources[name]; !ok {
+			t.Fatalf("missing reviewerDataSources entry for %q", name)
+		}
+		if !hasReviewerDataBuilder(name) {
+			t.Fatalf("missing reviewerDataBuilders entry for %q", name)
+		}
+		if _, err := GetTemplateForReviewer(name); err != nil {
+			t.Fatalf("missing template for %q: %v", name, err)
+		}
+	}
+
+	for name := range reviewerDataSources {
+		if _, ok := reviewerSet[name]; !ok {
+			t.Fatalf("reviewerDataSources contains unknown reviewer %q", name)
+		}
+	}
+	for name := range reviewerDataBuilders {
+		if _, ok := reviewerSet[name]; !ok {
+			t.Fatalf("reviewerDataBuilders contains unknown reviewer %q", name)
+		}
+	}
+	for name := range reviewerTemplates {
+		if _, ok := reviewerSet[name]; !ok {
+			t.Fatalf("reviewerTemplates contains unknown reviewer %q", name)
+		}
+	}
+}
+
 func TestGetReviewerDataSources(t *testing.T) {
 	tests := []struct {
 		reviewer string
@@ -126,12 +159,13 @@ func TestFilterFindingsForCodeReviewer(t *testing.T) {
 		{Category: "style", Severity: "info", Message: "line too long"},
 		{Category: "bug", Severity: "warning", Message: "unused var"},
 		{Category: "performance", Severity: "warning", Message: "slow loop"},
+		{Category: "custom-new", Severity: "warning", Message: "new tool category"},
 	}
 
 	codeFindings := FilterFindingsForCodeReviewer(findings)
-	// Should include style, bug, performance but not security
-	if len(codeFindings) != 3 {
-		t.Errorf("FilterFindingsForCodeReviewer() returned %d, want 3", len(codeFindings))
+	// Should include style, bug, performance and unknown categories, but not security
+	if len(codeFindings) != 4 {
+		t.Errorf("FilterFindingsForCodeReviewer() returned %d, want 4", len(codeFindings))
 	}
 }
 
@@ -146,6 +180,14 @@ func TestFilterFindingsForSecurityReviewer(t *testing.T) {
 	securityFindings := FilterFindingsForSecurityReviewer(findings)
 	if len(securityFindings) != 2 {
 		t.Errorf("FilterFindingsForSecurityReviewer() returned %d, want 2", len(securityFindings))
+	}
+}
+
+func TestFilterFindingsByCategory_NormalizesCategory(t *testing.T) {
+	findings := []Finding{{Category: "Security", Message: "issue"}}
+	filtered := FilterFindingsByCategory(findings, "security")
+	if len(filtered) != 1 {
+		t.Fatalf("expected normalized category match, got %d", len(filtered))
 	}
 }
 
