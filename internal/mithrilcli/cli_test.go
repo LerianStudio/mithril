@@ -150,7 +150,8 @@ func initTempGitRepo(t *testing.T) string {
 			t.Fatalf("git %s failed: %v\n%s", strings.Join(args, " "), err, string(output))
 		}
 	}
-	runGit("init", "-q", "-b", "main")
+	// Compatible with all Git versions; branch name is not required here.
+	runGit("init", "-q")
 	runGit("config", "user.email", "test@example.com")
 	runGit("config", "user.name", "Test User")
 	runGit("config", "commit.gpgsign", "false")
@@ -205,7 +206,7 @@ func TestRun_ScopeDetectorEndToEnd_RealRunner(t *testing.T) {
 	if err := json.Unmarshal(data, &parsed); err != nil {
 		t.Fatalf("scope.json did not parse: %v\nraw: %s", err, string(data))
 	}
-	// Real runner must have detected our seeded untracked .go file and
+	// Real runner must have detected our seeded staged .go file and
 	// resolved language to "go" (or at least a non-empty value).
 	if parsed.Language == "" {
 		t.Errorf("expected non-empty language in scope.json, got empty\nscope.json: %s", string(data))

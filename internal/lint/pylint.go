@@ -95,7 +95,7 @@ func (p *Pylint) Run(ctx context.Context, projectDir string, files []string) (*R
 	execResult := p.executor.Run(ctx, projectDir, "pylint", args...)
 	if execResult.Err != nil {
 		appendExecError(result, "pylint", execResult.Err)
-		return result, nil
+		return result, fmt.Errorf("pylint execution failed: %w", execResult.Err)
 	}
 
 	// Parse JSON output

@@ -3,6 +3,7 @@ package callgraph
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os/exec"
@@ -70,7 +71,8 @@ func runHelperCommand(ctx context.Context, workDir, command string, args []strin
 	}
 
 	waitErr := cmd.Wait()
-	if exitErr, ok := waitErr.(*exec.ExitError); ok {
+	var exitErr *exec.ExitError
+	if errors.As(waitErr, &exitErr) {
 		exitErr.Stderr = stderr.Bytes()
 	}
 	if waitErr != nil {

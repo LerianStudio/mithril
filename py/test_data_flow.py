@@ -4,6 +4,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(__file__))
 
@@ -297,13 +298,13 @@ class SandboxAndManifestTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as base:
             with tempfile.TemporaryDirectory() as outside:
                 outside_file = os.path.join(outside, "x.py")
-                open(outside_file, "w").close()
+                Path(outside_file).touch()
                 self.assertIsNone(sandbox_path(outside_file, base))
 
     def test_sandbox_path_allows_inside(self):
         with tempfile.TemporaryDirectory() as base:
             inside = os.path.join(base, "x.py")
-            open(inside, "w").close()
+            Path(inside).touch()
             self.assertIsNotNone(sandbox_path(inside, base))
 
     def test_manifest_too_large_is_rejected(self):
@@ -329,6 +330,7 @@ class SandboxAndManifestTests(unittest.TestCase):
                 ],
                 capture_output=True,
                 text=True,
+                check=False,
             )
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("manifest exceeds maximum size", result.stderr)
@@ -362,6 +364,7 @@ class SandboxAndManifestTests(unittest.TestCase):
                     ],
                     capture_output=True,
                     text=True,
+                    check=False,
                 )
                 # Should succeed (inside.py still analyzable) but warn about outside
                 self.assertIn("dropping manifest entry outside base dir", result.stderr)

@@ -198,7 +198,8 @@ function parseFile(filePath: string): ParsedFile {
 
   const content = fs.readFileSync(filePath, "utf-8")
   // Pick the right ScriptKind so JSX syntax in .tsx/.jsx parses correctly
-  // and ambient declarations in .d.ts are understood (see H17). Other
+  // and ambient declarations in .d.ts are understood (see H17). .mts/.cts
+  // (ESM/CJS TypeScript) are handled explicitly as plain TS. Other
   // extensions default to plain TS.
   const lower = filePath.toLowerCase()
   let scriptKind: ts.ScriptKind = ts.ScriptKind.TS
@@ -208,6 +209,8 @@ function parseFile(filePath: string): ParsedFile {
     scriptKind = ts.ScriptKind.JSX
   } else if (lower.endsWith(".js")) {
     scriptKind = ts.ScriptKind.JS
+  } else if (lower.endsWith(".mts") || lower.endsWith(".cts")) {
+    scriptKind = ts.ScriptKind.TS
   }
   const sourceFile = ts.createSourceFile(
     filePath,
@@ -457,6 +460,7 @@ function parseFile(filePath: string): ParsedFile {
     // functions / types / enums are picked up (H17).
     if (ts.isModuleDeclaration(node) && node.body) {
       ts.forEachChild(node.body, visit)
+      return // body already recursed; skip the forEachChild below
     }
 
     ts.forEachChild(node, visit)

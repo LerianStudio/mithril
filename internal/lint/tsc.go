@@ -3,6 +3,7 @@ package lint
 import (
 	"bufio"
 	"context"
+	"fmt"
 	"regexp"
 	"strconv"
 	"strings"
@@ -98,7 +99,7 @@ func (t *TSC) Run(ctx context.Context, projectDir string, files []string) (*Resu
 		execResult = t.executor.Run(ctx, projectDir, "tsc", args[2:]...)
 		if execResult.Err != nil {
 			appendExecError(result, "tsc", execResult.Err)
-			return result, nil
+			return result, fmt.Errorf("tsc execution failed: %w", execResult.Err)
 		}
 	}
 

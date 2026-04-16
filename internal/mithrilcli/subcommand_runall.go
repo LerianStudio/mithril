@@ -2,6 +2,7 @@ package mithrilcli
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -13,6 +14,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/lerianstudio/mithril/internal/callgraph"
 	"github.com/lerianstudio/mithril/internal/fileutil"
@@ -142,19 +144,20 @@ var defaultBaseBranchDetector = detectDefaultBaseBranch
 // error describing the failure when none are detected so the user can set
 // --base explicitly.
 func detectDefaultBaseBranch() (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
 	// 1. origin/HEAD symbolic ref points at the remote default branch.
-	if out, err := exec.Command("git", "symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD").Output(); err == nil {
+	if out, err := exec.CommandContext(ctx, "git", "symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD").Output(); err == nil {
 		ref := strings.TrimSpace(string(out))
-		if strings.HasPrefix(ref, "origin/") {
-			ref = strings.TrimPrefix(ref, "origin/")
-		}
+		ref = strings.TrimPrefix(ref, "origin/")
 		if ref != "" {
 			return ref, nil
 		}
 	}
 	// 2. Scan well-known local branch names.
 	for _, candidate := range []string{"main", "master", "trunk", "develop"} {
-		if err := exec.Command("git", "show-ref", "--verify", "--quiet", "refs/heads/"+candidate).Run(); err == nil {
+		if err := exec.CommandContext(ctx, "git", "show-ref", "--verify", "--quiet", "refs/heads/"+candidate).Run(); err == nil {
 			return candidate, nil
 		}
 	}

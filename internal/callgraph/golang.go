@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"go/types"
+	"os"
 	"path/filepath"
 	"strings"
 	"time"
@@ -444,8 +445,16 @@ func lookupSSAFunction(index map[string]*ssa.Function, prog *ssa.Program, modFun
 	}
 
 	targetFile := filepath.Clean(modFunc.File)
-	if !filepath.IsAbs(targetFile) && workDir != "" {
-		targetFile = filepath.Clean(filepath.Join(workDir, modFunc.File))
+	if !filepath.IsAbs(targetFile) {
+		base := workDir
+		if base == "" {
+			if cwd, err := os.Getwd(); err == nil {
+				base = cwd
+			}
+		}
+		if base != "" {
+			targetFile = filepath.Clean(filepath.Join(base, modFunc.File))
+		}
 	}
 
 	if fn, ok := index[targetFile+"|"+expectedName]; ok {

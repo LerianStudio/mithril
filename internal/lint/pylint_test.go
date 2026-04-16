@@ -86,7 +86,8 @@ func TestPylintRun_ExecutionFailure(t *testing.T) {
 	linter.executor = executor
 
 	result, err := linter.Run(context.Background(), "/tmp", []string{"main.py"})
-	require.NoError(t, err)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "pylint execution failed")
 	require.NotNil(t, result)
 	assert.NotEmpty(t, result.Errors)
 }

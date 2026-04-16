@@ -182,7 +182,10 @@ func TestWriteJSONFile_AtomicCleansTmpOnMarshalError(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected marshal error")
 	}
-	entries, _ := os.ReadDir(dir)
+	entries, readErr := os.ReadDir(dir)
+	if readErr != nil {
+		t.Fatalf("failed to list temp dir: %v", readErr)
+	}
 	for _, entry := range entries {
 		if strings.HasPrefix(entry.Name(), ".writejson-") {
 			t.Errorf("leftover tmp file %q after marshal error", entry.Name())

@@ -29,7 +29,7 @@ type filesJSON struct {
 	Modified []string            `json:"modified"`
 	Added    []string            `json:"added"`
 	Deleted  []string            `json:"deleted"`
-	Renamed  []scope.RenamedFile `json:"renamed,omitempty"`
+	Renamed  []scope.RenamedFile `json:"renamed"`
 }
 
 // statsJSON contains aggregate statistics for the diff.

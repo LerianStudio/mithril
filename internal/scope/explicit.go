@@ -83,8 +83,7 @@ func fileExistsInWorkdir(workDir, file string) (bool, error) {
 	}
 	joined := filepath.Join(workDir, file)
 
-	info, err := os.Lstat(joined)
-	if err != nil {
+	if _, err := os.Lstat(joined); err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return false, nil
 		}
@@ -101,9 +100,6 @@ func fileExistsInWorkdir(workDir, file string) (bool, error) {
 		baseReal = baseAbs
 	}
 
-	// If the entry itself is a symlink, resolve it fully. For regular files,
-	// EvalSymlinks on the path is still correct (returns the path unchanged).
-	_ = info
 	resolved, err := filepath.EvalSymlinks(joined)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {

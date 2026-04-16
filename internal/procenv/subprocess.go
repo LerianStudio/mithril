@@ -3,6 +3,7 @@ package procenv
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os/exec"
@@ -77,7 +78,8 @@ func RunHelper(ctx context.Context, workDir, command string, args []string, maxO
 	}
 
 	waitErr := cmd.Wait()
-	if exitErr, ok := waitErr.(*exec.ExitError); ok {
+	var exitErr *exec.ExitError
+	if errors.As(waitErr, &exitErr) {
 		exitErr.Stderr = stderr.Bytes()
 	}
 	if waitErr != nil {

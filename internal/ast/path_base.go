@@ -36,8 +36,9 @@ func deriveBaseDir(paths ...string) string {
 		}
 	}
 
-	// If the multi-path LCA climb reached root, the inputs are genuinely
-	// disjoint and "/" is not a meaningful sandbox. Fall back to cwd so
+	// If the multi-path LCA climb reached filesystem root, the inputs are
+	// genuinely disjoint and a root-wide base is not a meaningful sandbox.
+	// Fall back to cwd so
 	// downstream validators still enforce some containment.
 	if climbedToRoot && isFilesystemRoot(baseDir) {
 		if cwd, err := os.Getwd(); err == nil {

@@ -1177,15 +1177,15 @@ func TestBatchPathsByBytes(t *testing.T) {
 
 func TestClientGetDiffStatsForFilesBatches(t *testing.T) {
 	repo := setupTestRepo(t)
-	// Write enough files with long-ish names to force multiple batches
-	// when maxDiffStatsArgBytes is set low. We can't mutate the constant,
-	// but we can build a file list whose combined length exceeds it.
-	const numFiles = 20
-	files := make([]string, numFiles)
-	for i := 0; i < numFiles; i++ {
+	// Build enough path bytes to exceed maxDiffStatsArgBytes and force at
+	// least two git diff --numstat invocations.
+	files := make([]string, 0)
+	totalBytes := 0
+	for i := 0; totalBytes <= maxDiffStatsArgBytes+1024; i++ {
 		name := fmt.Sprintf("batch_%04d_%s.txt", i, strings.Repeat("y", 120))
 		writeFile(t, repo, name, "v1\n")
-		files[i] = name
+		files = append(files, name)
+		totalBytes += len(name) + 1
 	}
 	runGit(t, repo, "add", ".")
 	runGit(t, repo, "commit", "-m", "seed")
@@ -1198,11 +1198,11 @@ func TestClientGetDiffStatsForFilesBatches(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetDiffStatsForFiles error = %v", err)
 	}
-	if stats.TotalFiles != numFiles {
-		t.Fatalf("TotalFiles = %d, want %d", stats.TotalFiles, numFiles)
+	if stats.TotalFiles != len(files) {
+		t.Fatalf("TotalFiles = %d, want %d", stats.TotalFiles, len(files))
 	}
-	if len(perFile) != numFiles {
-		t.Fatalf("perFile len = %d, want %d", len(perFile), numFiles)
+	if len(perFile) != len(files) {
+		t.Fatalf("perFile len = %d, want %d", len(perFile), len(files))
 	}
 	for _, f := range files {
 		if _, ok := perFile[f]; !ok {

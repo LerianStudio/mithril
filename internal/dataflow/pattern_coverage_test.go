@@ -127,6 +127,7 @@ func TestInitSourcePatterns_ClassificationMatchesTaxonomy(t *testing.T) {
 		// External API
 		{"resp, _ := http.Get(url)", SourceExternal},
 		{"resp, _ := client.Do(req)", SourceExternal},
+		{"data := resp.Body.Bytes()", SourceExternal},
 
 		// User / stdin input
 		{"scanner := bufio.NewScanner(os.Stdin)", SourceUserInput},
@@ -137,9 +138,20 @@ func TestInitSourcePatterns_ClassificationMatchesTaxonomy(t *testing.T) {
 	// Every case must produce the expected taxonomy entry among its matches.
 	// A single sample may legitimately match multiple patterns (e.g. a line
 	// that contains both `json.NewDecoder` and `req.Body`), but the expected
-	// type must always be one of them.
+	// type must always be one of them. Track which individual patterns are
+	// exercised so dead regexes cannot hide behind another pattern of the
+	// same SourceType.
+	usedPatterns := make([]bool, len(patterns))
 	for _, tc := range cases {
-		matches := matchingSourceTypes(patterns, tc.Sample)
+		var matches []SourceType
+		for i, p := range patterns {
+			if p.Pattern.MatchString(tc.Sample) {
+				matches = append(matches, p.Type)
+				if p.Type == tc.ExpectedType {
+					usedPatterns[i] = true
+				}
+			}
+		}
 		require.NotEmptyf(t, matches, "no source pattern matched sample %q (expected %s)", tc.Sample, tc.ExpectedType)
 		require.Truef(t, containsSourceType(matches, tc.ExpectedType),
 			"sample %q matched types %v, expected %s to be present", tc.Sample, matches, tc.ExpectedType)
@@ -147,14 +159,10 @@ func TestInitSourcePatterns_ClassificationMatchesTaxonomy(t *testing.T) {
 
 	// Every registered pattern must be reachable by at least one case so new
 	// patterns without corpus coverage fail the test (prevents silent dead
-	// regexes).
-	usedTypes := make(map[SourceType]bool)
-	for _, tc := range cases {
-		usedTypes[tc.ExpectedType] = true
-	}
+	// regexes). This asserts per-pattern reachability, not just per-type.
 	for i, p := range patterns {
-		require.Truef(t, usedTypes[p.Type],
-			"source pattern %d (%s, type %s) has no classification sample; add one to cases",
+		require.Truef(t, usedPatterns[i],
+			"source pattern %d (%s, type %s) has no classification sample that matches it; add one to cases",
 			i, p.Desc, p.Type)
 	}
 }
@@ -178,11 +186,6 @@ func TestJSONUnmarshal_IsClassifiedAsJSONDecode(t *testing.T) {
 		require.NotEmptyf(t, matches, "no source pattern matched %q", sample)
 		require.Truef(t, containsSourceType(matches, SourceJSONDecode),
 			"%q matched %v; expected SourceJSONDecode present (C1 regression)", sample, matches)
-		// A bare json.Unmarshal/NewDecoder line must NOT be misclassified as
-		// http_body-only — that would re-introduce C1.
-		if !containsSourceType(matches, SourceJSONDecode) {
-			t.Fatalf("json decode sample %q did not produce SourceJSONDecode", sample)
-		}
 	}
 }
 

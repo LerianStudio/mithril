@@ -327,9 +327,7 @@ func convertFlowAnalysisToDataFlowData(producer *dataflowpkg.FlowAnalysis) *Data
 			unsanitized++
 		}
 	}
-	if result.Summary.UnsanitizedFlows == 0 {
-		result.Summary.UnsanitizedFlows = unsanitized
-	}
+	result.Summary.UnsanitizedFlows = unsanitized
 	result.Summary.SanitizedFlows = sanitized
 
 	computedHighRisk := 0

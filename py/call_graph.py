@@ -472,14 +472,16 @@ def sandbox_path(path: str, base_dir: str) -> Optional[str]:
     """
     try:
         base_real = os.path.realpath(os.path.abspath(base_dir))
-        cand_real = os.path.realpath(os.path.abspath(path))
+        candidate = path if os.path.isabs(path) else os.path.join(base_real, path)
+        cand_real = os.path.realpath(os.path.abspath(candidate))
     except OSError:
         return None
-    if cand_real == base_real:
-        return cand_real
-    prefix = base_real + os.sep
-    if cand_real.startswith(prefix):
-        return cand_real
+    try:
+        if os.path.commonpath([base_real, cand_real]) == base_real:
+            return cand_real
+    except ValueError:
+        # e.g., different drives on Windows
+        return None
     return None
 
 

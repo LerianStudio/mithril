@@ -23,7 +23,20 @@ var (
 	integrationBinaryOnce sync.Once
 	integrationBinaryPath string
 	integrationBinaryErr  error
+	integrationBinaryDir  string
 )
+
+func cleanupBinary() {
+	if integrationBinaryDir != "" {
+		_ = os.RemoveAll(integrationBinaryDir)
+	}
+}
+
+func TestMain(m *testing.M) {
+	code := m.Run()
+	cleanupBinary()
+	os.Exit(code)
+}
 
 // buildMithrilBinary builds `mithril` once per test binary and returns its
 // absolute path.
@@ -35,6 +48,7 @@ func buildMithrilBinary(t *testing.T) string {
 			integrationBinaryErr = err
 			return
 		}
+		integrationBinaryDir = out
 		bin := filepath.Join(out, "mithril")
 		build := exec.Command("go", "build", "-o", bin, ".")
 		if output, err := build.CombinedOutput(); err != nil {
@@ -117,9 +131,9 @@ func TestIntegration_InvalidFlagCombinations(t *testing.T) {
 	}
 	for _, args := range cases {
 		t.Run(strings.Join(args, " "), func(t *testing.T) {
-			err := exec.Command(bin, args...).Run()
+			output, err := exec.Command(bin, args...).CombinedOutput()
 			if err == nil {
-				t.Fatalf("expected non-zero exit for %v", args)
+				t.Fatalf("expected non-zero exit for %v, got output: %s", args, string(output))
 			}
 		})
 	}

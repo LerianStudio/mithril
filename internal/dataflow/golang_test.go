@@ -271,6 +271,11 @@ func decode(data []byte) {
 	if err := json.Unmarshal(bytes.NewReader(data).Bytes(), &calls); err == nil {
 		_ = calls
 	}
+
+	var decoded Static
+	if err := json.NewDecoder(bytes.NewReader(data)).Decode(&decoded); err == nil {
+		_ = decoded
+	}
 }
 `
 	err := os.WriteFile(testFile, []byte(content), 0o644)
@@ -279,8 +284,25 @@ func decode(data []byte) {
 	analyzer := NewGoAnalyzer(tmpDir)
 	sources, err := analyzer.DetectSources([]string{testFile})
 	require.NoError(t, err)
+	require.Condition(t, func() bool {
+		for _, src := range sources {
+			if src.Type == SourceJSONDecode {
+				return true
+			}
+		}
+		return false
+	}, "expected at least one SourceJSONDecode source")
+
 	sinks, err := analyzer.DetectSinks([]string{testFile})
 	require.NoError(t, err)
+	require.Condition(t, func() bool {
+		for _, sink := range sinks {
+			if sink.Function == "json.Unmarshal" || sink.Function == "json.NewDecoder" {
+				return true
+			}
+		}
+		return false
+	}, "expected JSON decode sink candidates")
 
 	flows, err := analyzer.TrackFlows(sources, sinks, []string{testFile})
 	require.NoError(t, err)

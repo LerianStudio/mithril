@@ -49,7 +49,8 @@ func RenderImpactSummary(result *callgraph.CallGraphResult) string {
 	// Render each category
 	if len(high) > 0 {
 		sb.WriteString("## High Impact Functions\n\n")
-		sb.WriteString("Functions with 3 or more callers - changes here have wide-reaching effects.\n\n")
+		fmt.Fprintf(&sb, "Functions with %d or more callers - changes here have wide-reaching effects.\n\n",
+			callgraph.HighImpactCallerThreshold)
 		for _, fcg := range high {
 			sb.WriteString(renderFunctionImpact(fcg, result.Language, string(ImpactHigh)))
 		}
@@ -57,7 +58,8 @@ func RenderImpactSummary(result *callgraph.CallGraphResult) string {
 
 	if len(medium) > 0 {
 		sb.WriteString("## Medium Impact Functions\n\n")
-		sb.WriteString("Functions with 1-2 callers - changes affect a limited scope.\n\n")
+		fmt.Fprintf(&sb, "Functions with 1-%d callers - changes affect a limited scope.\n\n",
+			callgraph.HighImpactCallerThreshold-1)
 		for _, fcg := range medium {
 			sb.WriteString(renderFunctionImpact(fcg, result.Language, string(ImpactMedium)))
 		}

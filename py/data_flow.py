@@ -60,7 +60,8 @@ def sandbox_path(path: str, base_dir: str) -> Optional[str]:
     """
     try:
         base_real = os.path.realpath(os.path.abspath(base_dir))
-        cand_real = os.path.realpath(os.path.abspath(path))
+        candidate = path if os.path.isabs(path) else os.path.join(base_real, path)
+        cand_real = os.path.realpath(os.path.abspath(candidate))
     except OSError:
         return None
     if cand_real == base_real:
@@ -1020,6 +1021,14 @@ def main() -> None:
     files: list[str] = []
     if len(file_args) >= 2 and file_args[0] == "--files-from":
         manifest_path = file_args[1]
+        safe_manifest = sandbox_path(manifest_path, base_dir)
+        if safe_manifest is None:
+            print(
+                f"Error: manifest path escapes base directory (base={base_dir}): {manifest_path}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        manifest_path = safe_manifest
         try:
             manifest_size = os.path.getsize(manifest_path)
         except OSError as e:

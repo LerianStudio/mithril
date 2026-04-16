@@ -530,13 +530,13 @@ func Use() string {
 	fcg := result.ModifiedFunctions[0]
 	sawVirtualCaller := false
 	for _, c := range fcg.Callers {
-		if c.IsVirtual {
+		if c.Function == "DoGreet" && c.IsVirtual {
 			sawVirtualCaller = true
 			break
 		}
 	}
 	if !sawVirtualCaller {
-		t.Fatalf("expected at least one virtual caller on Hello.Greet, got callers=%v", fcg.Callers)
+		t.Fatalf("expected DoGreet to be a virtual caller of Hello.Greet, got callers=%v", fcg.Callers)
 	}
 
 	// And a summary warning should have been emitted.

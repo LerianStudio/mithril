@@ -139,9 +139,11 @@ func (g GoExtractor) parseFile(path string) (*ParsedFile, error) {
 	}
 
 	// Extract top-level functions, types, and globals.
-	// init() functions are keyed by their source line so inserting a new
-	// init above existing ones does not cascade-rename the remaining keys
-	// and manufacture bogus diffs.
+	// init() functions are keyed by their body hash so unchanged init blocks
+	// match across line shifts. When multiple init blocks share the same
+	// body (e.g. two empty init()s), a per-hash occurrence counter is
+	// appended so their keys remain unique within the file.
+	initHashCounts := map[string]int{}
 	for _, decl := range file.Decls {
 		switch node := decl.(type) {
 		case *ast.FuncDecl:
@@ -153,7 +155,20 @@ func (g GoExtractor) parseFile(path string) (*ParsedFile, error) {
 			if fn.Receiver != "" {
 				key = fn.Receiver + "." + fn.Name
 			} else if fn.Name == "init" {
-				key = fmt.Sprintf("init@L%d", fn.StartLine)
+				// Key init() by body hash so unchanged init blocks match
+				// across line shifts. Fall back to line-based keying when
+				// the body is unavailable (e.g., parser recovery).
+				if fn.BodyHash != "" {
+					base := "init#" + fn.BodyHash
+					initHashCounts[base]++
+					if n := initHashCounts[base]; n > 1 {
+						key = fmt.Sprintf("%s#%d", base, n)
+					} else {
+						key = base
+					}
+				} else {
+					key = fmt.Sprintf("init@L%d", fn.StartLine)
+				}
 			}
 			parsed.Functions[key] = fn
 
@@ -338,7 +353,7 @@ func (g GoExtractor) extractType(fset *token.FileSet, ts *ast.TypeSpec) *GoType 
 					// Embedded field: ast.Field.Names == nil signals
 					// embedding regardless of type spelling.
 					goType.Fields = append(goType.Fields, GoField{
-						Name:     typeStr,
+						Name:     embeddedFieldName(field.Type),
 						Type:     typeStr,
 						Tag:      tag,
 						Embedded: true,
@@ -380,6 +395,23 @@ func (g GoExtractor) typeToString(expr ast.Expr) string {
 		return ""
 	}
 	return buf.String()
+}
+
+// embeddedFieldName returns the implicit identifier for an embedded struct
+// field (Foo, *Foo, pkg.Foo all yield "Foo") so cosmetic changes to the
+// type spelling do not register as field removal/addition.
+func embeddedFieldName(expr ast.Expr) string {
+	switch t := expr.(type) {
+	case *ast.Ident:
+		return t.Name
+	case *ast.StarExpr:
+		return embeddedFieldName(t.X)
+	case *ast.SelectorExpr:
+		if t.Sel != nil {
+			return t.Sel.Name
+		}
+	}
+	return ""
 }
 
 func (g GoExtractor) exprListToString(exprs []ast.Expr) string {
