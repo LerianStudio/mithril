@@ -22,3 +22,7 @@ docs/codereview/
 # Python bytecode cache
 py/__pycache__/
 *.pyc
+
+# TypeScript build + node modules
+ts/dist/
+ts/node_modules/
