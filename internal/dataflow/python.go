@@ -2,8 +2,9 @@
 package dataflow
 
 import (
-	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -13,36 +14,45 @@ import (
 	"github.com/lerianstudio/mithril/internal/procenv"
 )
 
-// PythonAnalyzer implements data flow analysis for Python and TypeScript
-// by delegating to the py/data_flow.py script.
-type PythonAnalyzer struct {
+// ScriptAnalyzer implements data flow analysis for Python and TypeScript by
+// delegating to the shared py/data_flow.py helper. The same struct drives
+// both languages; the language field selects which regex pattern set runs
+// inside the helper.
+type ScriptAnalyzer struct {
 	scriptPath string
 	language   string
 }
 
+// PythonAnalyzer is kept as an alias for backward compatibility with
+// callers that imported the original type name. New code should use
+// ScriptAnalyzer.
+type PythonAnalyzer = ScriptAnalyzer
+
 // NewPythonAnalyzer creates a new analyzer for Python files.
-func NewPythonAnalyzer(scriptDir string) *PythonAnalyzer {
-	return &PythonAnalyzer{
+func NewPythonAnalyzer(scriptDir string) *ScriptAnalyzer {
+	return &ScriptAnalyzer{
 		scriptPath: filepath.Join(scriptDir, "py", "data_flow.py"),
 		language:   "python",
 	}
 }
 
-// NewTypeScriptAnalyzer creates a new analyzer for TypeScript/JavaScript files.
-func NewTypeScriptAnalyzer(scriptDir string) *PythonAnalyzer {
-	return &PythonAnalyzer{
+// NewTypeScriptAnalyzer creates a new analyzer for TypeScript/JavaScript
+// files. It returns a *ScriptAnalyzer configured for TypeScript; the same
+// underlying struct drives both languages.
+func NewTypeScriptAnalyzer(scriptDir string) *ScriptAnalyzer {
+	return &ScriptAnalyzer{
 		scriptPath: filepath.Join(scriptDir, "py", "data_flow.py"),
 		language:   "typescript",
 	}
 }
 
 // Language returns the analyzer's target language.
-func (p *PythonAnalyzer) Language() string {
+func (p *ScriptAnalyzer) Language() string {
 	return p.language
 }
 
 // filterFiles filters the given files to only include those matching the analyzer's language.
-func (p *PythonAnalyzer) filterFiles(files []string) []string {
+func (p *ScriptAnalyzer) filterFiles(files []string) []string {
 	var filtered []string
 
 	for _, file := range files {
@@ -63,7 +73,7 @@ func (p *PythonAnalyzer) filterFiles(files []string) []string {
 }
 
 // runScript executes the Python data flow analysis script and parses its output.
-func (p *PythonAnalyzer) runScript(files []string) (*FlowAnalysis, error) {
+func (p *ScriptAnalyzer) runScript(files []string) (*FlowAnalysis, error) {
 	filteredFiles := p.filterFiles(files)
 	if len(filteredFiles) == 0 {
 		return &FlowAnalysis{
@@ -96,23 +106,24 @@ func (p *PythonAnalyzer) runScript(files []string) (*FlowAnalysis, error) {
 	// Build command arguments: python3 script.py <language> --files-from <manifest>
 	args := []string{p.scriptPath, p.language, "--files-from", manifestPath}
 
-	cmd := exec.Command("python3", args...) // #nosec G204,G702 -- no shell invocation; args are validated/internal
-	cmd.Env = procenv.Build()
-
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-
-	if err := cmd.Run(); err != nil {
-		stderrStr := strings.TrimSpace(stderr.String())
-		if stderrStr != "" {
-			return nil, fmt.Errorf("script execution failed: %w: %s", err, stderrStr)
+	output, err := procenv.RunHelper(context.Background(), "", "python3", args, 0)
+	if err != nil {
+		var tooLarge *procenv.OutputTooLargeError
+		if errors.As(err, &tooLarge) {
+			return nil, fmt.Errorf("dataflow script output too large: %w", err)
+		}
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) {
+			stderrStr := strings.TrimSpace(string(exitErr.Stderr))
+			if stderrStr != "" {
+				return nil, fmt.Errorf("script execution failed: %w: %s", err, stderrStr)
+			}
 		}
 		return nil, fmt.Errorf("script execution failed: %w", err)
 	}
 
 	var analysis FlowAnalysis
-	if err := json.Unmarshal(stdout.Bytes(), &analysis); err != nil {
+	if err := json.Unmarshal(output, &analysis); err != nil {
 		return nil, fmt.Errorf("parsing script output: %w", err)
 	}
 
@@ -120,7 +131,7 @@ func (p *PythonAnalyzer) runScript(files []string) (*FlowAnalysis, error) {
 }
 
 // DetectSources scans files for untrusted data sources.
-func (p *PythonAnalyzer) DetectSources(files []string) ([]Source, error) {
+func (p *ScriptAnalyzer) DetectSources(files []string) ([]Source, error) {
 	analysis, err := p.runScript(files)
 	if err != nil {
 		return nil, fmt.Errorf("detecting sources: %w", err)
@@ -129,7 +140,7 @@ func (p *PythonAnalyzer) DetectSources(files []string) ([]Source, error) {
 }
 
 // DetectSinks scans files for sensitive data sinks.
-func (p *PythonAnalyzer) DetectSinks(files []string) ([]Sink, error) {
+func (p *ScriptAnalyzer) DetectSinks(files []string) ([]Sink, error) {
 	analysis, err := p.runScript(files)
 	if err != nil {
 		return nil, fmt.Errorf("detecting sinks: %w", err)
@@ -141,7 +152,7 @@ func (p *PythonAnalyzer) DetectSinks(files []string) ([]Sink, error) {
 // Note: This method re-runs the full analysis since the Python script
 // performs integrated analysis. The sources and sinks parameters are
 // ignored as the script determines them internally.
-func (p *PythonAnalyzer) TrackFlows(sources []Source, sinks []Sink, files []string) ([]Flow, error) {
+func (p *ScriptAnalyzer) TrackFlows(sources []Source, sinks []Sink, files []string) ([]Flow, error) {
 	analysis, err := p.runScript(files)
 	if err != nil {
 		return nil, fmt.Errorf("tracking flows: %w", err)
@@ -150,7 +161,7 @@ func (p *PythonAnalyzer) TrackFlows(sources []Source, sinks []Sink, files []stri
 }
 
 // DetectNilSources identifies variables that may be nil/null/undefined.
-func (p *PythonAnalyzer) DetectNilSources(files []string) ([]NilSource, error) {
+func (p *ScriptAnalyzer) DetectNilSources(files []string) ([]NilSource, error) {
 	analysis, err := p.runScript(files)
 	if err != nil {
 		return nil, fmt.Errorf("detecting nil sources: %w", err)
@@ -159,6 +170,6 @@ func (p *PythonAnalyzer) DetectNilSources(files []string) ([]NilSource, error) {
 }
 
 // Analyze performs complete data flow analysis on the given files.
-func (p *PythonAnalyzer) Analyze(files []string) (*FlowAnalysis, error) {
+func (p *ScriptAnalyzer) Analyze(files []string) (*FlowAnalysis, error) {
 	return p.runScript(files)
 }

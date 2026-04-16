@@ -68,9 +68,10 @@ type GoType struct {
 
 // GoField represents a struct field
 type GoField struct {
-	Name string
-	Type string
-	Tag  string
+	Name     string
+	Type     string
+	Tag      string
+	Embedded bool
 }
 
 // GoVar represents a parsed Go variable or constant.
@@ -126,6 +127,9 @@ func (g GoExtractor) parseFile(path string) (*ParsedFile, error) {
 
 	// Extract imports
 	for _, imp := range file.Imports {
+		if imp == nil || imp.Path == nil {
+			continue
+		}
 		path := strings.Trim(imp.Path.Value, `"`)
 		alias := ""
 		if imp.Name != nil {
@@ -134,18 +138,22 @@ func (g GoExtractor) parseFile(path string) (*ParsedFile, error) {
 		parsed.Imports[path] = alias
 	}
 
-	// Extract top-level functions, types, and globals
-	initIndex := 0
+	// Extract top-level functions, types, and globals.
+	// init() functions are keyed by their source line so inserting a new
+	// init above existing ones does not cascade-rename the remaining keys
+	// and manufacture bogus diffs.
 	for _, decl := range file.Decls {
 		switch node := decl.(type) {
 		case *ast.FuncDecl:
+			if node.Name == nil {
+				continue
+			}
 			fn := g.extractFunc(fset, node)
 			key := fn.Name
 			if fn.Receiver != "" {
 				key = fn.Receiver + "." + fn.Name
 			} else if fn.Name == "init" {
-				key = fmt.Sprintf("init#%d", initIndex)
-				initIndex++
+				key = fmt.Sprintf("init@L%d", fn.StartLine)
 			}
 			parsed.Functions[key] = fn
 
@@ -154,6 +162,9 @@ func (g GoExtractor) parseFile(path string) (*ParsedFile, error) {
 			case token.TYPE:
 				for _, spec := range node.Specs {
 					if ts, ok := spec.(*ast.TypeSpec); ok {
+						if ts.Name == nil {
+							continue
+						}
 						t := g.extractType(fset, ts)
 						parsed.Types[t.Name] = t
 					}
@@ -177,16 +188,28 @@ func (g GoExtractor) parseFile(path string) (*ParsedFile, error) {
 }
 
 func (g GoExtractor) extractFunc(fset *token.FileSet, fn *ast.FuncDecl) *GoFunc {
+	name := ""
 	isExported := false
-	if len(fn.Name.Name) > 0 {
-		isExported = unicode.IsUpper(rune(fn.Name.Name[0]))
+	if fn.Name != nil {
+		name = fn.Name.Name
+		if len(name) > 0 {
+			isExported = unicode.IsUpper(rune(name[0]))
+		}
 	}
 
 	goFn := &GoFunc{
-		Name:       fn.Name.Name,
+		Name:       name,
 		IsExported: isExported,
-		StartLine:  fset.Position(fn.Pos()).Line,
-		EndLine:    fset.Position(fn.End()).Line,
+	}
+	// FuncDecl.Pos/End dereference Type and Body; guard to avoid panics on
+	// partial nodes produced by parser recovery.
+	if fn.Type != nil {
+		goFn.StartLine = fset.Position(fn.Pos()).Line
+		if fn.Body != nil {
+			goFn.EndLine = fset.Position(fn.End()).Line
+		} else {
+			goFn.EndLine = fset.Position(fn.Type.End()).Line
+		}
 	}
 
 	// Extract receiver
@@ -195,7 +218,7 @@ func (g GoExtractor) extractFunc(fset *token.FileSet, fn *ast.FuncDecl) *GoFunc 
 	}
 
 	// Extract parameters
-	if fn.Type.Params != nil {
+	if fn.Type != nil && fn.Type.Params != nil {
 		for _, field := range fn.Type.Params.List {
 			typeStr := g.typeToString(field.Type)
 			if len(field.Names) == 0 {
@@ -212,7 +235,7 @@ func (g GoExtractor) extractFunc(fset *token.FileSet, fn *ast.FuncDecl) *GoFunc 
 	}
 
 	// Extract return types
-	if fn.Type.Results != nil {
+	if fn.Type != nil && fn.Type.Results != nil {
 		for _, field := range fn.Type.Results.List {
 			goFn.Returns = append(goFn.Returns, g.typeToString(field.Type))
 		}
@@ -247,11 +270,17 @@ func (g GoExtractor) extractVars(fset *token.FileSet, spec *ast.ValueSpec, tok t
 	}
 	valueHash := hashValue(valueText)
 
+	if len(spec.Names) == 0 {
+		return nil
+	}
 	startLine := fset.Position(spec.Pos()).Line
 	endLine := fset.Position(spec.End()).Line
 
 	vars := make([]*GoVar, 0, len(spec.Names))
 	for _, name := range spec.Names {
+		if name == nil {
+			continue
+		}
 		varType := valueType
 		if varType == "" && len(spec.Values) > 0 {
 			varType = inferLiteralType(spec.Values[0])
@@ -272,12 +301,27 @@ func (g GoExtractor) extractVars(fset *token.FileSet, spec *ast.ValueSpec, tok t
 }
 
 func (g GoExtractor) extractType(fset *token.FileSet, ts *ast.TypeSpec) *GoType {
-	isExported := len(ts.Name.Name) > 0 && unicode.IsUpper(rune(ts.Name.Name[0]))
+	name := ""
+	isExported := false
+	if ts.Name != nil {
+		name = ts.Name.Name
+		isExported = len(name) > 0 && unicode.IsUpper(rune(name[0]))
+	}
 	goType := &GoType{
-		Name:       ts.Name.Name,
+		Name:       name,
 		IsExported: isExported,
-		StartLine:  fset.Position(ts.Pos()).Line,
-		EndLine:    fset.Position(ts.End()).Line,
+	}
+	// TypeSpec.Pos/End dereference Name and Type; guard against partial nodes.
+	if ts.Name != nil {
+		goType.StartLine = fset.Position(ts.Pos()).Line
+	}
+	if ts.Type != nil {
+		goType.EndLine = fset.Position(ts.End()).Line
+	}
+
+	if ts.Type == nil {
+		goType.Kind = "alias"
+		return goType
 	}
 
 	switch t := ts.Type.(type) {
@@ -291,11 +335,13 @@ func (g GoExtractor) extractType(fset *token.FileSet, ts *ast.TypeSpec) *GoType 
 					tag = field.Tag.Value
 				}
 				if len(field.Names) == 0 {
-					// Embedded field
+					// Embedded field: ast.Field.Names == nil signals
+					// embedding regardless of type spelling.
 					goType.Fields = append(goType.Fields, GoField{
-						Name: typeStr,
-						Type: typeStr,
-						Tag:  tag,
+						Name:     typeStr,
+						Type:     typeStr,
+						Tag:      tag,
+						Embedded: true,
 					})
 				} else {
 					for _, name := range field.Names {
@@ -625,22 +671,31 @@ func (g GoExtractor) compareVariables(before, after map[string]*GoVar) []VarDiff
 func (g GoExtractor) compareFields(before, after []GoField) []FieldDiff {
 	var diffs []FieldDiff
 
+	// Key by (Name, Embedded) so an embedded "Foo" and a named field
+	// "Foo Foo" are not conflated (both have Name == "Foo").
+	fieldKey := func(f GoField) string {
+		if f.Embedded {
+			return "embed:" + f.Name
+		}
+		return "name:" + f.Name
+	}
+
 	beforeMap := make(map[string]GoField)
 	for _, f := range before {
-		beforeMap[f.Name] = f
+		beforeMap[fieldKey(f)] = f
 	}
 
 	afterMap := make(map[string]GoField)
 	for _, f := range after {
-		afterMap[f.Name] = f
+		afterMap[fieldKey(f)] = f
 	}
 
 	// Find removed and modified fields
-	for name, beforeField := range beforeMap {
-		afterField, exists := afterMap[name]
+	for key, beforeField := range beforeMap {
+		afterField, exists := afterMap[key]
 		if !exists {
 			diffs = append(diffs, FieldDiff{
-				Name:       name,
+				Name:       beforeField.Name,
 				ChangeType: ChangeRemoved,
 				OldType:    beforeField.Type,
 			})
@@ -649,7 +704,7 @@ func (g GoExtractor) compareFields(before, after []GoField) []FieldDiff {
 
 		if beforeField.Type != afterField.Type {
 			diffs = append(diffs, FieldDiff{
-				Name:       name,
+				Name:       afterField.Name,
 				ChangeType: ChangeModified,
 				OldType:    beforeField.Type,
 				NewType:    afterField.Type,
@@ -658,10 +713,10 @@ func (g GoExtractor) compareFields(before, after []GoField) []FieldDiff {
 	}
 
 	// Find added fields
-	for name, afterField := range afterMap {
-		if _, exists := beforeMap[name]; !exists {
+	for key, afterField := range afterMap {
+		if _, exists := beforeMap[key]; !exists {
 			diffs = append(diffs, FieldDiff{
-				Name:       name,
+				Name:       afterField.Name,
 				ChangeType: ChangeAdded,
 				NewType:    afterField.Type,
 			})

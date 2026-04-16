@@ -2,6 +2,7 @@
 package scope
 
 import (
+	"errors"
 	"fmt"
 	"path/filepath"
 	"sort"
@@ -54,6 +55,7 @@ type ScopeResult struct {
 	ModifiedFiles    []string
 	AddedFiles       []string
 	DeletedFiles     []string
+	RenamedFiles     []RenamedFile
 	TotalFiles       int
 	TotalAdditions   int
 	TotalDeletions   int
@@ -74,6 +76,11 @@ type gitClientInterface interface {
 type Detector struct {
 	workDir   string
 	gitClient gitClientInterface
+	// logf is an optional structured log sink invoked when the detector
+	// needs to report a skipped file (for example, a race between listing
+	// and stat-ing a path). Callers that want operator visibility should set
+	// this; nil means "silently drop the message".
+	logf func(format string, args ...any)
 }
 
 // NewDetector creates a new Detector for the specified working directory.
@@ -82,6 +89,23 @@ func NewDetector(workDir string) *Detector {
 		workDir:   workDir,
 		gitClient: git.NewClient(workDir),
 	}
+}
+
+// SetLogger installs a logging function that the Detector calls with a
+// Printf-style message whenever it gracefully skips a file. Passing nil
+// disables logging.
+func (d *Detector) SetLogger(logf func(format string, args ...any)) {
+	if d == nil {
+		return
+	}
+	d.logf = logf
+}
+
+func (d *Detector) logSkip(format string, args ...any) {
+	if d == nil || d.logf == nil {
+		return
+	}
+	d.logf(format, args...)
 }
 
 // DetectFromRefs analyzes changes between two git refs.
@@ -139,9 +163,17 @@ func (d *Detector) buildScopeResultFromFiles(baseRef string, files []string) (*S
 	}
 
 	changedFiles := make([]git.ChangedFile, 0, len(cleanFiles))
+	survivors := make([]string, 0, len(cleanFiles))
 	for _, file := range cleanFiles {
 		status, statusErr := resolveFileStatus(d.gitClient, d.workDir, baseRef, file)
 		if statusErr != nil {
+			// Races (file listed but vanished before stat) are operationally
+			// normal — IDE saves, git ops, concurrent refactors. Skip the
+			// file with a visible log instead of failing the whole scope.
+			if errors.Is(statusErr, errFileRaceMissing) {
+				d.logSkip("scope: skipping %q (disappeared between list and stat: %v)", file, statusErr)
+				continue
+			}
 			return nil, statusErr
 		}
 		if status == git.StatusUnknown {
@@ -160,12 +192,14 @@ func (d *Detector) buildScopeResultFromFiles(baseRef string, files []string) (*S
 			Additions: fileStats.Additions,
 			Deletions: fileStats.Deletions,
 		})
+		survivors = append(survivors, file)
 	}
+	cleanFiles = survivors
 
 	lang := DetectLanguage(cleanFiles)
 	languages := DetectLanguages(cleanFiles)
 	packages := ExtractPackages(FilterByLanguage(cleanFiles, lang))
-	modified, added, deleted := CategorizeFilesByStatus(changedFiles)
+	modified, added, deleted, renamed := CategorizeFilesByStatusWithRenames(changedFiles)
 
 	return &ScopeResult{
 		BaseRef:          baseRef,
@@ -175,6 +209,7 @@ func (d *Detector) buildScopeResultFromFiles(baseRef string, files []string) (*S
 		ModifiedFiles:    modified,
 		AddedFiles:       added,
 		DeletedFiles:     deleted,
+		RenamedFiles:     renamed,
 		TotalFiles:       len(cleanFiles),
 		TotalAdditions:   stats.TotalAdditions,
 		TotalDeletions:   stats.TotalDeletions,
@@ -191,6 +226,7 @@ func (d *Detector) emptyScopeResult(baseRef, headRef string) *ScopeResult {
 		ModifiedFiles:    []string{},
 		AddedFiles:       []string{},
 		DeletedFiles:     []string{},
+		RenamedFiles:     []RenamedFile{},
 		TotalFiles:       0,
 		TotalAdditions:   0,
 		TotalDeletions:   0,
@@ -214,7 +250,7 @@ func (d *Detector) buildScopeResult(diffResult *git.DiffResult) (*ScopeResult, e
 	lang := DetectLanguage(allPaths)
 
 	// Categorize files by status
-	modified, added, deleted := CategorizeFilesByStatus(diffResult.Files)
+	modified, added, deleted, renamed := CategorizeFilesByStatusWithRenames(diffResult.Files)
 
 	// Extract packages from code files only
 	codeFiles := FilterByLanguage(allPaths, lang)
@@ -230,6 +266,7 @@ func (d *Detector) buildScopeResult(diffResult *git.DiffResult) (*ScopeResult, e
 		ModifiedFiles:    modified,
 		AddedFiles:       added,
 		DeletedFiles:     deleted,
+		RenamedFiles:     renamed,
 		TotalFiles:       diffResult.Stats.TotalFiles,
 		TotalAdditions:   diffResult.Stats.TotalAdditions,
 		TotalDeletions:   diffResult.Stats.TotalDeletions,
@@ -313,13 +350,26 @@ func getFileExtension(path string) string {
 	return ext
 }
 
-// CategorizeFilesByStatus separates files into modified, added, and deleted categories.
-// Renamed and copied files are treated as modified.
-// Unknown status files are treated as modified.
+// CategorizeFilesByStatus separates files into modified, added, and deleted
+// categories. Renamed and copied files are treated as modified so the new
+// path is still exercised by downstream analysis. The rename/copy link is
+// intentionally lost here; callers that need identity-preservation across
+// moves should use CategorizeFilesByStatusWithRenames instead.
 func CategorizeFilesByStatus(files []git.ChangedFile) (modified, added, deleted []string) {
+	modified, added, deleted, _ = CategorizeFilesByStatusWithRenames(files)
+	return modified, added, deleted
+}
+
+// CategorizeFilesByStatusWithRenames separates files into modified, added,
+// deleted, and renamed categories while preserving the OldPath→NewPath link
+// for renames/copies. Renamed/copied entries also appear in `modified` so
+// linters and dataflow still run on the new path (backward-compatible with
+// callers that ignore the rename list).
+func CategorizeFilesByStatusWithRenames(files []git.ChangedFile) (modified, added, deleted []string, renamed []RenamedFile) {
 	modified = make([]string, 0)
 	added = make([]string, 0)
 	deleted = make([]string, 0)
+	renamed = make([]RenamedFile, 0)
 
 	for _, f := range files {
 		switch f.Status {
@@ -327,13 +377,18 @@ func CategorizeFilesByStatus(files []git.ChangedFile) (modified, added, deleted 
 			added = append(added, f.Path)
 		case git.StatusDeleted:
 			deleted = append(deleted, f.Path)
+		case git.StatusRenamed, git.StatusCopied:
+			modified = append(modified, f.Path)
+			if f.OldPath != "" && f.OldPath != f.Path {
+				renamed = append(renamed, RenamedFile{OldPath: f.OldPath, NewPath: f.Path})
+			}
 		default:
-			// StatusModified, StatusRenamed, StatusCopied, StatusUnknown -> modified
+			// StatusModified, StatusUnknown -> modified
 			modified = append(modified, f.Path)
 		}
 	}
 
-	return modified, added, deleted
+	return modified, added, deleted, renamed
 }
 
 // ExtractPackages returns unique parent directories (packages) from file paths.

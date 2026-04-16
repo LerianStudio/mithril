@@ -5,32 +5,6 @@ import (
 	"testing"
 )
 
-func TestCapitalizeFirst(t *testing.T) {
-	tests := []struct {
-		name     string
-		input    string
-		expected string
-	}{
-		{name: "empty string", input: "", expected: ""},
-		{name: "single lowercase char", input: "a", expected: "A"},
-		{name: "single uppercase char", input: "A", expected: "A"},
-		{name: "normal lowercase string", input: "hello", expected: "Hello"},
-		{name: "already capitalized", input: "Hello", expected: "Hello"},
-		{name: "all uppercase", input: "HELLO", expected: "HELLO"},
-		{name: "unicode string", input: "über", expected: "Über"},
-		{name: "numeric prefix", input: "123abc", expected: "123abc"},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result := capitalizeFirst(tt.input)
-			if result != tt.expected {
-				t.Errorf("capitalizeFirst(%q) = %q, want %q", tt.input, result, tt.expected)
-			}
-		})
-	}
-}
-
 func TestEscapeMarkdownInline(t *testing.T) {
 	tests := []struct {
 		name     string

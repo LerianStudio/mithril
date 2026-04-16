@@ -3,6 +3,7 @@ package ast
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os/exec"
 	"path/filepath"
@@ -44,11 +45,14 @@ func (p *PythonExtractor) ExtractDiff(ctx context.Context, beforePath, afterPath
 
 	args := []string{p.scriptPath, "--before", before, "--after", after, "--base-dir", deriveBaseDir(beforePath, afterPath)}
 
-	cmd := exec.CommandContext(ctx, p.pythonExecutable, args...) // #nosec G204 - args are controlled
-	cmd.Env = procenv.Build()
-	output, err := cmd.Output()
+	output, err := procenv.RunHelper(ctx, "", p.pythonExecutable, args, 0)
 	if err != nil {
-		if exitErr, ok := err.(*exec.ExitError); ok {
+		var tooLarge *procenv.OutputTooLargeError
+		if errors.As(err, &tooLarge) {
+			return nil, fmt.Errorf("python extractor output too large: %w", err)
+		}
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) {
 			return nil, fmt.Errorf("python extractor failed: %s", string(exitErr.Stderr))
 		}
 		return nil, fmt.Errorf("failed to run python extractor: %w", err)

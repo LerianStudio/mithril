@@ -4,6 +4,7 @@ package scope
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
@@ -230,6 +231,62 @@ func TestCategorizeFilesByStatus(t *testing.T) {
 				t.Errorf("CategorizeFilesByStatus() deleted = %v, want %v", deleted, tt.expectedDeleted)
 			}
 		})
+	}
+}
+
+func TestCategorizeFilesByStatusWithRenames(t *testing.T) {
+	files := []git.ChangedFile{
+		{Path: "kept.go", Status: git.StatusModified},
+		{Path: "new.go", Status: git.StatusAdded},
+		{Path: "gone.go", Status: git.StatusDeleted},
+		{Path: "after.go", OldPath: "before.go", Status: git.StatusRenamed},
+		{Path: "copy.go", OldPath: "source.go", Status: git.StatusCopied},
+		// Rename that keeps the path (no-op rename) must not produce a record.
+		{Path: "same.go", OldPath: "same.go", Status: git.StatusRenamed},
+	}
+
+	mod, added, deleted, renamed := CategorizeFilesByStatusWithRenames(files)
+
+	wantMod := []string{"kept.go", "after.go", "copy.go", "same.go"}
+	if !slices.Equal(mod, wantMod) {
+		t.Errorf("modified = %v, want %v", mod, wantMod)
+	}
+	if !slices.Equal(added, []string{"new.go"}) {
+		t.Errorf("added = %v, want [new.go]", added)
+	}
+	if !slices.Equal(deleted, []string{"gone.go"}) {
+		t.Errorf("deleted = %v, want [gone.go]", deleted)
+	}
+	wantRenamed := []RenamedFile{
+		{OldPath: "before.go", NewPath: "after.go"},
+		{OldPath: "source.go", NewPath: "copy.go"},
+	}
+	if !slices.Equal(renamed, wantRenamed) {
+		t.Errorf("renamed = %v, want %v", renamed, wantRenamed)
+	}
+}
+
+func TestDetectFromRefs_PreservesRenames(t *testing.T) {
+	d := NewDetector("")
+	d.gitClient = &mockGitClient{
+		diffResult: &git.DiffResult{
+			BaseRef: "main",
+			HeadRef: "HEAD",
+			Files: []git.ChangedFile{
+				{Path: "new/path.go", OldPath: "old/path.go", Status: git.StatusRenamed, Additions: 2, Deletions: 1},
+			},
+			Stats: git.DiffStats{TotalFiles: 1, TotalAdditions: 2, TotalDeletions: 1},
+		},
+	}
+	r, err := d.DetectFromRefs("main", "HEAD")
+	if err != nil {
+		t.Fatalf("DetectFromRefs: %v", err)
+	}
+	if len(r.RenamedFiles) != 1 {
+		t.Fatalf("RenamedFiles len = %d, want 1", len(r.RenamedFiles))
+	}
+	if r.RenamedFiles[0].OldPath != "old/path.go" || r.RenamedFiles[0].NewPath != "new/path.go" {
+		t.Errorf("RenamedFiles[0] = %+v, want {old/path.go, new/path.go}", r.RenamedFiles[0])
 	}
 }
 
@@ -887,6 +944,44 @@ func TestDetector_DetectUnstagedChanges_Empty(t *testing.T) {
 	}
 	if result.Language != "unknown" {
 		t.Fatalf("Language = %q, want unknown", result.Language)
+	}
+}
+
+func TestDetector_SkipsRacyMissingFile(t *testing.T) {
+	workDir := t.TempDir()
+	// "survivor.go" exists on disk; "ghost.go" does not (simulated race:
+	// listed by ListUnstagedFiles, deleted before fileExistsInWorkdir).
+	if err := os.WriteFile(filepath.Join(workDir, "survivor.go"), []byte("package main\n"), 0o644); err != nil {
+		t.Fatalf("failed to write survivor.go: %v", err)
+	}
+
+	d := NewDetector(workDir)
+	d.gitClient = &mockGitClient{
+		unstagedFiles: []string{"ghost.go", "survivor.go"},
+		stats:         git.DiffStats{TotalFiles: 2, TotalAdditions: 1},
+		statsByFile:   map[string]git.FileStats{"survivor.go": {Additions: 1}},
+		// Neither file is in the base ref — ghost.go will trip the race
+		// branch (!inBase && !inWorktree).
+		fileExists: map[string]bool{"ghost.go": false, "survivor.go": false},
+	}
+
+	var logs []string
+	d.SetLogger(func(format string, args ...any) {
+		logs = append(logs, fmt.Sprintf(format, args...))
+	})
+
+	result, err := d.DetectUnstagedChanges()
+	if err != nil {
+		t.Fatalf("DetectUnstagedChanges() returned error despite race: %v", err)
+	}
+	if result.TotalFiles != 1 {
+		t.Fatalf("TotalFiles = %d, want 1 (ghost.go should be skipped)", result.TotalFiles)
+	}
+	if len(result.AddedFiles) != 1 || result.AddedFiles[0] != "survivor.go" {
+		t.Fatalf("AddedFiles = %v, want [survivor.go]", result.AddedFiles)
+	}
+	if len(logs) != 1 || !strings.Contains(logs[0], "ghost.go") {
+		t.Fatalf("expected one skip log mentioning ghost.go, got %v", logs)
 	}
 }
 

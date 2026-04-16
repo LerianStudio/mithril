@@ -2,12 +2,12 @@
 package output
 
 import (
-	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
 	"regexp"
 
+	"github.com/lerianstudio/mithril/internal/fileutil"
 	"github.com/lerianstudio/mithril/internal/lint"
 )
 
@@ -60,21 +60,9 @@ func sanitizeLanguageToken(raw string) (string, error) {
 }
 
 // writeJSON writes data as formatted JSON to a file.
-func (w *LintWriter) writeJSON(filename string, data interface{}) error {
+func (w *LintWriter) writeJSON(filename string, data any) error {
 	path := filepath.Join(w.outputDir, filename)
-
-	jsonData, err := json.MarshalIndent(data, "", "  ")
-	if err != nil {
-		return fmt.Errorf("failed to marshal JSON: %w", err)
-	}
-
-	dataWithNewline := append(jsonData, '\n')
-
-	if err := os.WriteFile(path, dataWithNewline, 0o600); err != nil {
-		return fmt.Errorf("failed to write %s: %w", path, err)
-	}
-
-	return nil
+	return fileutil.WriteJSONFile(path, data)
 }
 
 // DefaultOutputDir returns the default output directory.

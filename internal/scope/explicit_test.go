@@ -87,6 +87,53 @@ func TestResolveFileStatus(t *testing.T) {
 	})
 }
 
+func TestResolveFileStatus_RejectsSymlinkEscapingWorkdir(t *testing.T) {
+	outside := t.TempDir()
+	targetPath := filepath.Join(outside, "sensitive.txt")
+	if err := os.WriteFile(targetPath, []byte("SECRET"), 0o600); err != nil {
+		t.Fatalf("failed to create sensitive file: %v", err)
+	}
+
+	workDir := t.TempDir()
+	linkName := "leak.txt"
+	linkPath := filepath.Join(workDir, linkName)
+	if err := os.Symlink(targetPath, linkPath); err != nil {
+		t.Skipf("symlinks unsupported in test env: %v", err)
+	}
+
+	client := &mockGitClient{fileExists: map[string]bool{linkName: false}}
+	status, err := resolveFileStatus(client, workDir, "HEAD", linkName)
+	if err == nil {
+		t.Fatalf("expected symlink escape to be rejected; got status %s", status)
+	}
+	if status != git.StatusUnknown {
+		t.Fatalf("status = %s, want Unknown on rejection", status)
+	}
+}
+
+func TestResolveFileStatus_AllowsInRepoSymlink(t *testing.T) {
+	workDir := t.TempDir()
+	targetName := "real.txt"
+	targetPath := filepath.Join(workDir, targetName)
+	if err := os.WriteFile(targetPath, []byte("ok"), 0o644); err != nil {
+		t.Fatalf("failed to create real file: %v", err)
+	}
+	linkName := "alias.txt"
+	linkPath := filepath.Join(workDir, linkName)
+	if err := os.Symlink(targetPath, linkPath); err != nil {
+		t.Skipf("symlinks unsupported: %v", err)
+	}
+
+	client := &mockGitClient{fileExists: map[string]bool{linkName: false}}
+	status, err := resolveFileStatus(client, workDir, "HEAD", linkName)
+	if err != nil {
+		t.Fatalf("resolveFileStatus returned error: %v", err)
+	}
+	if status != git.StatusAdded {
+		t.Fatalf("status = %s, want %s", status, git.StatusAdded)
+	}
+}
+
 func TestNormalizeFileList(t *testing.T) {
 	input := []string{"", ".", "./cmd/main.go", "cmd/main.go", "internal/../internal/service.go", "cmd/main.go"}
 	got := normalizeFileList(input)

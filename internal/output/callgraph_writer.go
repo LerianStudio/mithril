@@ -2,13 +2,13 @@
 package output
 
 import (
-	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
 	"regexp"
 
 	"github.com/lerianstudio/mithril/internal/callgraph"
+	"github.com/lerianstudio/mithril/internal/fileutil"
 )
 
 var safeCallgraphLanguagePattern = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
@@ -51,40 +51,7 @@ func WriteJSON(result *callgraph.CallGraphResult, outputDir string) error {
 	filename := fmt.Sprintf("%s-calls.json", language)
 	path := filepath.Join(outputDir, filename)
 
-	// Marshal with pretty printing
-	jsonData, err := json.MarshalIndent(result, "", "  ")
-	if err != nil {
-		return fmt.Errorf("failed to marshal call graph result: %w", err)
-	}
-
-	// Write to file with trailing newline for better file handling.
-	// Avoids an extra allocation vs append(jsonData, '\n').
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600) // #nosec G304 -- filename is constrained by sanitizeCallgraphLanguage and joined under configured outputDir
-	if err != nil {
-		return fmt.Errorf("failed to open %s: %w", path, err)
-	}
-
-	if n, err := f.Write(jsonData); err != nil {
-		_ = f.Close()
-		return fmt.Errorf("failed to write %s: %w", path, err)
-	} else if n != len(jsonData) {
-		_ = f.Close()
-		return fmt.Errorf("failed to write %s: short write (%d/%d)", path, n, len(jsonData))
-	}
-
-	if n, err := f.Write([]byte{'\n'}); err != nil {
-		_ = f.Close()
-		return fmt.Errorf("failed to write %s newline: %w", path, err)
-	} else if n != 1 {
-		_ = f.Close()
-		return fmt.Errorf("failed to write %s newline: short write (%d/1)", path, n)
-	}
-
-	if err := f.Close(); err != nil {
-		return fmt.Errorf("failed to close %s: %w", path, err)
-	}
-
-	return nil
+	return fileutil.WriteJSONFile(path, result)
 }
 
 func sanitizeCallgraphLanguage(raw string) (string, error) {

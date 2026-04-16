@@ -3,6 +3,7 @@ package ast
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -50,7 +51,9 @@ func (t *TypeScriptExtractor) Language() string {
 }
 
 func (t *TypeScriptExtractor) SupportedExtensions() []string {
-	return []string{".ts", ".tsx", ".js", ".jsx"}
+	// .d.ts files are ambient declaration files and parse fine as TS; the
+	// node helper also now selects the correct ScriptKind per extension.
+	return []string{".ts", ".tsx", ".js", ".jsx", ".d.ts"}
 }
 
 func (t *TypeScriptExtractor) ExtractDiff(ctx context.Context, beforePath, afterPath string) (*SemanticDiff, error) {
@@ -65,11 +68,14 @@ func (t *TypeScriptExtractor) ExtractDiff(ctx context.Context, beforePath, after
 
 	args := []string{t.scriptPath, "--before", before, "--after", after}
 	args = append(args, "--base-dir", deriveBaseDir(beforePath, afterPath))
-	cmd := exec.CommandContext(ctx, t.nodeExecutable, args...) // #nosec G204 - args are controlled
-	cmd.Env = procenv.Build()
-	output, err := cmd.Output()
+	output, err := procenv.RunHelper(ctx, "", t.nodeExecutable, args, 0)
 	if err != nil {
-		if exitErr, ok := err.(*exec.ExitError); ok {
+		var tooLarge *procenv.OutputTooLargeError
+		if errors.As(err, &tooLarge) {
+			return nil, fmt.Errorf("typescript extractor output too large: %w", err)
+		}
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) {
 			return nil, fmt.Errorf("typescript extractor failed: %s", string(exitErr.Stderr))
 		}
 		return nil, fmt.Errorf("failed to run typescript extractor: %w", err)

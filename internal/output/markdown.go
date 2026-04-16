@@ -127,13 +127,14 @@ func renderSummaryTable(sb *strings.Builder, result *callgraph.CallGraphResult) 
 }
 
 // categorizeFunctions groups functions by their impact level based on caller count.
+// Uses callgraph.RiskLevelFromCallerCount so thresholds stay in sync with the
+// context/template helpers.
 func categorizeFunctions(functions []callgraph.FunctionCallGraph) (high, medium, low []callgraph.FunctionCallGraph) {
 	for _, fcg := range functions {
-		callerCount := len(fcg.Callers)
-		switch {
-		case callerCount >= 3:
+		switch callgraph.RiskLevelFromCallerCount(len(fcg.Callers)) {
+		case callgraph.RiskHigh:
 			high = append(high, fcg)
-		case callerCount >= 1:
+		case callgraph.RiskMedium:
 			medium = append(medium, fcg)
 		default:
 			low = append(low, fcg)

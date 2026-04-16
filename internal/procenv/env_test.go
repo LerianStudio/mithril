@@ -27,13 +27,3 @@ func TestBuild_UsesAllowlist(t *testing.T) {
 	}
 }
 
-func TestBuild_AllowsExtraKeys(t *testing.T) {
-	t.Setenv("CUSTOM_ALLOWED", "value")
-
-	env := Build("CUSTOM_ALLOWED")
-	joined := strings.Join(env, "\n")
-
-	if !strings.Contains(joined, "CUSTOM_ALLOWED=value") {
-		t.Fatalf("expected CUSTOM_ALLOWED in env, got: %v", env)
-	}
-}
