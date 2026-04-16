@@ -319,6 +319,10 @@ func TestCompiler_UncoveredFunctions(t *testing.T) {
 	}
 }
 
+// TestCompiler_InvalidJSONHandling verifies H23: a single corrupt phase
+// output no longer wipes every reviewer context. The compile proceeds with
+// the scope phase marked Failed in PhaseStatus, and reviewer contexts still
+// get written for the intact phases.
 func TestCompiler_InvalidJSONHandling(t *testing.T) {
 	inputDir := t.TempDir()
 	outputDir := t.TempDir()
@@ -332,12 +336,99 @@ func TestCompiler_InvalidJSONHandling(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewCompiler() error = %v", err)
 	}
-	err = compiler.Compile()
-	if err == nil {
-		t.Fatal("Compile() expected error for invalid JSON, got nil")
+	if err := compiler.Compile(); err != nil {
+		t.Fatalf("Compile() should degrade gracefully, got error: %v", err)
 	}
-	if !strings.Contains(err.Error(), "scope.json") {
-		t.Fatalf("expected compile error to mention scope.json parse failure, got: %v", err)
+
+	// All reviewer context files should still exist despite the bad scope.json
+	for _, reviewer := range GetReviewerNames() {
+		path := filepath.Join(outputDir, "context-"+reviewer+".md")
+		if _, statErr := os.Stat(path); statErr != nil {
+			t.Errorf("reviewer context %s was not written: %v", reviewer, statErr)
+		}
+	}
+}
+
+// TestBusinessLogicReviewer_ReceivesDataflowFindings verifies H40: a
+// user-input -> database flow is a correctness concern (was validation
+// applied correctly? is the query appropriate?) so the business-logic
+// reviewer must see high-risk flows, not only the security reviewer.
+func TestBusinessLogicReviewer_ReceivesDataflowFindings(t *testing.T) {
+	outputs := &PhaseOutputs{
+		DataFlow: &DataFlowData{
+			Flows: []DataFlow{
+				{ID: "f1", Risk: "critical", Source: FlowSource{Type: "http_query"}, Sink: FlowSink{Type: "database"}},
+				{ID: "f2", Risk: "medium", Source: FlowSource{Type: "env_var"}, Sink: FlowSink{Type: "logging"}},
+			},
+		},
+	}
+
+	data := &TemplateData{}
+	buildBusinessLogicReviewerData(data, outputs)
+
+	if !data.HasDataFlowAnalysis {
+		t.Fatal("expected HasDataFlowAnalysis = true for business-logic reviewer")
+	}
+	if len(data.HighRiskFlows) != 1 {
+		t.Errorf("HighRiskFlows len = %d, want 1", len(data.HighRiskFlows))
+	}
+	if len(data.MediumRiskFlows) != 1 {
+		t.Errorf("MediumRiskFlows len = %d, want 1", len(data.MediumRiskFlows))
+	}
+
+	var foundFocus bool
+	for _, area := range data.FocusAreas {
+		if area.Title == "Data Flow Correctness" {
+			foundFocus = true
+			break
+		}
+	}
+	if !foundFocus {
+		t.Error("expected 'Data Flow Correctness' focus area when high-risk flows present")
+	}
+}
+
+// TestCompiler_PhaseStatusTracking verifies H24: PhaseStatus distinguishes
+// NotRun, Completed, Failed, and Empty so downstream consumers can render
+// specific messages instead of treating all silence the same way.
+func TestCompiler_PhaseStatusTracking(t *testing.T) {
+	inputDir := t.TempDir()
+	outputDir := t.TempDir()
+
+	// Write a valid scope.json (Completed) and a corrupt static-analysis.json
+	// (Failed). Leave ast/calls/flow absent (NotRun).
+	scope := ScopeData{
+		BaseRef: "main", HeadRef: "HEAD", Language: "go",
+		Files: ScopeFiles{Modified: []string{"a.go"}},
+		Stats: ScopeStats{TotalFiles: 1},
+	}
+	writeJSON(t, inputDir, "scope.json", scope)
+	if err := os.WriteFile(filepath.Join(inputDir, "static-analysis.json"), []byte("{not json"), 0o644); err != nil {
+		t.Fatalf("write static-analysis.json: %v", err)
+	}
+
+	compiler, err := NewCompiler(inputDir, outputDir)
+	if err != nil {
+		t.Fatalf("NewCompiler: %v", err)
+	}
+	outputs, err := compiler.readPhaseOutputs()
+	if err != nil {
+		t.Fatalf("readPhaseOutputs: %v", err)
+	}
+	if got := outputs.PhaseStatus[phaseScope]; got != PhaseStatusCompleted {
+		t.Errorf("scope status = %s, want %s", got, PhaseStatusCompleted)
+	}
+	if got := outputs.PhaseStatus[phaseStaticAnalysis]; got != PhaseStatusFailed {
+		t.Errorf("static_analysis status = %s, want %s", got, PhaseStatusFailed)
+	}
+	if got := outputs.PhaseStatus[phaseAST]; got != PhaseStatusNotRun {
+		t.Errorf("ast status = %s, want %s", got, PhaseStatusNotRun)
+	}
+	if got := outputs.PhaseStatus[phaseCallGraph]; got != PhaseStatusNotRun {
+		t.Errorf("call_graph status = %s, want %s", got, PhaseStatusNotRun)
+	}
+	if got := outputs.PhaseStatus[phaseDataFlow]; got != PhaseStatusNotRun {
+		t.Errorf("data_flow status = %s, want %s", got, PhaseStatusNotRun)
 	}
 }
 
@@ -498,5 +589,120 @@ func TestCompiler_TestReviewerNewErrorPaths(t *testing.T) {
 
 	if !strings.Contains(string(content), "New Error Paths") {
 		t.Error("expected 'New Error Paths' focus area in test-reviewer context")
+	}
+}
+
+func TestCompiler_ConsequencesReviewerContext(t *testing.T) {
+	inputDir := t.TempDir()
+	outputDir := t.TempDir()
+	createSamplePhaseOutputs(t, inputDir)
+
+	compiler, err := NewCompiler(inputDir, outputDir)
+	if err != nil {
+		t.Fatalf("NewCompiler() error = %v", err)
+	}
+	if err := compiler.Compile(); err != nil {
+		t.Fatalf("Compile() error = %v", err)
+	}
+
+	contextPath := filepath.Join(outputDir, "context-consequences-reviewer.md")
+	content, err := os.ReadFile(contextPath)
+	if err != nil {
+		t.Fatalf("failed to read consequences-reviewer context: %v", err)
+	}
+	contentStr := string(content)
+
+	expectedSections := []string{
+		"# Pre-Analysis Context: Consequences",
+		"API Surface Changes",
+		"Caller Chain Impact",
+		"Error Contract Shifts",
+		"Focus Areas",
+	}
+	for _, section := range expectedSections {
+		if !strings.Contains(contentStr, section) {
+			t.Errorf("consequences-reviewer context missing section %q", section)
+		}
+	}
+
+	// Sample data has a signature change (added_param on CreateUser); the focus area should mention it.
+	if !strings.Contains(contentStr, "Signature Changes") {
+		t.Error("expected 'Signature Changes' section populated from sample AST")
+	}
+}
+
+func TestCompiler_DeadCodeReviewerContext(t *testing.T) {
+	inputDir := t.TempDir()
+	outputDir := t.TempDir()
+
+	// Build phase outputs that exercise dead-code signals: a deleted function,
+	// a removed import, and a modified function with zero callers (orphan + zombie).
+	scope := ScopeData{
+		Language: "go",
+		Files: ScopeFiles{
+			Modified: []string{"user.go"},
+			Added:    []string{},
+			Deleted:  []string{"legacy.go"},
+		},
+		Stats: ScopeStats{},
+	}
+	writeJSON(t, inputDir, "scope.json", scope)
+
+	ast := ASTData{
+		Functions: FunctionChanges{
+			Deleted: []FunctionInfo{
+				{Name: "LegacyHelper", Package: "util", File: "legacy.go", Signature: "func LegacyHelper()", LineStart: 12},
+			},
+		},
+		Imports: ImportChanges{
+			Removed: []ImportInfo{
+				{File: "user.go", Path: "github.com/old/pkg"},
+			},
+		},
+	}
+	writeJSON(t, inputDir, "go-ast.json", ast)
+
+	calls := CallGraphData{
+		ModifiedFunctions: []FunctionCallGraph{
+			{
+				Function: "handler.Orphan",
+				File:     "user.go",
+				Callers:  nil,
+				TestCoverage: []TestCoverage{
+					{TestFunction: "TestOrphan", File: "user_test.go", Line: 10},
+				},
+			},
+		},
+	}
+	writeJSON(t, inputDir, "go-calls.json", calls)
+
+	compiler, err := NewCompiler(inputDir, outputDir)
+	if err != nil {
+		t.Fatalf("NewCompiler() error = %v", err)
+	}
+	if err := compiler.Compile(); err != nil {
+		t.Fatalf("Compile() error = %v", err)
+	}
+
+	contextPath := filepath.Join(outputDir, "context-dead-code-reviewer.md")
+	content, err := os.ReadFile(contextPath)
+	if err != nil {
+		t.Fatalf("failed to read dead-code-reviewer context: %v", err)
+	}
+	contentStr := string(content)
+
+	expected := []string{
+		"# Pre-Analysis Context: Dead Code",
+		"Deleted Symbols",
+		"Orphan Candidates",
+		"Zombie Tests",
+		"LegacyHelper",
+		"handler.Orphan",
+		"TestOrphan",
+	}
+	for _, snippet := range expected {
+		if !strings.Contains(contentStr, snippet) {
+			t.Errorf("dead-code-reviewer context missing %q", snippet)
+		}
 	}
 }

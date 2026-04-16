@@ -4,6 +4,9 @@
 package context
 
 // PhaseOutputs holds all the outputs from analysis phases.
+// PhaseStatusByPhase tracks whether each phase completed, was missing,
+// errored, or produced empty output so downstream reviewers can render
+// distinct messages rather than treating all three as silence.
 type PhaseOutputs struct {
 	Scope          *ScopeData          `json:"scope"`
 	StaticAnalysis *StaticAnalysisData `json:"static_analysis"`
@@ -12,11 +15,25 @@ type PhaseOutputs struct {
 	DataFlow       *DataFlowData       `json:"data_flow"`
 	Errors         []string            `json:"errors,omitempty"`
 
-	// Multi-language support: maps language code to data
-	ASTByLanguage       map[string]*ASTData       `json:"ast_by_language,omitempty"`
-	CallGraphByLanguage map[string]*CallGraphData `json:"call_graph_by_language,omitempty"`
-	DataFlowByLanguage  map[string]*DataFlowData  `json:"data_flow_by_language,omitempty"`
+	// PhaseStatus records per-phase availability. Keys are phase names:
+	// "scope", "static_analysis", "ast", "call_graph", "data_flow".
+	PhaseStatus map[string]PhaseStatus `json:"phase_status,omitempty"`
 }
+
+// PhaseStatus records the outcome of a single analysis phase from the
+// compiler's perspective.
+type PhaseStatus string
+
+const (
+	// PhaseStatusNotRun indicates the phase output file was absent.
+	PhaseStatusNotRun PhaseStatus = "not_run"
+	// PhaseStatusCompleted indicates the phase produced parsed output.
+	PhaseStatusCompleted PhaseStatus = "completed"
+	// PhaseStatusFailed indicates the phase output existed but could not be read or parsed.
+	PhaseStatusFailed PhaseStatus = "failed"
+	// PhaseStatusEmpty indicates the phase ran but produced no usable findings.
+	PhaseStatusEmpty PhaseStatus = "empty"
+)
 
 // ScopeData represents Phase 0 output (scope.json).
 type ScopeData struct {
@@ -27,12 +44,6 @@ type ScopeData struct {
 	Files            ScopeFiles `json:"files"`
 	Stats            ScopeStats `json:"stats"`
 	PackagesAffected []string   `json:"packages_affected"`
-	ModifiedFiles    []string   `json:"-"`
-	AddedFiles       []string   `json:"-"`
-	DeletedFiles     []string   `json:"-"`
-	TotalFiles       int        `json:"-"`
-	TotalAdditions   int        `json:"-"`
-	TotalDeletions   int        `json:"-"`
 }
 
 // ScopeFiles represents nested file lists in scope.json.

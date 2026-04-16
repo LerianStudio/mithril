@@ -114,3 +114,87 @@ func TestParseDataFlowData_ConvertsFlowAnalysis(t *testing.T) {
 	require.Equal(t, "db.Exec", parsed.Flows[0].Sink.Expression)
 	require.Len(t, parsed.Flows[0].Path, 2)
 }
+
+// H22 regression: when a producer function diff has a nil Before or After
+// signature, convertSemanticDiffsToASTData must NOT synthesize a fake
+// `func NAME()` placeholder. Previously the converter filled in a bare
+// signature string which the downstream reviewer would treat as authoritative.
+func TestConvertSemanticDiffsToASTData_NoFakeSignatures(t *testing.T) {
+	diffs := []astpkg.SemanticDiff{
+		{
+			Language: "go",
+			FilePath: "internal/svc/a.go",
+			Functions: []astpkg.FunctionDiff{
+				{Name: "OnlyBeforeMissing", ChangeType: astpkg.ChangeModified,
+					Before: nil,
+					After:  &astpkg.FuncSig{Params: []astpkg.Param{{Name: "x", Type: "int"}}, StartLine: 5, EndLine: 8}},
+				{Name: "OnlyAfterMissing", ChangeType: astpkg.ChangeModified,
+					Before: &astpkg.FuncSig{Params: []astpkg.Param{{Name: "x", Type: "int"}}, StartLine: 5, EndLine: 8},
+					After:  nil},
+				{Name: "BothMissing", ChangeType: astpkg.ChangeModified,
+					Before: nil, After: nil},
+				{Name: "AddedButNil", ChangeType: astpkg.ChangeAdded, After: nil},
+				{Name: "RemovedButNil", ChangeType: astpkg.ChangeRemoved, Before: nil},
+			},
+		},
+	}
+
+	result := convertSemanticDiffsToASTData(diffs)
+
+	// BothMissing, AddedButNil, RemovedButNil must be dropped.
+	for _, fn := range result.Functions.Modified {
+		if fn.Name == "BothMissing" {
+			t.Errorf("BothMissing should not appear in Modified, got %+v", fn)
+		}
+		if fn.Before.Signature == "func "+fn.Name+"()" && fn.Before.LineStart == 0 {
+			t.Errorf("Modified %q Before has synthesized placeholder signature", fn.Name)
+		}
+		if fn.After.Signature == "func "+fn.Name+"()" && fn.After.LineStart == 0 {
+			t.Errorf("Modified %q After has synthesized placeholder signature", fn.Name)
+		}
+	}
+	for _, fn := range result.Functions.Added {
+		if fn.Name == "AddedButNil" {
+			t.Errorf("AddedButNil should be dropped (nil After), got %+v", fn)
+		}
+	}
+	for _, fn := range result.Functions.Deleted {
+		if fn.Name == "RemovedButNil" {
+			t.Errorf("RemovedButNil should be dropped (nil Before), got %+v", fn)
+		}
+	}
+
+	// OnlyBeforeMissing: After populated, Before zero-valued (not a fake placeholder).
+	var onlyBeforeMissing *FunctionDiff
+	for i, fn := range result.Functions.Modified {
+		if fn.Name == "OnlyBeforeMissing" {
+			onlyBeforeMissing = &result.Functions.Modified[i]
+			break
+		}
+	}
+	require.NotNil(t, onlyBeforeMissing, "OnlyBeforeMissing should be present with populated After")
+	require.NotEmpty(t, onlyBeforeMissing.After.Signature)
+	require.Empty(t, onlyBeforeMissing.Before.Signature, "Before side must be zero value, not a placeholder")
+}
+
+// H27 regression: SanitizedFlows is counted positively from the flow list,
+// never derived by subtraction that could underflow or disagree with totals.
+func TestConvertFlowAnalysisToDataFlowData_SanitizedCountedPositively(t *testing.T) {
+	producer := &dataflowpkg.FlowAnalysis{
+		Language: "go",
+		Flows: []dataflowpkg.Flow{
+			{ID: "f1", Sanitized: true, Risk: dataflowpkg.RiskLow},
+			{ID: "f2", Sanitized: false, Risk: dataflowpkg.RiskHigh},
+			{ID: "f3", Sanitized: true, Risk: dataflowpkg.RiskMedium},
+		},
+		// Intentionally inflate TotalFlows beyond len(Flows) to prove we don't
+		// subtract into negatives or mismatch the actual list.
+		Statistics: dataflowpkg.Stats{TotalFlows: 10, UnsanitizedFlows: 0},
+	}
+
+	result := convertFlowAnalysisToDataFlowData(producer)
+
+	require.Equal(t, 2, result.Summary.SanitizedFlows, "should count sanitized positively")
+	require.Equal(t, 1, result.Summary.UnsanitizedFlows, "should count unsanitized positively when stats say 0")
+	require.GreaterOrEqual(t, result.Summary.SanitizedFlows, 0)
+}

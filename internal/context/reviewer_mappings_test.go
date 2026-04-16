@@ -12,6 +12,8 @@ func TestReviewerNames(t *testing.T) {
 		"business-logic-reviewer",
 		"test-reviewer",
 		"nil-safety-reviewer",
+		"consequences-reviewer",
+		"dead-code-reviewer",
 	}
 
 	names := GetReviewerNames()
@@ -60,7 +62,7 @@ func TestGetReviewerDataSources(t *testing.T) {
 	}{
 		{"code-reviewer", 2},           // static-analysis, semantic-diff
 		{"security-reviewer", 2},       // static-analysis (security), security-summary
-		{"business-logic-reviewer", 2}, // semantic-diff, impact-summary
+		{"business-logic-reviewer", 3}, // semantic-diff, impact-summary, data-flow (H40)
 		{"test-reviewer", 1},           // impact-summary (test coverage)
 		{"nil-safety-reviewer", 1},     // data-flow (nil_sources)
 		{"unknown-reviewer", 0},        // unknown reviewer returns empty slice

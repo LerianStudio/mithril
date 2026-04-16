@@ -27,12 +27,21 @@ var reviewerDataSources = map[string][]DataSource{
 	"business-logic-reviewer": {
 		{Name: "semantic-diff", Description: "Business logic changes in functions/methods"},
 		{Name: "impact-summary", Description: "Call graph impact, affected callers"},
+		{Name: "data-flow", Description: "User-input-to-sink flows for validation/query-shape correctness"},
 	},
 	"test-reviewer": {
 		{Name: "impact-summary", Description: "Test coverage for modified code"},
 	},
 	"nil-safety-reviewer": {
 		{Name: "data-flow", Description: "Nil/None source analysis"},
+	},
+	"consequences-reviewer": {
+		{Name: "impact-summary", Description: "Caller chains, API surface reach, shared state"},
+		{Name: "semantic-diff", Description: "Signature, type, and import changes that ripple outward"},
+	},
+	"dead-code-reviewer": {
+		{Name: "semantic-diff", Description: "Deleted symbols and removed imports"},
+		{Name: "impact-summary", Description: "Orphan functions and zombie tests from dependency walk"},
 	},
 }
 
@@ -44,6 +53,8 @@ var reviewerOrder = []string{
 	"business-logic-reviewer",
 	"test-reviewer",
 	"nil-safety-reviewer",
+	"consequences-reviewer",
+	"dead-code-reviewer",
 }
 
 func init() {

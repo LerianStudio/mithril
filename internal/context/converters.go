@@ -67,13 +67,19 @@ func convertSemanticDiffsToASTData(diffs []astpkg.SemanticDiff) *ASTData {
 		for _, fn := range diff.Functions {
 			switch fn.ChangeType {
 			case astpkg.ChangeModified:
-				before := convertFuncSig(diff.FilePath, fn.Name, fn.Before)
-				after := convertFuncSig(diff.FilePath, fn.Name, fn.After)
+				if fn.Before == nil && fn.After == nil {
+					continue
+				}
+				before, beforeOK := convertFuncSig(diff.FilePath, fn.Name, fn.Before)
+				after, afterOK := convertFuncSig(diff.FilePath, fn.Name, fn.After)
+				if !beforeOK && !afterOK {
+					continue
+				}
 				changes := []string{}
 				if fn.BodyDiff != "" {
 					changes = append(changes, fn.BodyDiff)
 				}
-				if before.Signature != after.Signature {
+				if beforeOK && afterOK && before.Signature != after.Signature {
 					changes = append(changes, "signature_changed")
 				}
 				result.Functions.Modified = append(result.Functions.Modified, FunctionDiff{
@@ -85,9 +91,13 @@ func convertSemanticDiffsToASTData(diffs []astpkg.SemanticDiff) *ASTData {
 					Changes:  changes,
 				})
 			case astpkg.ChangeAdded:
-				result.Functions.Added = append(result.Functions.Added, convertFuncSig(diff.FilePath, fn.Name, fn.After))
+				if info, ok := convertFuncSig(diff.FilePath, fn.Name, fn.After); ok {
+					result.Functions.Added = append(result.Functions.Added, info)
+				}
 			case astpkg.ChangeRemoved:
-				result.Functions.Deleted = append(result.Functions.Deleted, convertFuncSig(diff.FilePath, fn.Name, fn.Before))
+				if info, ok := convertFuncSig(diff.FilePath, fn.Name, fn.Before); ok {
+					result.Functions.Deleted = append(result.Functions.Deleted, info)
+				}
 			}
 		}
 
@@ -128,9 +138,12 @@ func convertSemanticDiffsToASTData(diffs []astpkg.SemanticDiff) *ASTData {
 	return result
 }
 
-func convertFuncSig(filePath, name string, sig *astpkg.FuncSig) FunctionInfo {
+// convertFuncSig converts a producer FuncSig to a consumer FunctionInfo.
+// Returns ok=false when sig is nil so callers can skip absent sides instead
+// of synthesizing misleading `func NAME()` placeholders.
+func convertFuncSig(filePath, name string, sig *astpkg.FuncSig) (FunctionInfo, bool) {
 	if sig == nil {
-		return FunctionInfo{Name: name, File: filePath, Signature: fmt.Sprintf("func %s()", name)}
+		return FunctionInfo{}, false
 	}
 
 	params := make([]ParamInfo, 0, len(sig.Params))
@@ -151,7 +164,7 @@ func convertFuncSig(filePath, name string, sig *astpkg.FuncSig) FunctionInfo {
 		LineEnd:   sig.EndLine,
 		Params:    params,
 		Returns:   returns,
-	}
+	}, true
 }
 
 func buildFunctionSignature(name string, sig *astpkg.FuncSig) string {
@@ -214,16 +227,19 @@ func convertTypeFields(fields []astpkg.FieldDiff) ([]FieldInfo, []FieldInfo, []s
 	return before, after, changes
 }
 
+// parseDataFlowData parses raw data-flow JSON into the consumer DataFlowData
+// shape. The producer (internal/dataflow.FlowAnalysis) is the single
+// canonical input format; we always route through the converter so the
+// FlowSummary is computed from the producer's Statistics and Flow list
+// rather than direct-unmarshalled (H28/#4). Previously a try-direct-first
+// branch existed but it never succeeded on real producer payloads because
+// producer `path` is []string while consumer `Path` is []FlowStep — the
+// direct path would only match a hand-crafted consumer-native sample, and
+// keeping it around only created drift-risk for the FlowSummary fields.
 func parseDataFlowData(data []byte) (*DataFlowData, error) {
-	var direct DataFlowData
-	if err := json.Unmarshal(data, &direct); err == nil {
-		normalizeDataFlowData(&direct)
-		return &direct, nil
-	}
-
 	var producer dataflowpkg.FlowAnalysis
 	if err := json.Unmarshal(data, &producer); err != nil {
-		return nil, fmt.Errorf("failed to parse data flow output in supported formats: %w", err)
+		return nil, fmt.Errorf("failed to parse data flow output: %w", err)
 	}
 
 	converted := convertFlowAnalysisToDataFlowData(&producer)
@@ -301,17 +317,20 @@ func convertFlowAnalysisToDataFlowData(producer *dataflowpkg.FlowAnalysis) *Data
 		NilRisks:         firstNonZero(producer.Statistics.NilRisks, len(result.NilSources)),
 	}
 
-	if result.Summary.UnsanitizedFlows == 0 {
-		for _, flow := range result.Flows {
-			if !flow.Sanitized {
-				result.Summary.UnsanitizedFlows++
-			}
+	// Count sanitized/unsanitized positively from the flow list so the two
+	// never go out of sync with TotalFlows due to stats drift or subtraction.
+	sanitized, unsanitized := 0, 0
+	for _, flow := range result.Flows {
+		if flow.Sanitized {
+			sanitized++
+		} else {
+			unsanitized++
 		}
 	}
-	result.Summary.SanitizedFlows = result.Summary.TotalFlows - result.Summary.UnsanitizedFlows
-	if result.Summary.SanitizedFlows < 0 {
-		result.Summary.SanitizedFlows = 0
+	if result.Summary.UnsanitizedFlows == 0 {
+		result.Summary.UnsanitizedFlows = unsanitized
 	}
+	result.Summary.SanitizedFlows = sanitized
 
 	computedHighRisk := 0
 	for _, flow := range result.Flows {
