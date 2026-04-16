@@ -3,7 +3,6 @@ package lint
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"strings"
 )
 
@@ -65,13 +64,7 @@ func (m *Mypy) Version(ctx context.Context) (string, error) {
 // Run executes mypy type checking on the specified files.
 func (m *Mypy) Run(ctx context.Context, projectDir string, files []string) (*Result, error) {
 	result := NewResult()
-
-	version, err := m.Version(ctx)
-	if err != nil {
-		result.Errors = append(result.Errors, fmt.Sprintf("mypy version check failed: %v", err))
-	} else {
-		result.ToolVersions["mypy"] = version
-	}
+	recordToolVersion(ctx, result, "mypy", m.Version)
 
 	// Build arguments
 	args := []string{
@@ -82,8 +75,7 @@ func (m *Mypy) Run(ctx context.Context, projectDir string, files []string) (*Res
 
 	// Add files to check
 	if len(files) > 0 {
-		if err := validateTargetArgs(files); err != nil {
-			result.Errors = append(result.Errors, fmt.Sprintf("mypy target validation failed: %v", err))
+		if !appendValidationError(result, "mypy", files) {
 			return result, nil
 		}
 		args = append(args, files...)
@@ -95,7 +87,7 @@ func (m *Mypy) Run(ctx context.Context, projectDir string, files []string) (*Res
 	// mypy returns non-zero exit code when type errors are found
 	// Only treat as failure if there's no output to parse
 	if execResult.Err != nil && len(execResult.Stdout) == 0 {
-		result.Errors = append(result.Errors, fmt.Sprintf("mypy execution failed: %v", execResult.Err))
+		appendExecError(result, "mypy", execResult.Err)
 		return result, nil
 	}
 

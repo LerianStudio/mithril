@@ -3,7 +3,6 @@ package lint
 import (
 	"bufio"
 	"context"
-	"fmt"
 	"regexp"
 	"strconv"
 	"strings"
@@ -82,19 +81,12 @@ func (t *TSC) Version(ctx context.Context) (string, error) {
 // checked.
 func (t *TSC) Run(ctx context.Context, projectDir string, files []string) (*Result, error) {
 	result := NewResult()
-
-	version, err := t.Version(ctx)
-	if err != nil {
-		result.Errors = append(result.Errors, fmt.Sprintf("tsc version check failed: %v", err))
-	} else {
-		result.ToolVersions["typescript"] = version
-	}
+	recordToolVersion(ctx, result, "typescript", t.Version)
 
 	// Run tsc --noEmit to type check without emitting files
 	args := []string{"--no-install", "tsc", "--noEmit", "--pretty", "false"}
 	if len(files) > 0 {
-		if err := validateTargetArgs(files); err != nil {
-			result.Errors = append(result.Errors, fmt.Sprintf("tsc target validation failed: %v", err))
+		if !appendValidationError(result, "tsc", files) {
 			return result, nil
 		}
 		args = append(args, files...)
@@ -105,13 +97,16 @@ func (t *TSC) Run(ctx context.Context, projectDir string, files []string) (*Resu
 		// Try global tsc
 		execResult = t.executor.Run(ctx, projectDir, "tsc", args[2:]...)
 		if execResult.Err != nil {
-			result.Errors = append(result.Errors, fmt.Sprintf("tsc execution failed: %v", execResult.Err))
+			appendExecError(result, "tsc", execResult.Err)
 			return result, nil
 		}
 	}
 
-	// Parse output line by line
+	// Parse output line by line. tsc can emit very long single lines
+	// (e.g. flattened object types); bump the buffer to 10 MB so we don't
+	// silently drop diagnostics past bufio.Scanner's default 64 KB cap.
 	scanner := bufio.NewScanner(strings.NewReader(string(execResult.Stdout)))
+	scanner.Buffer(make([]byte, 0, 64*1024), 10*1024*1024)
 	for scanner.Scan() {
 		line := scanner.Text()
 		matches := tscDiagnosticRegex.FindStringSubmatch(line)

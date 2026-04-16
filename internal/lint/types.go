@@ -71,20 +71,45 @@ func NewResult() *Result {
 	}
 }
 
+// IncrementSummary bumps the counter matching the severity. Returns true when
+// the severity was recognized, false for unknown values.
+func (s *Summary) IncrementSummary(severity Severity) bool {
+	switch severity {
+	case SeverityCritical:
+		s.Critical++
+	case SeverityHigh:
+		s.High++
+	case SeverityWarning:
+		s.Warning++
+	case SeverityInfo:
+		s.Info++
+	default:
+		s.Unknown++
+		return false
+	}
+	return true
+}
+
+// SeverityRank orders severities by importance (higher is worse).
+func SeverityRank(severity Severity) int {
+	switch severity {
+	case SeverityCritical:
+		return 4
+	case SeverityHigh:
+		return 3
+	case SeverityWarning:
+		return 2
+	case SeverityInfo:
+		return 1
+	default:
+		return 0
+	}
+}
+
 // AddFinding adds a finding and updates the summary.
 func (r *Result) AddFinding(f Finding) {
 	r.Findings = append(r.Findings, f)
-	switch f.Severity {
-	case SeverityCritical:
-		r.Summary.Critical++
-	case SeverityHigh:
-		r.Summary.High++
-	case SeverityWarning:
-		r.Summary.Warning++
-	case SeverityInfo:
-		r.Summary.Info++
-	default:
-		r.Summary.Unknown++
+	if !r.Summary.IncrementSummary(f.Severity) {
 		r.Errors = append(r.Errors, fmt.Sprintf("unknown severity %q for finding %s:%d (%s)", f.Severity, f.File, f.Line, f.Message))
 	}
 }

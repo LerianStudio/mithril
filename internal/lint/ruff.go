@@ -3,7 +3,6 @@ package lint
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"strings"
 )
 
@@ -76,13 +75,7 @@ func (r *Ruff) Version(ctx context.Context) (string, error) {
 // Run executes ruff on the specified files.
 func (r *Ruff) Run(ctx context.Context, projectDir string, files []string) (*Result, error) {
 	result := NewResult()
-
-	version, err := r.Version(ctx)
-	if err != nil {
-		result.Errors = append(result.Errors, fmt.Sprintf("ruff version check failed: %v", err))
-	} else {
-		result.ToolVersions["ruff"] = version
-	}
+	recordToolVersion(ctx, result, "ruff", r.Version)
 
 	// Build arguments
 	args := []string{
@@ -93,8 +86,7 @@ func (r *Ruff) Run(ctx context.Context, projectDir string, files []string) (*Res
 
 	// Add files to lint
 	if len(files) > 0 {
-		if err := validateTargetArgs(files); err != nil {
-			result.Errors = append(result.Errors, fmt.Sprintf("ruff target validation failed: %v", err))
+		if !appendValidationError(result, "ruff", files) {
 			return result, nil
 		}
 		args = append(args, files...)
@@ -104,7 +96,7 @@ func (r *Ruff) Run(ctx context.Context, projectDir string, files []string) (*Res
 
 	execResult := r.executor.Run(ctx, projectDir, "ruff", args...)
 	if execResult.Err != nil {
-		result.Errors = append(result.Errors, fmt.Sprintf("ruff execution failed: %v", execResult.Err))
+		appendExecError(result, "ruff", execResult.Err)
 		return result, nil
 	}
 
@@ -113,7 +105,7 @@ func (r *Ruff) Run(ctx context.Context, projectDir string, files []string) (*Res
 	if strings.TrimSpace(string(execResult.Stdout)) == "" {
 		output = ruffOutput{}
 	} else if err := json.Unmarshal(execResult.Stdout, &output); err != nil {
-		result.Errors = append(result.Errors, fmt.Sprintf("ruff output parse warning: %v", err))
+		appendParseError(result, "ruff", err)
 		return result, nil
 	}
 

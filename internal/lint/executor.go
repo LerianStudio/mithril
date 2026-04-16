@@ -17,6 +17,12 @@ import (
 // DefaultTimeout is the default timeout for linter execution.
 const DefaultTimeout = 5 * time.Minute
 
+// maxLinterOutputBytes caps stdout+stderr per linter invocation to prevent
+// unbounded memory growth if a tool goes berserk (e.g. staticcheck on a
+// generated file producing one diagnostic per line for millions of lines).
+// 50 MB matches the subprocess caps used elsewhere in the pipeline.
+const maxLinterOutputBytes = 50 * 1024 * 1024
+
 // ExecResult holds the result of command execution.
 type ExecResult struct {
 	Stdout   []byte
@@ -103,8 +109,8 @@ func (e *Executor) Run(ctx context.Context, dir string, name string, args ...str
 	configureProcessGroup(cmd)
 
 	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
+	cmd.Stdout = &cappedWriter{w: &stdout, limit: maxLinterOutputBytes}
+	cmd.Stderr = &cappedWriter{w: &stderr, limit: maxLinterOutputBytes}
 
 	if err := cmd.Start(); err != nil {
 		return &ExecResult{Err: err}
@@ -145,6 +151,33 @@ func (e *Executor) Run(ctx context.Context, dir string, name string, args ...str
 	}
 
 	return result
+}
+
+// cappedWriter bounds the number of bytes forwarded to the underlying writer
+// so a runaway linter cannot exhaust memory. Writes past the limit are
+// silently discarded; callers may detect truncation via wrote >= limit.
+type cappedWriter struct {
+	w     *bytes.Buffer
+	limit int
+	wrote int
+}
+
+func (c *cappedWriter) Write(p []byte) (int, error) {
+	remaining := c.limit - c.wrote
+	if remaining <= 0 {
+		// Pretend the full write succeeded so the child process doesn't
+		// get SIGPIPE from stdout; we just drop the overflow.
+		return len(p), nil
+	}
+	n := len(p)
+	if n > remaining {
+		_, err := c.w.Write(p[:remaining])
+		c.wrote += remaining
+		return n, err
+	}
+	_, err := c.w.Write(p)
+	c.wrote += n
+	return n, err
 }
 
 // CommandAvailable checks if a command is available in PATH.

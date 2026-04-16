@@ -77,13 +77,7 @@ func (g *Gosec) Version(ctx context.Context) (string, error) {
 // Run executes gosec on the specified packages.
 func (g *Gosec) Run(ctx context.Context, projectDir string, packages []string) (*Result, error) {
 	result := NewResult()
-
-	version, err := g.Version(ctx)
-	if err != nil {
-		result.Errors = append(result.Errors, fmt.Sprintf("gosec version check failed: %v", err))
-	} else {
-		result.ToolVersions["gosec"] = version
-	}
+	recordToolVersion(ctx, result, "gosec", g.Version)
 
 	// Build arguments
 	args := []string{
@@ -94,8 +88,7 @@ func (g *Gosec) Run(ctx context.Context, projectDir string, packages []string) (
 
 	// Add packages to analyze
 	if len(packages) > 0 {
-		if err := validateTargetArgs(packages); err != nil {
-			result.Errors = append(result.Errors, fmt.Sprintf("gosec target validation failed: %v", err))
+		if !appendValidationError(result, "gosec", packages) {
 			return result, nil
 		}
 		args = append(args, packages...)
@@ -106,14 +99,14 @@ func (g *Gosec) Run(ctx context.Context, projectDir string, packages []string) (
 
 	execResult := g.executor.Run(ctx, projectDir, "gosec", args...)
 	if execResult.Err != nil {
-		result.Errors = append(result.Errors, fmt.Sprintf("gosec execution failed: %v", execResult.Err))
+		appendExecError(result, "gosec", execResult.Err)
 		return result, nil
 	}
 
 	// Parse JSON output
 	var output gosecOutput
 	if err := json.Unmarshal(execResult.Stdout, &output); err != nil {
-		result.Errors = append(result.Errors, fmt.Sprintf("gosec output parse warning: %v", err))
+		appendParseError(result, "gosec", err)
 		return result, nil
 	}
 
