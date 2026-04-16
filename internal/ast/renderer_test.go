@@ -335,4 +335,3 @@ func TestFormatSignature(t *testing.T) {
 		})
 	}
 }
-

@@ -143,4 +143,3 @@ func selectAvailableLinters(ctx context.Context, registry *lint.Registry, lang l
 	}
 	return linters
 }
-

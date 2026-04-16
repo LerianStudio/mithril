@@ -26,4 +26,3 @@ func TestBuild_UsesAllowlist(t *testing.T) {
 		t.Fatalf("expected LC_ALL to be forced to C, got: %v", env)
 	}
 }
-

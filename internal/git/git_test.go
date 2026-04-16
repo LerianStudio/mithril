@@ -1089,9 +1089,9 @@ func TestRunGitCommandEnvFiltered(t *testing.T) {
 
 	// Pollute the parent env with vars that must NOT leak to the child.
 	forbidden := map[string]string{
-		"GITHUB_TOKEN":    "super-secret-token",
-		"GIT_SSH_COMMAND": "ssh -i /tmp/should-not-leak",
-		"SSH_AUTH_SOCK":   "/tmp/should-not-leak.sock",
+		"GITHUB_TOKEN":     "super-secret-token",
+		"GIT_SSH_COMMAND":  "ssh -i /tmp/should-not-leak",
+		"SSH_AUTH_SOCK":    "/tmp/should-not-leak.sock",
 		"GIT_CONFIG_KEY_0": "http.extraheader",
 	}
 	for k, v := range forbidden {

@@ -20,9 +20,9 @@ type stubLinter struct {
 	run        func(ctx context.Context, dir string, targets []string) (*Result, error)
 }
 
-func (s *stubLinter) Name() string                      { return s.name }
-func (s *stubLinter) Language() Language                { return s.language }
-func (s *stubLinter) TargetKind() TargetKind            { return s.targetKind }
+func (s *stubLinter) Name() string                       { return s.name }
+func (s *stubLinter) Language() Language                 { return s.language }
+func (s *stubLinter) TargetKind() TargetKind             { return s.targetKind }
 func (s *stubLinter) Available(ctx context.Context) bool { return true }
 func (s *stubLinter) Version(ctx context.Context) (string, error) {
 	return "stub", nil
