@@ -2,11 +2,17 @@
 package callgraph
 
 // CallInfo represents a single caller or callee relationship.
+//
+// IsVirtual indicates that the edge is an over-approximation produced by
+// interface/dynamic dispatch analysis (e.g. Go CHA interface dispatch) rather
+// than a statically-resolved direct call. Consumers should treat virtual
+// edges as potential, not guaranteed.
 type CallInfo struct {
-	Function string `json:"function"`
-	File     string `json:"file"`
-	Line     int    `json:"line"`
-	CallSite string `json:"call_site,omitempty"`
+	Function  string `json:"function"`
+	File      string `json:"file"`
+	Line      int    `json:"line"`
+	CallSite  string `json:"call_site,omitempty"`
+	IsVirtual bool   `json:"is_virtual,omitempty"`
 }
 
 // TestCoverage represents a test that covers a function.

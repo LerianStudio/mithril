@@ -309,7 +309,7 @@ func TestPythonAnalyzerRunPythonHelperCommand_TooLarge(t *testing.T) {
 	}
 
 	analyzer := NewPythonAnalyzer(t.TempDir())
-	cmd := fmt.Sprintf("head -c %d /dev/zero", pyMaxOutputSize+1)
+	cmd := fmt.Sprintf("head -c %d /dev/zero", maxHelperOutputSize+1)
 
 	_, err := analyzer.runPythonHelperCommand(context.Background(), "sh", []string{"-c", cmd})
 	if err == nil {

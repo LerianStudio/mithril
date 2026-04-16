@@ -198,7 +198,7 @@ func TestTypeScriptAnalyzerRunHelperCommandWithLimit_TooLarge(t *testing.T) {
 	}
 
 	analyzer := NewTypeScriptAnalyzer(t.TempDir())
-	cmd := fmt.Sprintf("head -c %d /dev/zero", tsMaxOutputSize+1)
+	cmd := fmt.Sprintf("head -c %d /dev/zero", maxHelperOutputSize+1)
 
 	_, err := analyzer.runHelperCommandWithLimit(context.Background(), "sh", []string{"-c", cmd})
 	if err == nil {
