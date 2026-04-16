@@ -62,6 +62,13 @@ func TestValidateRunAllFlags(t *testing.T) {
 		},
 	}
 
+	// Stub auto-detection so default-mode tests do not depend on the host
+	// repository having a `main`/`master`/`trunk`/`develop` branch or an
+	// `origin/HEAD` ref.
+	prevDetector := defaultBaseBranchDetector
+	defaultBaseBranchDetector = func() (string, error) { return "main", nil }
+	t.Cleanup(func() { defaultBaseBranchDetector = prevDetector })
+
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			fs := flag.NewFlagSet("run-all", flag.ContinueOnError)
@@ -441,8 +448,10 @@ func TestRunAll_AllPhasesSkipped(t *testing.T) {
 	dir := t.TempDir()
 	outDir := filepath.Join(dir, "out")
 	var stderr bytes.Buffer
+	// --base=HEAD bypasses default-base auto-detection; this test is about
+	// phase skipping, not branch detection.
 	err := runAll(
-		[]string{"--output=" + outDir, "--skip=scope,static-analysis,ast,callgraph,dataflow,context"},
+		[]string{"--base=HEAD", "--output=" + outDir, "--skip=scope,static-analysis,ast,callgraph,dataflow,context"},
 		&bytes.Buffer{}, &stderr,
 	)
 	if err != nil {
@@ -461,8 +470,10 @@ func TestRunAll_AllPhasesSkipped(t *testing.T) {
 func TestRunAll_OutputDirCreation(t *testing.T) {
 	base := t.TempDir()
 	nested := filepath.Join(base, "nested", "deeply", "output")
+	// --base=HEAD bypasses default-base auto-detection; this test is about
+	// output directory creation, not branch detection.
 	err := runAll(
-		[]string{"--output=" + nested, "--skip=scope,static-analysis,ast,callgraph,dataflow,context"},
+		[]string{"--base=HEAD", "--output=" + nested, "--skip=scope,static-analysis,ast,callgraph,dataflow,context"},
 		&bytes.Buffer{}, &bytes.Buffer{},
 	)
 	if err != nil {
@@ -476,8 +487,10 @@ func TestRunAll_OutputDirCreation(t *testing.T) {
 func TestRunAll_VerboseOutput(t *testing.T) {
 	dir := t.TempDir()
 	var stderr bytes.Buffer
+	// --base=HEAD bypasses default-base auto-detection; this test is about
+	// verbose output formatting, not branch detection.
 	err := runAll(
-		[]string{"--output=" + dir, "--verbose", "--skip=scope,static-analysis,ast,callgraph,dataflow,context"},
+		[]string{"--base=HEAD", "--output=" + dir, "--verbose", "--skip=scope,static-analysis,ast,callgraph,dataflow,context"},
 		&bytes.Buffer{}, &stderr,
 	)
 	if err != nil {

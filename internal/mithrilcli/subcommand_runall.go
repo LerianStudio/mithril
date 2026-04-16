@@ -129,6 +129,13 @@ func runAll(args []string, stdout io.Writer, stderr io.Writer) error {
 	return nil
 }
 
+// defaultBaseBranchDetector is the package-level hook used by validation to
+// auto-detect the default base branch. It is overridable in tests so the
+// flag-validation logic can be exercised hermetically without depending on
+// the host repository's branch layout. Tests should restore the original
+// value via t.Cleanup.
+var defaultBaseBranchDetector = detectDefaultBaseBranch
+
 // detectDefaultBaseBranch returns the repository's default base branch for
 // compare mode. It prefers `origin/HEAD` if set, then falls back to locally
 // present branches in the order main, master, trunk, develop. Returns an
@@ -195,7 +202,7 @@ func validateRunAllFlags(fs *flag.FlagSet, cfg *runAllConfig, stderr io.Writer) 
 		cfg.compare = true
 	}
 	if cfg.compare && !baseSet {
-		detected, detectErr := detectDefaultBaseBranch()
+		detected, detectErr := defaultBaseBranchDetector()
 		if detectErr != nil {
 			_, _ = fmt.Fprintln(stderr, "Error:", detectErr)
 			return detectErr
