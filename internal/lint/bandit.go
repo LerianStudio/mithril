@@ -74,13 +74,7 @@ func (b *Bandit) Version(ctx context.Context) (string, error) {
 // Run executes bandit security analysis on the specified files.
 func (b *Bandit) Run(ctx context.Context, projectDir string, files []string) (*Result, error) {
 	result := NewResult()
-
-	version, err := b.Version(ctx)
-	if err != nil {
-		result.Errors = append(result.Errors, fmt.Sprintf("bandit version check failed: %v", err))
-	} else {
-		result.ToolVersions["bandit"] = version
-	}
+	recordToolVersion(ctx, result, "bandit", b.Version)
 
 	// Build arguments
 	args := []string{
@@ -90,8 +84,7 @@ func (b *Bandit) Run(ctx context.Context, projectDir string, files []string) (*R
 
 	// Add files to scan
 	if len(files) > 0 {
-		if err := validateTargetArgs(files); err != nil {
-			result.Errors = append(result.Errors, fmt.Sprintf("bandit target validation failed: %v", err))
+		if !appendValidationError(result, "bandit", files) {
 			return result, nil
 		}
 		args = append(args, files...)
@@ -101,7 +94,7 @@ func (b *Bandit) Run(ctx context.Context, projectDir string, files []string) (*R
 
 	execResult := b.executor.Run(ctx, projectDir, "bandit", args...)
 	if execResult.Err != nil {
-		result.Errors = append(result.Errors, fmt.Sprintf("bandit execution failed: %v", execResult.Err))
+		appendExecError(result, "bandit", execResult.Err)
 		return result, nil
 	}
 	if execResult.ExitCode > 1 {
@@ -112,7 +105,7 @@ func (b *Bandit) Run(ctx context.Context, projectDir string, files []string) (*R
 	// Parse JSON output
 	var output banditOutput
 	if err := json.Unmarshal(execResult.Stdout, &output); err != nil {
-		result.Errors = append(result.Errors, fmt.Sprintf("bandit output parse warning: %v", err))
+		appendParseError(result, "bandit", err)
 		return result, nil
 	}
 

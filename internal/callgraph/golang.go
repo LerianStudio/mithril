@@ -4,8 +4,8 @@ import (
 	"container/list"
 	"context"
 	"fmt"
-	"go/token"
 	"go/types"
+	"os"
 	"path/filepath"
 	"strings"
 	"time"
@@ -177,9 +177,18 @@ func (g *GoAnalyzer) Analyze(modifiedFuncs []ModifiedFunction, timeBudgetSec int
 	// CHA is fast but conservative - it over-approximates call targets
 	cg := cha.CallGraph(prog)
 
+	// Build a single index of SSA functions used by analyzeFunction and
+	// findTransitiveCallers to avoid O(packages * members * methodSet) scans
+	// on every lookup (see H19).
+	ssaIndex := g.buildSSAIndex(prog)
+
 	// Track all unique direct callers and affected tests
 	allDirectCallers := make(map[string]bool)
 	allAffectedTests := make(map[string]bool)
+
+	// Count virtual edges so we can emit a single summary warning rather than
+	// one per call site (see H15).
+	virtualEdgeCount := 0
 
 	// Analyze each modified function
 	for _, modFunc := range modifiedFuncs {
@@ -193,15 +202,21 @@ func (g *GoAnalyzer) Analyze(modifiedFuncs []ModifiedFunction, timeBudgetSec int
 		default:
 		}
 
-		fcg := g.analyzeFunction(prog, cg, modFunc, allDirectCallers, allAffectedTests)
+		fcg, vCount := g.analyzeFunction(prog, cg, ssaIndex, modFunc, allDirectCallers, allAffectedTests)
+		virtualEdgeCount += vCount
 		result.ModifiedFunctions = append(result.ModifiedFunctions, fcg)
+	}
+
+	if virtualEdgeCount > 0 {
+		result.Warnings = append(result.Warnings,
+			fmt.Sprintf("CHA produced %d virtual (interface-dispatch) edges; these are over-approximations and may include infeasible targets", virtualEdgeCount))
 	}
 
 	// Calculate direct callers count
 	result.ImpactAnalysis.DirectCallers = len(allDirectCallers)
 
 	// Calculate transitive callers (excluding direct callers to avoid double-counting)
-	transitiveCallers := g.findTransitiveCallers(cg, prog, modifiedFuncs, 10)
+	transitiveCallers := g.findTransitiveCallers(cg, prog, ssaIndex, modifiedFuncs, 10)
 	result.ImpactAnalysis.TransitiveCallers = len(transitiveCallers) - result.ImpactAnalysis.DirectCallers
 	if result.ImpactAnalysis.TransitiveCallers < 0 {
 		result.ImpactAnalysis.TransitiveCallers = 0
@@ -214,13 +229,16 @@ func (g *GoAnalyzer) Analyze(modifiedFuncs []ModifiedFunction, timeBudgetSec int
 }
 
 // analyzeFunction analyzes a single function and returns its call graph.
+// The second return value is the number of virtual (interface-dispatch) edges
+// produced, used by the caller to emit a summary warning.
 func (g *GoAnalyzer) analyzeFunction(
 	prog *ssa.Program,
 	cg *callgraph.Graph,
+	ssaIndex map[string]*ssa.Function,
 	modFunc ModifiedFunction,
 	allDirectCallers map[string]bool,
 	allAffectedTests map[string]bool,
-) FunctionCallGraph {
+) (FunctionCallGraph, int) {
 	fcg := FunctionCallGraph{
 		Function:     modFunc.Name,
 		File:         modFunc.File,
@@ -229,17 +247,19 @@ func (g *GoAnalyzer) analyzeFunction(
 		TestCoverage: make([]TestCoverage, 0),
 	}
 
-	// Find the SSA function
-	ssaFunc := g.findSSAFunction(prog, modFunc)
+	// Find the SSA function via the prebuilt index.
+	ssaFunc := lookupSSAFunction(ssaIndex, prog, modFunc, g.workDir)
 	if ssaFunc == nil {
-		return fcg
+		return fcg, 0
 	}
 
 	// Get the call graph node for this function
 	node := cg.Nodes[ssaFunc]
 	if node == nil {
-		return fcg
+		return fcg, 0
 	}
+
+	virtualCount := 0
 
 	// Find callers (incoming edges)
 	for _, edge := range node.In {
@@ -266,6 +286,11 @@ func (g *GoAnalyzer) analyzeFunction(
 			line = pos.Line
 		}
 
+		isVirtual := isVirtualEdge(edge)
+		if isVirtual {
+			virtualCount++
+		}
+
 		// Track unique callers
 		callerKey := fmt.Sprintf("%s:%s", file, callerName)
 		allDirectCallers[callerKey] = true
@@ -281,10 +306,11 @@ func (g *GoAnalyzer) analyzeFunction(
 		}
 
 		fcg.Callers = append(fcg.Callers, CallInfo{
-			Function: callerName,
-			File:     file,
-			Line:     line,
-			CallSite: callSite,
+			Function:  callerName,
+			File:      file,
+			Line:      line,
+			CallSite:  callSite,
+			IsVirtual: isVirtual,
 		})
 	}
 
@@ -313,102 +339,149 @@ func (g *GoAnalyzer) analyzeFunction(
 			line = pos.Line
 		}
 
+		isVirtual := isVirtualEdge(edge)
+		if isVirtual {
+			virtualCount++
+		}
+
 		fcg.Callees = append(fcg.Callees, CallInfo{
-			Function: calleeName,
-			File:     file,
-			Line:     line,
-			CallSite: callSite,
+			Function:  calleeName,
+			File:      file,
+			Line:      line,
+			CallSite:  callSite,
+			IsVirtual: isVirtual,
 		})
 	}
 
-	return fcg
+	return fcg, virtualCount
 }
 
-// findSSAFunction locates the SSA function corresponding to a ModifiedFunction.
-func (g *GoAnalyzer) findSSAFunction(prog *ssa.Program, modFunc ModifiedFunction) *ssa.Function {
-	// Normalize the file path for comparison
-	targetFile := filepath.Clean(modFunc.File)
-	if !filepath.IsAbs(targetFile) && g.workDir != "" {
-		targetFile = filepath.Join(g.workDir, targetFile)
+// isVirtualEdge reports whether a call graph edge was produced by a dynamic
+// (interface) dispatch. CHA conservatively materialises every type that
+// satisfies the interface, so these edges are over-approximations rather than
+// guaranteed call targets.
+func isVirtualEdge(edge *callgraph.Edge) bool {
+	if edge == nil || edge.Site == nil {
+		return false
+	}
+	return edge.Site.Common().IsInvoke()
+}
+
+// buildSSAIndex enumerates all SSA functions (including methods) once and
+// indexes them by file + qualified name so subsequent lookups are O(1) rather
+// than the nested package/member/methodSet scan (see H19).
+//
+// Keys take two forms:
+//   - "<file>|<Receiver>.<Name>" for methods
+//   - "<file>|<Name>" for package-level functions
+//
+// Both pointer and value method sets are enumerated; both map to the same
+// underlying SSA function and are deduped by the map.
+func (g *GoAnalyzer) buildSSAIndex(prog *ssa.Program) map[string]*ssa.Function {
+	index := make(map[string]*ssa.Function)
+	if prog == nil {
+		return index
 	}
 
-	// Construct the expected function name
-	expectedName := modFunc.Name
-	if modFunc.Receiver != "" {
-		// Strip pointer indicator for matching
-		receiver := strings.TrimPrefix(modFunc.Receiver, "*")
-		expectedName = receiver + "." + modFunc.Name
+	addFn := func(fn *ssa.Function) {
+		if fn == nil {
+			return
+		}
+		name := fn.Name()
+		var file string
+		if fn.Pos().IsValid() {
+			file = filepath.Clean(prog.Fset.Position(fn.Pos()).Filename)
+		}
+		qualified := name
+		if recvType := safeReceiverTypeString(fn); recvType != "" {
+			if idx := strings.LastIndex(recvType, "."); idx >= 0 {
+				recvType = recvType[idx+1:]
+			}
+			recvType = strings.TrimPrefix(recvType, "*")
+			qualified = recvType + "." + name
+		}
+		// Index by both (file, qualified) and (file, bare name) so callers
+		// that do not know the receiver can still find the function.
+		index[file+"|"+qualified] = fn
+		if qualified != name {
+			if _, ok := index[file+"|"+name]; !ok {
+				index[file+"|"+name] = fn
+			}
+		}
 	}
 
-	// Search all packages for the function
 	for _, pkg := range prog.AllPackages() {
 		if pkg == nil {
 			continue
 		}
-
-		// Check package-level functions
 		for _, member := range pkg.Members {
-			if fn, ok := member.(*ssa.Function); ok {
-				if g.functionMatches(prog.Fset, fn, expectedName, targetFile, modFunc.Receiver) {
-					return fn
+			switch m := member.(type) {
+			case *ssa.Function:
+				addFn(m)
+			case *ssa.Type:
+				mset := prog.MethodSets.MethodSet(m.Type())
+				for i := 0; i < mset.Len(); i++ {
+					addFn(prog.MethodValue(mset.At(i)))
+				}
+				pset := prog.MethodSets.MethodSet(types.NewPointer(m.Type()))
+				for i := 0; i < pset.Len(); i++ {
+					addFn(prog.MethodValue(pset.At(i)))
 				}
 			}
+		}
+	}
 
-			// Check methods on types
-			if t, ok := member.(*ssa.Type); ok {
-				// Get methods of the named type
-				for i := 0; i < prog.MethodSets.MethodSet(t.Type()).Len(); i++ {
-					sel := prog.MethodSets.MethodSet(t.Type()).At(i)
-					fn := prog.MethodValue(sel)
-					if fn != nil && g.functionMatches(prog.Fset, fn, expectedName, targetFile, modFunc.Receiver) {
-						return fn
-					}
-				}
+	return index
+}
 
-				// Also check pointer methods
-				ptrType := prog.MethodSets.MethodSet(types.NewPointer(t.Type()))
-				for i := 0; i < ptrType.Len(); i++ {
-					sel := ptrType.At(i)
-					fn := prog.MethodValue(sel)
-					if fn != nil && g.functionMatches(prog.Fset, fn, expectedName, targetFile, modFunc.Receiver) {
-						return fn
-					}
-				}
+// lookupSSAFunction resolves a ModifiedFunction to its SSA representation using
+// the prebuilt index. It falls back to a filename-suffix scan only when the
+// exact (file, name) key is absent.
+func lookupSSAFunction(index map[string]*ssa.Function, prog *ssa.Program, modFunc ModifiedFunction, workDir string) *ssa.Function {
+	expectedName := modFunc.Name
+	if modFunc.Receiver != "" {
+		receiver := strings.TrimPrefix(modFunc.Receiver, "*")
+		expectedName = receiver + "." + modFunc.Name
+	}
+
+	targetFile := filepath.Clean(modFunc.File)
+	if !filepath.IsAbs(targetFile) {
+		base := workDir
+		if base == "" {
+			if cwd, err := os.Getwd(); err == nil {
+				base = cwd
 			}
+		}
+		if base != "" {
+			targetFile = filepath.Clean(filepath.Join(base, modFunc.File))
+		}
+	}
+
+	if fn, ok := index[targetFile+"|"+expectedName]; ok {
+		return fn
+	}
+	if fn, ok := index[targetFile+"|"+modFunc.Name]; ok {
+		return fn
+	}
+
+	// Fallback: if the caller provided a non-absolute or non-matching path,
+	// accept any indexed function whose file path ends with the target.
+	base := filepath.Base(modFunc.File)
+	for key, fn := range index {
+		sep := strings.Index(key, "|")
+		if sep < 0 {
+			continue
+		}
+		file, name := key[:sep], key[sep+1:]
+		if name != expectedName && name != modFunc.Name {
+			continue
+		}
+		if strings.HasSuffix(file, modFunc.File) || filepath.Base(file) == base {
+			return fn
 		}
 	}
 
 	return nil
-}
-
-// functionMatches checks if an SSA function matches the expected name and file.
-func (g *GoAnalyzer) functionMatches(fset *token.FileSet, fn *ssa.Function, expectedName, targetFile, receiver string) bool {
-	// Build the full name for comparison
-	fnName := fn.Name()
-	if recvType := safeReceiverTypeString(fn); recvType != "" {
-		// Extract just the type name without package path
-		if idx := strings.LastIndex(recvType, "."); idx >= 0 {
-			recvType = recvType[idx+1:]
-		}
-		recvType = strings.TrimPrefix(recvType, "*")
-		fnName = recvType + "." + fn.Name()
-	}
-
-	// Check name match
-	if fnName != expectedName && fn.Name() != expectedName {
-		// Also try without receiver for simple function matching
-		return false
-	}
-
-	// Check file match if we have position info
-	if fn.Pos().IsValid() {
-		fnFile := filepath.Clean(fset.Position(fn.Pos()).Filename)
-		if fnFile != targetFile && !strings.HasSuffix(fnFile, targetFile) && !strings.HasSuffix(targetFile, filepath.Base(fnFile)) {
-			return false
-		}
-	}
-
-	return true
 }
 
 // isTestFunction checks if a function name indicates a test function.
@@ -442,6 +515,7 @@ func isTestFunction(name string) bool {
 func (g *GoAnalyzer) findTransitiveCallers(
 	cg *callgraph.Graph,
 	prog *ssa.Program,
+	ssaIndex map[string]*ssa.Function,
 	modifiedFuncs []ModifiedFunction,
 	maxDepth int,
 ) map[string]bool {
@@ -450,7 +524,7 @@ func (g *GoAnalyzer) findTransitiveCallers(
 	// Start with all modified functions
 	var startNodes []*callgraph.Node
 	for _, modFunc := range modifiedFuncs {
-		ssaFunc := g.findSSAFunction(prog, modFunc)
+		ssaFunc := lookupSSAFunction(ssaIndex, prog, modFunc, g.workDir)
 		if ssaFunc == nil {
 			continue
 		}
@@ -536,7 +610,60 @@ func formatSSAFunctionName(fn *ssa.Function) string {
 		name = recvType + "." + name
 	}
 
+	// Anonymous closures have SSA-synthesized names like "main$1" or
+	// "funcN" that carry no meaning for reviewers. Qualify them with the
+	// enclosing function so they are at least attributable.
+	if parent := fn.Parent(); parent != nil {
+		shortName := fn.Name()
+		if isAnonymousSSAName(shortName) {
+			parentName := parent.Name()
+			if parentRecv := safeReceiverTypeString(parent); parentRecv != "" {
+				parentName = parentRecv + "." + parentName
+			}
+			name = parentName + ".<closure:" + shortName + ">"
+		}
+	}
+
 	return name
+}
+
+// isAnonymousSSAName reports whether an SSA function name looks auto-generated
+// (e.g. "func1", "func12", or the "$N" suffix produced by the ssa package).
+func isAnonymousSSAName(name string) bool {
+	if name == "" {
+		return true
+	}
+	if strings.HasPrefix(name, "func") {
+		digits := name[len("func"):]
+		if digits != "" {
+			allDigits := true
+			for _, r := range digits {
+				if r < '0' || r > '9' {
+					allDigits = false
+					break
+				}
+			}
+			if allDigits {
+				return true
+			}
+		}
+	}
+	if idx := strings.LastIndex(name, "$"); idx >= 0 {
+		tail := name[idx+1:]
+		if tail != "" {
+			allDigits := true
+			for _, r := range tail {
+				if r < '0' || r > '9' {
+					allDigits = false
+					break
+				}
+			}
+			if allDigits {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func safeReceiverTypeString(fn *ssa.Function) string {

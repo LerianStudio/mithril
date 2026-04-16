@@ -64,15 +64,10 @@ var defaultAllowlist = []string{
 
 // Build returns a sanitized subprocess environment using an allowlist.
 // LC_ALL is always forced to C for stable tool output.
-func Build(extraKeys ...string) []string {
-	allowlist := make(map[string]struct{}, len(defaultAllowlist)+len(extraKeys))
+func Build() []string {
+	allowlist := make(map[string]struct{}, len(defaultAllowlist))
 	for _, key := range defaultAllowlist {
 		allowlist[key] = struct{}{}
-	}
-	for _, key := range extraKeys {
-		if key != "" {
-			allowlist[key] = struct{}{}
-		}
 	}
 
 	envMap := map[string]string{"LC_ALL": "C"}

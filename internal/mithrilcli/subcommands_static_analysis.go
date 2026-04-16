@@ -23,6 +23,8 @@ func runStaticAnalysis(args []string, stdout io.Writer, stderr io.Writer) error 
 	verbose := fs.Bool("v", false, "Verbose output")
 	fs.BoolVar(verbose, "verbose", false, "Verbose output")
 	timeout := fs.Duration("timeout", 5*time.Minute, "Timeout for analysis")
+	perLinterTimeout := fs.Duration("linter-timeout", lint.DefaultPerLinterTimeout, "Per-linter timeout")
+	maxConcurrency := fs.Int("linter-concurrency", lint.DefaultMaxConcurrency, "Max concurrent linters")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return nil
@@ -56,23 +58,24 @@ func runStaticAnalysis(args []string, stdout io.Writer, stderr io.Writer) error 
 	registry := lint.NewRegistry()
 	registerLinters(registry)
 	linters := selectAvailableLinters(ctx, registry, lang, s)
-	aggregateResult := lint.NewResult()
-	changedFiles := s.GetAllFilesMap()
+	changedFiles := s.GetAnalyzableFilesMap()
 
+	allFiles := s.GetAnalyzableFiles()
+	packages := s.GetPackages()
+	inputs := make([]lint.RunnerInput, 0, len(linters))
 	for _, linter := range linters {
-		targets := selectTargets(linter, lang, s)
-		result, runErr := linter.Run(ctx, projectDir, targets)
-		if runErr != nil {
-			aggregateResult.Errors = append(aggregateResult.Errors, fmt.Sprintf("%s: %v", linter.Name(), runErr))
-			continue
-		}
-		if result == nil {
-			continue
-		}
-		aggregateResult.Merge(result.FilterByFiles(changedFiles))
+		inputs = append(inputs, lint.RunnerInput{
+			Linter:  linter,
+			Targets: lint.SelectTargets(linter, allFiles, packages),
+		})
 	}
 
-	deduplicateFindings(aggregateResult)
+	runner := lint.NewRunner()
+	runner.PerLinterTimeout = *perLinterTimeout
+	runner.MaxConcurrency = *maxConcurrency
+	aggregateResult := runner.Run(ctx, projectDir, inputs, changedFiles)
+
+	lint.Deduplicate(aggregateResult)
 	writer := output.NewLintWriter(*outputPath)
 	if err := writer.EnsureDir(); err != nil {
 		return fmt.Errorf("failed to create output directory: %w", err)
@@ -115,35 +118,6 @@ func registerLinters(r *lint.Registry) {
 	r.Register(lint.NewBandit())
 }
 
-func selectTargets(linter lint.Linter, lang lint.Language, s *scope.ScopeJSON) []string {
-	if selector, ok := linter.(lint.TargetSelector); ok {
-		switch selector.TargetKind() {
-		case lint.TargetKindPackages:
-			if pkgs := s.GetPackages(); len(pkgs) > 0 {
-				return pkgs
-			}
-			return nil
-		case lint.TargetKindFiles:
-			if files := s.GetAllFiles(); len(files) > 0 {
-				return files
-			}
-			return nil
-		case lint.TargetKindProject:
-			return nil
-		}
-	}
-	if lang == lint.LanguageGo {
-		if pkgs := s.GetPackages(); len(pkgs) > 0 {
-			return pkgs
-		}
-		return nil
-	}
-	if files := s.GetAllFiles(); len(files) > 0 {
-		return files
-	}
-	return nil
-}
-
 func selectAvailableLinters(ctx context.Context, registry *lint.Registry, lang lint.Language, s *scope.ScopeJSON) []lint.Linter {
 	if lang != lint.LanguageMixed {
 		return registry.GetAvailableLinters(ctx, lang)
@@ -168,55 +142,4 @@ func selectAvailableLinters(ctx context.Context, registry *lint.Registry, lang l
 		}
 	}
 	return linters
-}
-
-func deduplicateFindings(result *lint.Result) {
-	seen := make(map[string]int)
-	unique := make([]lint.Finding, 0)
-	result.Summary = lint.Summary{}
-
-	for _, f := range result.Findings {
-		key := fmt.Sprintf("%s:%d:%s", f.File, f.Line, f.Message)
-		idx, exists := seen[key]
-		if !exists {
-			seen[key] = len(unique)
-			unique = append(unique, f)
-			continue
-		}
-		if severityRank(f.Severity) > severityRank(unique[idx].Severity) {
-			unique[idx] = f
-		}
-	}
-
-	for _, f := range unique {
-		switch f.Severity {
-		case lint.SeverityCritical:
-			result.Summary.Critical++
-		case lint.SeverityHigh:
-			result.Summary.High++
-		case lint.SeverityWarning:
-			result.Summary.Warning++
-		case lint.SeverityInfo:
-			result.Summary.Info++
-		default:
-			result.Summary.Unknown++
-			result.Errors = append(result.Errors, fmt.Sprintf("unknown severity %q for finding %s:%d (%s)", f.Severity, f.File, f.Line, f.Message))
-		}
-	}
-	result.Findings = unique
-}
-
-func severityRank(severity lint.Severity) int {
-	switch severity {
-	case lint.SeverityCritical:
-		return 4
-	case lint.SeverityHigh:
-		return 3
-	case lint.SeverityWarning:
-		return 2
-	case lint.SeverityInfo:
-		return 1
-	default:
-		return 0
-	}
 }

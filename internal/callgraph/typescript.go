@@ -1,21 +1,17 @@
 package callgraph
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strings"
 	"time"
 
 	"github.com/lerianstudio/mithril/internal/fileutil"
-	"github.com/lerianstudio/mithril/internal/procenv"
 )
 
 // validTypeScriptIdentifier is a regex pattern for valid TypeScript identifiers.
@@ -24,9 +20,8 @@ var validTypeScriptIdentifier = regexp.MustCompile(`^[a-zA-Z_$][a-zA-Z0-9_$]*(\.
 
 // Resource protection limits for TypeScript analysis.
 const (
-	tsMaxModifiedFunctions = 500              // Maximum number of modified functions to analyze
-	tsDefaultTimeBudgetSec = 120              // Default time budget when not specified
-	tsMaxOutputSize        = 50 * 1024 * 1024 // 50MB limit for subprocess output
+	tsMaxModifiedFunctions = 500 // Maximum number of modified functions to analyze
+	tsDefaultTimeBudgetSec = 120 // Default time budget when not specified
 )
 
 // TypeScriptAnalyzer implements call graph analysis for TypeScript code.
@@ -50,41 +45,7 @@ func NewTypeScriptAnalyzer(workDir string) *TypeScriptAnalyzer {
 
 // sanitizeFilePaths validates file paths to prevent command injection and traversal.
 func (t *TypeScriptAnalyzer) sanitizeFilePaths(files []string) ([]string, error) {
-	absWorkDir, err := filepath.Abs(t.workDir)
-	if err != nil {
-		return nil, fmt.Errorf("failed to resolve workDir: %w", err)
-	}
-	realWorkDir, err := filepath.EvalSymlinks(absWorkDir)
-	if err != nil {
-		return nil, fmt.Errorf("failed to resolve workDir symlinks: %w", err)
-	}
-
-	var sanitized []string
-	for _, f := range files {
-		if strings.HasPrefix(f, "-") {
-			return nil, fmt.Errorf("invalid file path (starts with dash): %s", f)
-		}
-		if strings.ContainsRune(f, '\x00') {
-			return nil, fmt.Errorf("invalid file path (contains null byte)")
-		}
-
-		absPath, absErr := filepath.Abs(f)
-		if absErr != nil {
-			return nil, fmt.Errorf("invalid file path (cannot resolve): %s", f)
-		}
-
-		realPath, evalErr := filepath.EvalSymlinks(absPath)
-		if evalErr != nil {
-			return nil, fmt.Errorf("invalid file path (cannot resolve symlinks): %s", f)
-		}
-
-		if !strings.HasPrefix(realPath, realWorkDir+string(filepath.Separator)) && realPath != realWorkDir {
-			return nil, fmt.Errorf("invalid file path (outside work directory): %s", f)
-		}
-
-		sanitized = append(sanitized, f)
-	}
-	return sanitized, nil
+	return sanitizeHelperFilePaths(t.workDir, files)
 }
 
 // sanitizeFunctionNames validates function names to prevent argument injection.
@@ -151,15 +112,6 @@ type tsHelperCaller struct {
 	Line     int    `json:"line"`
 }
 
-type tsHelperOutputTooLargeError struct {
-	size  int
-	limit int
-}
-
-func (e *tsHelperOutputTooLargeError) Error() string {
-	return fmt.Sprintf("helper output exceeds size limit (%d > %d bytes)", e.size, e.limit)
-}
-
 // Analyze implements the Analyzer interface for TypeScript code.
 func (t *TypeScriptAnalyzer) Analyze(modifiedFuncs []ModifiedFunction, timeBudgetSec int) (*CallGraphResult, error) {
 	result := &CallGraphResult{
@@ -221,43 +173,25 @@ func (t *TypeScriptAnalyzer) Analyze(modifiedFuncs []ModifiedFunction, timeBudge
 		return runFallback(ctx, modifiedFuncs, result)
 	}
 
+	// TypeScript dynamic dispatch patterns (prototype mutation, runtime
+	// monkey-patching, dynamically-indexed method access such as obj[name]())
+	// cannot be fully resolved by static analysis; emit a single advisory
+	// warning so consumers treat the graph as a lower bound (see H15).
+	result.Warnings = append(result.Warnings,
+		"TypeScript dynamic dispatch (prototype mutation, monkey-patching, dynamic property access) is not tracked; call graph is a lower bound.")
+
 	// Process helper results
 	return processHelper(helperResult, modifiedFuncs, result)
 }
 
 // getAffectedPackages extracts unique package paths from modified functions.
 func (t *TypeScriptAnalyzer) getAffectedPackages(funcs []ModifiedFunction) []string {
-	seen := make(map[string]bool)
-	var result []string
-
-	for _, fn := range funcs {
-		pkg := fn.Package
-		if pkg == "" {
-			// Extract package from file path
-			pkg = filepath.Dir(fn.File)
-		}
-		if pkg != "" && !seen[pkg] {
-			seen[pkg] = true
-			result = append(result, pkg)
-		}
-	}
-
-	return result
+	return affectedPackages(funcs)
 }
 
 // collectUniqueFiles returns unique file paths from modified functions.
 func (t *TypeScriptAnalyzer) collectUniqueFiles(funcs []ModifiedFunction) []string {
-	seen := make(map[string]bool)
-	var files []string
-
-	for _, fn := range funcs {
-		if fn.File != "" && !seen[fn.File] {
-			seen[fn.File] = true
-			files = append(files, fn.File)
-		}
-	}
-
-	return files
+	return collectUniqueFiles(funcs)
 }
 
 // analyzeWithTSHelper uses the Node.js TypeScript helper for detailed analysis.
@@ -312,7 +246,7 @@ func (t *TypeScriptAnalyzer) analyzeWithTSHelper(ctx context.Context, files []st
 		output, err = t.runHelperCommandWithLimit(ctx, "node", args)
 	}
 	if err != nil {
-		var tooLarge *tsHelperOutputTooLargeError
+		var tooLarge *outputTooLargeError
 		if errors.As(err, &tooLarge) {
 			return nil, err
 		}
@@ -357,45 +291,7 @@ func (t *TypeScriptAnalyzer) analyzeWithTSHelper(ctx context.Context, files []st
 }
 
 func (t *TypeScriptAnalyzer) runHelperCommandWithLimit(ctx context.Context, command string, args []string) ([]byte, error) {
-	cmd := exec.CommandContext(ctx, command, args...) // #nosec G204 - args sanitized
-	cmd.Env = procenv.Build()
-	cmd.Dir = t.workDir
-
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		return nil, fmt.Errorf("failed to create stdout pipe: %w", err)
-	}
-
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
-
-	if err := cmd.Start(); err != nil {
-		return nil, err
-	}
-
-	output, readErr := io.ReadAll(io.LimitReader(stdout, tsMaxOutputSize+1))
-	if readErr != nil {
-		_ = cmd.Wait()
-		return nil, fmt.Errorf("failed to read helper output: %w", readErr)
-	}
-
-	if len(output) > tsMaxOutputSize {
-		if cmd.Process != nil {
-			_ = cmd.Process.Kill()
-		}
-		_ = cmd.Wait()
-		return nil, &tsHelperOutputTooLargeError{size: len(output), limit: tsMaxOutputSize}
-	}
-
-	waitErr := cmd.Wait()
-	if exitErr, ok := waitErr.(*exec.ExitError); ok {
-		exitErr.Stderr = stderr.Bytes()
-	}
-	if waitErr != nil {
-		return nil, waitErr
-	}
-
-	return output, nil
+	return runHelperCommand(ctx, t.workDir, command, args)
 }
 
 // findHelperScript locates the call-graph.ts helper script.

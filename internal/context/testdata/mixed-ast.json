@@ -1,0 +1,96 @@
+[
+  {
+    "language": "go",
+    "file_path": "internal/handler/user.go",
+    "functions": [
+      {
+        "name": "GetUser",
+        "change_type": "modified",
+        "before": {
+          "params": [{"name": "id", "type": "int"}],
+          "returns": ["User", "error"],
+          "is_exported": true,
+          "start_line": 10,
+          "end_line": 20
+        },
+        "after": {
+          "params": [{"name": "ctx", "type": "context.Context"}, {"name": "id", "type": "int"}],
+          "returns": ["User", "error"],
+          "is_exported": true,
+          "start_line": 10,
+          "end_line": 22
+        },
+        "body_diff": "+ctx propagated"
+      },
+      {
+        "name": "DeleteUser",
+        "change_type": "added",
+        "after": {
+          "params": [{"name": "id", "type": "int"}],
+          "returns": ["error"],
+          "is_exported": true,
+          "start_line": 24,
+          "end_line": 30
+        }
+      }
+    ],
+    "types": [
+      {
+        "name": "User",
+        "kind": "struct",
+        "change_type": "modified",
+        "fields": [
+          {"name": "Email", "change_type": "added", "new_type": "string"}
+        ],
+        "start_line": 1,
+        "end_line": 8
+      }
+    ],
+    "imports": [
+      {"path": "context", "change_type": "added"}
+    ],
+    "summary": {
+      "functions_added": 1,
+      "functions_removed": 0,
+      "functions_modified": 1,
+      "types_added": 0,
+      "types_removed": 0,
+      "types_modified": 1,
+      "variables_added": 0,
+      "variables_removed": 0,
+      "variables_modified": 0,
+      "imports_added": 1
+    }
+  },
+  {
+    "language": "python",
+    "file_path": "app/service.py",
+    "functions": [
+      {
+        "name": "compute",
+        "change_type": "added",
+        "after": {
+          "params": [{"name": "data", "type": "dict"}],
+          "returns": ["int"],
+          "is_exported": true,
+          "start_line": 5,
+          "end_line": 12
+        }
+      }
+    ],
+    "types": [],
+    "imports": [],
+    "summary": {
+      "functions_added": 1,
+      "functions_removed": 0,
+      "functions_modified": 0,
+      "types_added": 0,
+      "types_removed": 0,
+      "types_modified": 0,
+      "variables_added": 0,
+      "variables_removed": 0,
+      "variables_modified": 0,
+      "imports_added": 0
+    }
+  }
+]

@@ -5,6 +5,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/lerianstudio/mithril/internal/testutil"
 )
 
 func TestPythonAnalyzerFilterFiles(t *testing.T) {
@@ -43,6 +45,7 @@ func TestPythonAnalyzerConstructors(t *testing.T) {
 }
 
 func TestTypeScriptWrapperUsesTypeScriptLanguageArgument(t *testing.T) {
+	testutil.RequirePython3(t)
 	tempDir := t.TempDir()
 	scriptPath := filepath.Join(tempDir, "inspect_lang.py")
 	script := `import json
@@ -90,6 +93,7 @@ func TestPythonAnalyzerRunScript_NoMatchingFiles(t *testing.T) {
 }
 
 func TestPythonAnalyzerWrappers_CallScriptAndParse(t *testing.T) {
+	testutil.RequirePython3(t)
 	tempDir := t.TempDir()
 	scriptPath := filepath.Join(tempDir, "mock_data_flow.py")
 
@@ -151,6 +155,7 @@ print(json.dumps({
 }
 
 func TestPythonAnalyzerRunScript_PropagatesScriptErrors(t *testing.T) {
+	testutil.RequirePython3(t)
 	tempDir := t.TempDir()
 	scriptPath := filepath.Join(tempDir, "error_script.py")
 	script := `import sys
@@ -177,6 +182,7 @@ raise SystemExit(1)
 }
 
 func TestPythonAnalyzerRunScript_InvalidJSON(t *testing.T) {
+	testutil.RequirePython3(t)
 	tempDir := t.TempDir()
 	scriptPath := filepath.Join(tempDir, "invalid_json.py")
 	script := `print("not-json")

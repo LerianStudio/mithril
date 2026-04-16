@@ -17,6 +17,12 @@ import (
 // DefaultTimeout is the default timeout for linter execution.
 const DefaultTimeout = 5 * time.Minute
 
+// maxLinterOutputBytes caps stdout+stderr per linter invocation to prevent
+// unbounded memory growth if a tool goes berserk (e.g. staticcheck on a
+// generated file producing one diagnostic per line for millions of lines).
+// 50 MB matches the subprocess caps used elsewhere in the pipeline.
+const maxLinterOutputBytes = 50 * 1024 * 1024
+
 // ExecResult holds the result of command execution.
 type ExecResult struct {
 	Stdout   []byte
@@ -103,8 +109,9 @@ func (e *Executor) Run(ctx context.Context, dir string, name string, args ...str
 	configureProcessGroup(cmd)
 
 	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
+	budget := &outputBudget{remaining: maxLinterOutputBytes}
+	cmd.Stdout = &cappedWriter{w: &stdout, budget: budget}
+	cmd.Stderr = &cappedWriter{w: &stderr, budget: budget}
 
 	if err := cmd.Start(); err != nil {
 		return &ExecResult{Err: err}
@@ -145,6 +152,43 @@ func (e *Executor) Run(ctx context.Context, dir string, name string, args ...str
 	}
 
 	return result
+}
+
+// outputBudget holds a shared byte budget across stdout and stderr writers so
+// the combined output is capped, not each stream independently.
+type outputBudget struct {
+	mu        sync.Mutex
+	remaining int
+}
+
+// cappedWriter bounds the number of bytes forwarded to the underlying writer
+// so a runaway linter cannot exhaust memory. Writes past the shared budget are
+// silently discarded; the child process still sees a successful write to avoid
+// SIGPIPE.
+type cappedWriter struct {
+	w      *bytes.Buffer
+	budget *outputBudget
+}
+
+func (c *cappedWriter) Write(p []byte) (int, error) {
+	c.budget.mu.Lock()
+	remaining := c.budget.remaining
+	if remaining <= 0 {
+		c.budget.mu.Unlock()
+		// Pretend the full write succeeded so the child process doesn't
+		// get SIGPIPE from stdout; we just drop the overflow.
+		return len(p), nil
+	}
+	n := len(p)
+	toWrite := n
+	if toWrite > remaining {
+		toWrite = remaining
+	}
+	c.budget.remaining -= toWrite
+	c.budget.mu.Unlock()
+
+	_, err := c.w.Write(p[:toWrite])
+	return n, err
 }
 
 // CommandAvailable checks if a command is available in PATH.

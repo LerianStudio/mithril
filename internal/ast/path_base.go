@@ -24,14 +24,27 @@ func deriveBaseDir(paths ...string) string {
 	}
 
 	baseDir := filepath.Dir(absPaths[0])
+	climbedToRoot := false
 	for _, p := range absPaths[1:] {
 		for !isPathWithinBase(p, baseDir) {
 			parent := filepath.Dir(baseDir)
 			if parent == baseDir {
+				climbedToRoot = true
 				break
 			}
 			baseDir = parent
 		}
+	}
+
+	// If the multi-path LCA climb reached filesystem root, the inputs are
+	// genuinely disjoint and a root-wide base is not a meaningful sandbox.
+	// Fall back to cwd so
+	// downstream validators still enforce some containment.
+	if climbedToRoot && isFilesystemRoot(baseDir) {
+		if cwd, err := os.Getwd(); err == nil {
+			return cwd
+		}
+		return "."
 	}
 
 	for {
@@ -46,6 +59,11 @@ func deriveBaseDir(paths ...string) string {
 		}
 		baseDir = parent
 	}
+}
+
+func isFilesystemRoot(p string) bool {
+	parent := filepath.Dir(p)
+	return parent == p
 }
 
 func isPathWithinBase(path, base string) bool {

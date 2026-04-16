@@ -539,14 +539,15 @@ class TestParseArgs(unittest.TestCase):
 
     def test_files_only(self):
         """Test parsing with only file arguments."""
-        files, functions = parse_args(["file1.py", "file2.py"])
+        files, functions, base_dir = parse_args(["file1.py", "file2.py"])
 
         self.assertEqual(files, ["file1.py", "file2.py"])
         self.assertEqual(functions, [])
+        self.assertEqual(base_dir, "")
 
     def test_with_functions_flag(self):
         """Test parsing with --functions flag."""
-        files, functions = parse_args(
+        files, functions, _ = parse_args(
             ["file.py", "--functions", "func1,func2"]
         )
 
@@ -555,7 +556,7 @@ class TestParseArgs(unittest.TestCase):
 
     def test_functions_with_spaces(self):
         """Test parsing functions with spaces around commas."""
-        _files, functions = parse_args(
+        _files, functions, _ = parse_args(
             ["file.py", "--functions", "func1, func2, func3"]
         )
 
@@ -563,10 +564,40 @@ class TestParseArgs(unittest.TestCase):
 
     def test_empty_args(self):
         """Test parsing empty arguments."""
-        files, functions = parse_args([])
+        files, functions, base_dir = parse_args([])
 
         self.assertEqual(files, [])
         self.assertEqual(functions, [])
+        self.assertEqual(base_dir, "")
+
+    def test_base_dir_flag(self):
+        """Test parsing --base-dir flag."""
+        files, _, base_dir = parse_args(
+            ["a.py", "--base-dir", "/tmp/sandbox"]
+        )
+        self.assertEqual(files, ["a.py"])
+        self.assertEqual(base_dir, "/tmp/sandbox")
+
+
+class TestSandboxPath(unittest.TestCase):
+    """Tests for sandbox_path() in call_graph.py."""
+
+    def test_rejects_path_outside_base_dir(self):
+        from call_graph import sandbox_path
+        with tempfile.TemporaryDirectory() as base:
+            with tempfile.TemporaryDirectory() as outside:
+                outside_file = os.path.join(outside, "x.py")
+                open(outside_file, "w").close()
+                self.assertIsNone(sandbox_path(outside_file, base))
+
+    def test_allows_path_inside_base_dir(self):
+        from call_graph import sandbox_path
+        with tempfile.TemporaryDirectory() as base:
+            inside = os.path.join(base, "x.py")
+            open(inside, "w").close()
+            resolved = sandbox_path(inside, base)
+            self.assertIsNotNone(resolved)
+            self.assertTrue(resolved.startswith(os.path.realpath(base)))
 
 
 class TestBuildCallerMap(unittest.TestCase):

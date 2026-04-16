@@ -3,7 +3,6 @@ package lint
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"path/filepath"
 	"strings"
 )
@@ -79,12 +78,7 @@ func (g *GolangciLint) Run(ctx context.Context, projectDir string, packages []st
 	if versionFn == nil {
 		versionFn = g.Version
 	}
-	version, err := versionFn(ctx)
-	if err != nil {
-		result.Errors = append(result.Errors, fmt.Sprintf("golangci-lint version check failed: %v", err))
-	} else {
-		result.ToolVersions["golangci-lint"] = version
-	}
+	recordToolVersion(ctx, result, "golangci-lint", versionFn)
 
 	// Build arguments
 	args := []string{
@@ -95,8 +89,7 @@ func (g *GolangciLint) Run(ctx context.Context, projectDir string, packages []st
 
 	// Add packages to analyze
 	if len(packages) > 0 {
-		if err := validateTargetArgs(packages); err != nil {
-			result.Errors = append(result.Errors, fmt.Sprintf("golangci-lint target validation failed: %v", err))
+		if !appendValidationError(result, "golangci-lint", packages) {
 			return result, nil
 		}
 		args = append(args, packages...)
@@ -107,7 +100,7 @@ func (g *GolangciLint) Run(ctx context.Context, projectDir string, packages []st
 
 	execResult := g.executor.Run(ctx, projectDir, "golangci-lint", args...)
 	if execResult.Err != nil {
-		result.Errors = append(result.Errors, fmt.Sprintf("golangci-lint execution failed: %v", execResult.Err))
+		appendExecError(result, "golangci-lint", execResult.Err)
 		return result, nil
 	}
 
@@ -119,8 +112,7 @@ func (g *GolangciLint) Run(ctx context.Context, projectDir string, packages []st
 	// Parse JSON output
 	var output golangciLintOutput
 	if err := json.Unmarshal([]byte(trimmed), &output); err != nil {
-		// Try to parse partial output
-		result.Errors = append(result.Errors, fmt.Sprintf("golangci-lint output parse warning: %v", err))
+		appendParseError(result, "golangci-lint", err)
 		return result, nil
 	}
 

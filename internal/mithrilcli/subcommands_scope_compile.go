@@ -105,6 +105,9 @@ func runScopeDetector(args []string, stdout io.Writer, stderr io.Writer) error {
 	}
 
 	detector := scope.NewDetector(wd)
+	detector.SetLogger(func(format string, args ...any) {
+		_, _ = fmt.Fprintf(stderr, format+"\n", args...)
+	})
 	patterns, patternsErr := resolveFilePatterns(*filesFlag, *filesFrom)
 	if patternsErr != nil {
 		return patternsErr

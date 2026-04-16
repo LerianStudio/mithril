@@ -2,16 +2,15 @@ package ast
 
 import (
 	"context"
+	"go/ast"
+	"go/token"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
-	"sync"
 	"testing"
 	"unicode/utf8"
 )
-
-var workingDirMu sync.Mutex
 
 func codereviewRoot(t *testing.T) string {
 	t.Helper()
@@ -30,31 +29,20 @@ func codereviewRoot(t *testing.T) string {
 	return absRoot
 }
 
-func setWorkingDir(t *testing.T, dir string) {
+// chdirForTest changes the test's working directory to dir using t.Chdir
+// (Go 1.24+), which restores the original cwd when the test ends and panics
+// if t.Parallel() has been called — replacing the previous global mutex +
+// manual os.Chdir dance that could leak cwd on panic.
+func chdirForTest(t *testing.T, dir string) {
 	t.Helper()
-	workingDirMu.Lock()
-	cwd, err := os.Getwd()
-	if err != nil {
-		workingDirMu.Unlock()
-		t.Fatalf("failed to get working directory: %v", err)
-	}
-	if err := os.Chdir(dir); err != nil {
-		workingDirMu.Unlock()
-		t.Fatalf("failed to change directory: %v", err)
-	}
-	t.Cleanup(func() {
-		if err := os.Chdir(cwd); err != nil {
-			t.Errorf("failed to restore working directory: %v", err)
-		}
-		workingDirMu.Unlock()
-	})
+	t.Chdir(dir)
 }
 
 func TestGoExtractor_ExtractDiff(t *testing.T) {
 	extractor := NewGoExtractor()
 
 	root := codereviewRoot(t)
-	setWorkingDir(t, root)
+	chdirForTest(t, root)
 	beforePath := filepath.Join("testdata", "go", "before.go")
 	afterPath := filepath.Join("testdata", "go", "after.go")
 
@@ -158,7 +146,7 @@ func TestGoExtractor_NewFile(t *testing.T) {
 	extractor := NewGoExtractor()
 
 	root := codereviewRoot(t)
-	setWorkingDir(t, root)
+	chdirForTest(t, root)
 	afterPath := filepath.Join("testdata", "go", "after.go")
 
 	diff, err := extractor.ExtractDiff(context.Background(), "", afterPath)
@@ -182,7 +170,7 @@ func TestGoExtractor_DeletedFile(t *testing.T) {
 	extractor := NewGoExtractor()
 
 	root := codereviewRoot(t)
-	setWorkingDir(t, root)
+	chdirForTest(t, root)
 	beforePath := filepath.Join("testdata", "go", "before.go")
 
 	diff, err := extractor.ExtractDiff(context.Background(), beforePath, "")
@@ -250,7 +238,7 @@ func main() {
 		t.Fatalf("failed to write file: %v", err)
 	}
 
-	setWorkingDir(t, filepath.Dir(path))
+	chdirForTest(t, filepath.Dir(path))
 	diff, err := extractor.ExtractDiff(context.Background(), "", path)
 	if err != nil {
 		t.Fatalf("ExtractDiff failed: %v", err)
@@ -280,7 +268,7 @@ func TestGoExtractor_ParseFile_RejectsOversizedFile(t *testing.T) {
 		t.Fatalf("failed to write oversized file: %v", err)
 	}
 
-	setWorkingDir(t, filepath.Dir(path))
+	chdirForTest(t, filepath.Dir(path))
 	_, err := extractor.parseFile(path)
 	if err == nil {
 		t.Fatal("expected oversized file to be rejected")
@@ -321,7 +309,7 @@ func greet(name string) string {
 		t.Fatalf("failed to write file: %v", err)
 	}
 
-	setWorkingDir(t, filepath.Dir(path))
+	chdirForTest(t, filepath.Dir(path))
 	parsed, err := extractor.parseFile(path)
 	if err != nil {
 		t.Fatalf("parseFile failed: %v", err)
@@ -342,4 +330,144 @@ func greet(name string) string {
 	if utf8.RuneCountInString(fn.BodyHash) != 64 {
 		t.Fatalf("expected 64 runes in hash, got %d", utf8.RuneCountInString(fn.BodyHash))
 	}
+}
+
+// TestGoExtractor_NilSafetyOnMalformedAST exercises the extraction helpers with
+// directly-constructed AST nodes that have nil Name / Type / Path fields. This
+// shape can be produced by the parser when recovering from malformed input, so
+// the extractors must not panic. It also confirms that parsing a truncated Go
+// source file fails cleanly without panicking.
+func TestGoExtractor_NilSafetyOnMalformedAST(t *testing.T) {
+	extractor := NewGoExtractor()
+
+	// 1. Truncated source should return an error, not panic.
+	path := filepath.Join(t.TempDir(), "truncated.go")
+	if err := os.WriteFile(path, []byte("package p\nfunc"), 0o644); err != nil {
+		t.Fatalf("failed to write truncated source: %v", err)
+	}
+	chdirForTest(t, filepath.Dir(path))
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				t.Fatalf("parseFile panicked on truncated source: %v", r)
+			}
+		}()
+		if _, err := extractor.parseFile(path); err == nil {
+			t.Fatal("expected parse error on truncated source")
+		}
+	}()
+
+	fset := token.NewFileSet()
+
+	// 2. FuncDecl with nil Name and nil Type (as recovery mode may produce).
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				t.Fatalf("extractFunc panicked on nil Name/Type: %v", r)
+			}
+		}()
+		fn := extractor.extractFunc(fset, &ast.FuncDecl{})
+		if fn == nil {
+			t.Fatal("extractFunc returned nil")
+		}
+		if fn.Name != "" {
+			t.Fatalf("expected empty name, got %q", fn.Name)
+		}
+	}()
+
+	// 3. TypeSpec with nil Name and nil Type.
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				t.Fatalf("extractType panicked on nil Name/Type: %v", r)
+			}
+		}()
+		ty := extractor.extractType(fset, &ast.TypeSpec{})
+		if ty == nil {
+			t.Fatal("extractType returned nil")
+		}
+		if ty.Name != "" {
+			t.Fatalf("expected empty name, got %q", ty.Name)
+		}
+		if ty.Kind != "alias" {
+			t.Fatalf("expected alias kind for nil Type, got %q", ty.Kind)
+		}
+	}()
+
+	// 4. Top-level parse over a synthetic file with FuncDecl/TypeSpec/ImportSpec
+	//    all missing their expected identifiers must not panic and must skip
+	//    the malformed decls.
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				t.Fatalf("parseFile-like extraction panicked on nil sub-fields: %v", r)
+			}
+		}()
+		file := &ast.File{
+			Name: &ast.Ident{Name: "p"},
+			Decls: []ast.Decl{
+				&ast.FuncDecl{}, // nil Name -> skipped
+				&ast.GenDecl{
+					Tok: token.TYPE,
+					Specs: []ast.Spec{
+						&ast.TypeSpec{}, // nil Name -> skipped
+					},
+				},
+				&ast.GenDecl{
+					Tok: token.IMPORT,
+					Specs: []ast.Spec{
+						&ast.ImportSpec{}, // nil Path -> skipped below via file.Imports
+					},
+				},
+			},
+			Imports: []*ast.ImportSpec{{}}, // nil Path -> skipped
+		}
+		parsed := &ParsedFile{
+			Fset:      fset,
+			File:      file,
+			Functions: make(map[string]*GoFunc),
+			Types:     make(map[string]*GoType),
+			Variables: make(map[string]*GoVar),
+			Imports:   make(map[string]string),
+		}
+		// Replay the extraction loop inline to exercise the nil guards. We
+		// intentionally mirror parseFile's per-decl handling here rather than
+		// calling parseFile, because parseFile reads a file from disk.
+		for _, imp := range parsed.File.Imports {
+			if imp == nil || imp.Path == nil {
+				continue
+			}
+			parsed.Imports[imp.Path.Value] = ""
+		}
+		for _, decl := range parsed.File.Decls {
+			switch node := decl.(type) {
+			case *ast.FuncDecl:
+				if node.Name == nil {
+					continue
+				}
+				parsed.Functions[node.Name.Name] = extractor.extractFunc(fset, node)
+			case *ast.GenDecl:
+				if node.Tok == token.TYPE {
+					for _, spec := range node.Specs {
+						if ts, ok := spec.(*ast.TypeSpec); ok {
+							if ts.Name == nil {
+								continue
+							}
+							ty := extractor.extractType(fset, ts)
+							parsed.Types[ty.Name] = ty
+						}
+					}
+				}
+			}
+		}
+		if len(parsed.Functions) != 0 {
+			t.Fatalf("expected zero functions from nil decls, got %d", len(parsed.Functions))
+		}
+		if len(parsed.Types) != 0 {
+			t.Fatalf("expected zero types from nil specs, got %d", len(parsed.Types))
+		}
+		if len(parsed.Imports) != 0 {
+			t.Fatalf("expected zero imports from nil paths, got %d", len(parsed.Imports))
+		}
+	}()
 }

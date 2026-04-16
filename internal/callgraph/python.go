@@ -1,28 +1,23 @@
 package callgraph
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strings"
 	"time"
 
 	"github.com/lerianstudio/mithril/internal/fileutil"
-	"github.com/lerianstudio/mithril/internal/procenv"
 )
 
 // Resource protection limits for Python analysis.
 const (
-	pyMaxModifiedFunctions = 500              // Maximum number of modified functions to analyze
-	pyDefaultTimeBudgetSec = 120              // Default time budget when not specified
-	pyMaxOutputSize        = 50 * 1024 * 1024 // 50MB limit for subprocess output
+	pyMaxModifiedFunctions = 500 // Maximum number of modified functions to analyze
+	pyDefaultTimeBudgetSec = 120 // Default time budget when not specified
 )
 
 // PythonAnalyzer implements call graph analysis for Python code.
@@ -46,47 +41,7 @@ func NewPythonAnalyzer(workDir string) *PythonAnalyzer {
 
 // sanitizeFilePaths validates file paths to prevent command injection and path traversal.
 func (p *PythonAnalyzer) sanitizeFilePaths(files []string) ([]string, error) {
-	// Resolve workDir to absolute path for comparison
-	absWorkDir, err := filepath.Abs(p.workDir)
-	if err != nil {
-		return nil, fmt.Errorf("failed to resolve workDir: %w", err)
-	}
-	realWorkDir, err := filepath.EvalSymlinks(absWorkDir)
-	if err != nil {
-		return nil, fmt.Errorf("failed to resolve workDir symlinks: %w", err)
-	}
-
-	var sanitized []string
-	for _, f := range files {
-		// Check for dash prefix (command injection)
-		if strings.HasPrefix(f, "-") {
-			return nil, fmt.Errorf("invalid file path (starts with dash): %s", f)
-		}
-		// Check for null bytes
-		if strings.ContainsRune(f, '\x00') {
-			return nil, fmt.Errorf("invalid file path (contains null byte)")
-		}
-
-		// Resolve to absolute path
-		absPath, err := filepath.Abs(f)
-		if err != nil {
-			return nil, fmt.Errorf("invalid file path (cannot resolve): %s", f)
-		}
-
-		// Evaluate symlinks to prevent escape via symlink
-		realPath, err := filepath.EvalSymlinks(absPath)
-		if err != nil {
-			return nil, fmt.Errorf("invalid file path (cannot resolve symlinks): %s", f)
-		}
-
-		// Verify path is within workDir (prevent path traversal)
-		if !strings.HasPrefix(realPath, realWorkDir+string(filepath.Separator)) && realPath != realWorkDir {
-			return nil, fmt.Errorf("invalid file path (outside work directory): %s", f)
-		}
-
-		sanitized = append(sanitized, f)
-	}
-	return sanitized, nil
+	return sanitizeHelperFilePaths(p.workDir, files)
 }
 
 // validPythonIdentifier is a regex pattern for valid Python identifiers.
@@ -197,100 +152,29 @@ func (p *PythonAnalyzer) Analyze(modifiedFuncs []ModifiedFunction, timeBudgetSec
 		return runFallback(ctx, modifiedFuncs, result)
 	}
 
+	// Python dynamic dispatch patterns (getattr, super(), monkey patching,
+	// decorators rewriting callables) cannot be resolved by static AST
+	// analysis; surface a single advisory warning so downstream consumers
+	// know the graph is a lower bound (see H15).
+	result.Warnings = append(result.Warnings,
+		"Python dynamic dispatch (getattr, super(), monkey-patching, dynamically-assigned decorators) is not tracked; call graph is a lower bound.")
+
 	// Process helper results
 	return processHelper(helperResult, modifiedFuncs, result)
 }
 
 // getAffectedPackages extracts unique package paths from modified functions.
 func (p *PythonAnalyzer) getAffectedPackages(funcs []ModifiedFunction) []string {
-	seen := make(map[string]bool)
-	var result []string
-
-	for _, fn := range funcs {
-		pkg := fn.Package
-		if pkg == "" {
-			// Extract package from file path
-			pkg = filepath.Dir(fn.File)
-		}
-		if pkg != "" && !seen[pkg] {
-			seen[pkg] = true
-			result = append(result, pkg)
-		}
-	}
-
-	return result
+	return affectedPackages(funcs)
 }
 
 // collectUniqueFiles returns unique file paths from modified functions.
 func (p *PythonAnalyzer) collectUniqueFiles(funcs []ModifiedFunction) []string {
-	seen := make(map[string]bool)
-	var files []string
-
-	for _, fn := range funcs {
-		if fn.File != "" && !seen[fn.File] {
-			seen[fn.File] = true
-			files = append(files, fn.File)
-		}
-	}
-
-	return files
-}
-
-type pyHelperOutputTooLargeError struct {
-	size  int
-	limit int
-}
-
-func (e *pyHelperOutputTooLargeError) Error() string {
-	return fmt.Sprintf("helper output exceeds size limit (%d > %d bytes)", e.size, e.limit)
+	return collectUniqueFiles(funcs)
 }
 
 func (p *PythonAnalyzer) runPythonHelperCommand(ctx context.Context, pythonBinary string, args []string) ([]byte, error) {
-	cmd := exec.CommandContext(ctx, pythonBinary, args...) // #nosec G204 - args sanitized
-	cmd.Dir = p.workDir
-	cmd.Env = procenv.Build()
-
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
-
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		return nil, err
-	}
-
-	if err := cmd.Start(); err != nil {
-		return nil, err
-	}
-
-	limitedStdout := io.LimitReader(stdout, pyMaxOutputSize+1)
-	output, readErr := io.ReadAll(limitedStdout)
-	if readErr != nil {
-		if cmd.Process != nil {
-			_ = cmd.Process.Kill()
-		}
-		_ = cmd.Wait()
-		return nil, readErr
-	}
-
-	// If we hit the limit, STOP: do not keep reading (risk hang). Kill + Wait to reap.
-	if len(output) > pyMaxOutputSize {
-		if cmd.Process != nil {
-			_ = cmd.Process.Kill()
-		}
-		_ = cmd.Wait()
-		return nil, &pyHelperOutputTooLargeError{size: len(output), limit: pyMaxOutputSize}
-	}
-
-	waitErr := cmd.Wait()
-	if exitErr, ok := waitErr.(*exec.ExitError); ok {
-		// Preserve Cmd.Output() behavior: attach captured stderr to ExitError.
-		exitErr.Stderr = stderr.Bytes()
-	}
-	if waitErr != nil {
-		return nil, waitErr
-	}
-
-	return output, nil
+	return runHelperCommand(ctx, p.workDir, pythonBinary, args)
 }
 
 // runCallGraphPy uses the custom Python call_graph.py script for detailed analysis.
@@ -342,7 +226,7 @@ func (p *PythonAnalyzer) runCallGraphPy(ctx context.Context, files []string, mod
 	// Try python3 first, then python
 	output, err := p.runPythonHelperCommand(ctx, "python3", args)
 	if err != nil {
-		var tooLarge *pyHelperOutputTooLargeError
+		var tooLarge *outputTooLargeError
 		if errors.As(err, &tooLarge) {
 			return nil, err
 		}
@@ -354,11 +238,6 @@ func (p *PythonAnalyzer) runCallGraphPy(ctx context.Context, files []string, mod
 			}
 			return nil, fmt.Errorf("failed to run Python helper: %w", err)
 		}
-	}
-
-	// Check output size limit to prevent memory exhaustion
-	if len(output) > pyMaxOutputSize {
-		return nil, fmt.Errorf("helper output exceeds size limit (%d > %d bytes)", len(output), pyMaxOutputSize)
 	}
 
 	var helperOutput pyHelperOutput
@@ -496,7 +375,7 @@ func (p *PythonAnalyzer) runPyan3(ctx context.Context, modifiedFuncs []ModifiedF
 
 	output, err := p.runPythonHelperCommand(ctx, "python3", args)
 	if err != nil {
-		var tooLarge *pyHelperOutputTooLargeError
+		var tooLarge *outputTooLargeError
 		if errors.As(err, &tooLarge) {
 			result.Warnings = append(result.Warnings, "pyan3 output exceeds size limit")
 			return p.returnEmptyResults(modifiedFuncs, result), nil

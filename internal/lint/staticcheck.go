@@ -71,21 +71,14 @@ func (s *Staticcheck) Version(ctx context.Context) (string, error) {
 // Run executes staticcheck on the specified packages.
 func (s *Staticcheck) Run(ctx context.Context, projectDir string, packages []string) (*Result, error) {
 	result := NewResult()
-
-	version, err := s.Version(ctx)
-	if err != nil {
-		result.Errors = append(result.Errors, fmt.Sprintf("staticcheck version check failed: %v", err))
-	} else {
-		result.ToolVersions["staticcheck"] = version
-	}
+	recordToolVersion(ctx, result, "staticcheck", s.Version)
 
 	// Build arguments
 	args := []string{"-f", "json"}
 
 	// Add packages to analyze
 	if len(packages) > 0 {
-		if err := validateTargetArgs(packages); err != nil {
-			result.Errors = append(result.Errors, fmt.Sprintf("staticcheck target validation failed: %v", err))
+		if !appendValidationError(result, "staticcheck", packages) {
 			return result, nil
 		}
 		args = append(args, packages...)

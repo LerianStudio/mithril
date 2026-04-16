@@ -36,6 +36,9 @@ func normalizeScopeJSON(scope *ScopeJSON) {
 	if scope.Files.Deleted == nil {
 		scope.Files.Deleted = []string{}
 	}
+	if scope.Files.Renamed == nil {
+		scope.Files.Renamed = []RenamedFile{}
+	}
 	if scope.Languages == nil {
 		scope.Languages = []string{}
 	}
@@ -45,10 +48,23 @@ func normalizeScopeJSON(scope *ScopeJSON) {
 }
 
 // FilesByStatus holds categorized file lists.
+//
+// Modified, Added, and Deleted are mutually exclusive by path. Renamed is a
+// supplementary list of {old -> new} pairs; when populated, the new path is
+// also present in Added (or Modified for copy/rename-with-edit semantics),
+// preserving backward-compat for consumers that ignore Renamed.
 type FilesByStatus struct {
-	Modified []string `json:"modified"`
-	Added    []string `json:"added"`
-	Deleted  []string `json:"deleted"`
+	Modified []string      `json:"modified"`
+	Added    []string      `json:"added"`
+	Deleted  []string      `json:"deleted"`
+	Renamed  []RenamedFile `json:"renamed,omitempty"`
+}
+
+// RenamedFile captures a rename/copy operation so downstream consumers can
+// track identity across moves instead of treating it as delete+add.
+type RenamedFile struct {
+	OldPath string `json:"old_path"`
+	NewPath string `json:"new_path"`
 }
 
 // StatsJSON holds change statistics.
@@ -95,8 +111,12 @@ func (s *ScopeJSON) GetLanguage() lint.Language {
 	}
 }
 
-// GetAllFiles returns all changed files (modified + added) with normalized paths.
-func (s *ScopeJSON) GetAllFiles() []string {
+// GetAnalyzableFiles returns the changed files that still exist on disk and
+// can be fed to linters, AST extractors, and dataflow analyzers (Modified +
+// Added). Deleted files are intentionally excluded because they have no
+// current content to analyze; use GetAllChangedFiles or GetDeletedFiles for
+// deletion-aware workflows.
+func (s *ScopeJSON) GetAnalyzableFiles() []string {
 	if s == nil {
 		return []string{}
 	}
@@ -111,8 +131,62 @@ func (s *ScopeJSON) GetAllFiles() []string {
 	return all
 }
 
-// GetAllFilesMap returns a map of all changed files for quick lookup with normalized paths.
-func (s *ScopeJSON) GetAllFilesMap() map[string]bool {
+// GetAllChangedFiles returns every path touched by the change (Modified +
+// Added + Deleted + old paths of Renamed entries). Use this when you need to
+// reason about deletion-based regressions (e.g. an attacker removing an auth
+// check) — the deleted paths let callers fetch the "before" version from git
+// and diff against nothing.
+func (s *ScopeJSON) GetAllChangedFiles() []string {
+	if s == nil {
+		return []string{}
+	}
+
+	seen := make(map[string]struct{})
+	all := make([]string, 0, len(s.Files.Modified)+len(s.Files.Added)+len(s.Files.Deleted)+len(s.Files.Renamed))
+	add := func(raw string) {
+		if raw == "" {
+			return
+		}
+		p := normalizeScopePath(raw)
+		if _, ok := seen[p]; ok {
+			return
+		}
+		seen[p] = struct{}{}
+		all = append(all, p)
+	}
+	for _, f := range s.Files.Modified {
+		add(f)
+	}
+	for _, f := range s.Files.Added {
+		add(f)
+	}
+	for _, f := range s.Files.Deleted {
+		add(f)
+	}
+	for _, r := range s.Files.Renamed {
+		add(r.OldPath)
+		add(r.NewPath)
+	}
+	return all
+}
+
+// GetDeletedFiles returns the normalized paths of files removed by the change.
+// Callers wanting to analyze the removed content should load it via
+// `git show <base-ref>:<path>` rather than the working tree.
+func (s *ScopeJSON) GetDeletedFiles() []string {
+	if s == nil {
+		return []string{}
+	}
+	deleted := make([]string, 0, len(s.Files.Deleted))
+	for _, f := range s.Files.Deleted {
+		deleted = append(deleted, normalizeScopePath(f))
+	}
+	return deleted
+}
+
+// GetAnalyzableFilesMap returns a set of analyzable file paths for quick
+// lookups. Mirrors GetAnalyzableFiles semantics (Modified + Added).
+func (s *ScopeJSON) GetAnalyzableFilesMap() map[string]bool {
 	if s == nil {
 		return map[string]bool{}
 	}

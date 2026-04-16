@@ -75,9 +75,12 @@ func initSourcePatterns() []sourcePattern {
 			Desc:    "HTTP request body",
 		},
 		{
-			Type:    SourceHTTPBody,
+			// TODO: To promote this back to SourceHTTPBody, add argument-aware
+			// matching that verifies the reader argument resolves to an HTTP body
+			// (r.Body, req.Body, request.Body, ctx.Body(), etc.).
+			Type:    SourceJSONDecode,
 			Pattern: regexp.MustCompile(`json\.(?:NewDecoder|Unmarshal)\s*\(`),
-			Desc:    "JSON decode from request",
+			Desc:    "JSON decode (origin-agnostic)",
 		},
 		{
 			Type:    SourceHTTPBody,
@@ -483,6 +486,14 @@ func initSanitizerRegex() *regexp.Regexp {
 		`template\.(?:HTMLEscapeString|JSEscapeString)`,
 		`sql\.Named`,
 		`pgx\.NamedArgs`,
+		// github.com/microcosm-cc/bluemonday — HTML sanitizer.
+		`bluemonday\.(?:UGCPolicy|StrictPolicy|StricterPolicy|NewPolicy)\(\)\.Sanitize`,
+		`\.Sanitize(?:Bytes|Reader)?\s*\(`,
+		// github.com/go-playground/validator (v9/v10) — struct-field validator.
+		`validator\.New\s*\(\)`,
+		`(?:validate|validator|v)\.(?:Struct|StructCtx|Var|VarCtx|StructFiltered|StructPartial|StructExcept)\s*\(`,
+		// github.com/asaskevich/govalidator — format/allow-list helpers.
+		`govalidator\.(?:Is[A-Z]\w*|ValidateStruct|ValidateMap|Trim|Escape|SafeFileName|WhiteList|BlackList|StripLow)\s*\(`,
 	}
 	return regexp.MustCompile(`(?i)(?:` + strings.Join(sanitizers, "|") + `)`)
 }
@@ -722,6 +733,15 @@ func (g *GoAnalyzer) analyzeFlow(source Source, sink Sink, fileContents map[stri
 		return nil
 	}
 
+	// Drop the json.Unmarshal self-flow class: when the source is a JSON
+	// decode and the sink is json.Unmarshal/json.NewDecoder, the tracked
+	// "variable" is usually the reused err/ok idiom and no real data flows
+	// from source to sink.
+	if source.Type == SourceJSONDecode &&
+		(sink.Function == "json.Unmarshal" || sink.Function == "json.NewDecoder") {
+		return nil
+	}
+
 	trackedVars := trackDerivedVariables(lines, sourceVar, source.Line, sink.Line)
 
 	// Check if source variable appears in sink line
@@ -801,28 +821,36 @@ func (g *GoAnalyzer) detectNilSourcesInFile(filePath string) ([]NilSource, error
 		}
 
 		for _, pattern := range g.nilPatterns {
-			if matches := pattern.FindStringSubmatch(line); len(matches) > 1 {
-				varName := matches[1]
-				if varName == "" || varName == "_" {
-					continue
-				}
-
-				origin := determineNilOrigin(line)
-				nilSrc := NilSource{
-					File:     filePath,
-					Line:     lineNum + 1,
-					Variable: varName,
-					Origin:   origin,
-					Risk:     RiskMedium,
-				}
-
-				// Check for ok pattern (map lookup, type assertion)
-				if strings.Contains(line, ", ok") || strings.Contains(line, ", _") {
-					nilSrc.IsChecked = true
-				}
-
-				detectedVars[varName] = nilSrc
+			loc := pattern.FindStringSubmatchIndex(line)
+			if loc == nil {
+				continue
 			}
+			matches := pattern.FindStringSubmatch(line)
+			if len(matches) <= 1 {
+				continue
+			}
+			varName := matches[1]
+			if varName == "" || varName == "_" {
+				continue
+			}
+
+			origin := determineNilOrigin(line)
+			nilSrc := NilSource{
+				File:     filePath,
+				Line:     lineNum + 1,
+				Column:   loc[0] + 1,
+				Variable: varName,
+				Pattern:  pattern.String(),
+				Origin:   origin,
+				Risk:     RiskMedium,
+			}
+
+			// Check for ok pattern (map lookup, type assertion)
+			if strings.Contains(line, ", ok") || strings.Contains(line, ", _") {
+				nilSrc.IsChecked = true
+			}
+
+			detectedVars[varName] = nilSrc
 		}
 	}
 
@@ -1077,7 +1105,11 @@ func extractFunctionName(line string) string {
 
 // generateFlowID creates a unique identifier for a flow.
 func generateFlowID(source Source, sink Sink) string {
-	data := fmt.Sprintf("%s:%d:%s:%d", source.File, source.Line, sink.File, sink.Line)
+	data := fmt.Sprintf("%s:%d:%s|%s:%d:%s|%s|%s",
+		source.File, source.Line, source.Type,
+		sink.File, sink.Line, sink.Type,
+		source.Pattern, sink.Pattern,
+	)
 	hash := sha256.Sum256([]byte(data))
 	return fmt.Sprintf("flow_%x", hash[:8])
 }
@@ -1295,6 +1327,11 @@ func trackDerivedVariables(lines []string, sourceVar string, sourceLine, sinkLin
 				rhs := matches[2]
 				if containsAnyVariableOrDerivative(rhs, tracked) {
 					tracked[assignedVar] = struct{}{}
+				} else if _, wasTracked := tracked[assignedVar]; wasTracked && assignedVar != sourceVar {
+					// Reassignment to a clean expression un-taints the
+					// variable. Skip the original sourceVar so the source
+					// stays marked across its own declaration line.
+					delete(tracked, assignedVar)
 				}
 			}
 			continue

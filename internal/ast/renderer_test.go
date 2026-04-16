@@ -335,24 +335,3 @@ func TestFormatSignature(t *testing.T) {
 		})
 	}
 }
-
-func TestCapitalizeFirst(t *testing.T) {
-	tests := []struct {
-		input    string
-		expected string
-	}{
-		{"added", "Added"},
-		{"removed", "Removed"},
-		{"modified", "Modified"},
-		{"", ""},
-		{"A", "A"},
-		{"aBC", "ABC"},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.input, func(t *testing.T) {
-			result := capitalizeFirst(tt.input)
-			assert.Equal(t, tt.expected, result)
-		})
-	}
-}

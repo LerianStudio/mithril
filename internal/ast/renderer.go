@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+
+	"github.com/lerianstudio/mithril/internal/output"
 )
 
 // RenderMarkdown converts a SemanticDiff to markdown format
@@ -111,7 +113,7 @@ func renderType(t TypeDiff) string {
 
 	icon := getChangeIcon(t.ChangeType)
 	_, _ = fmt.Fprintf(&sb, "### %s `%s` (%s)\n\n", icon, t.Name, t.Kind)
-	_, _ = fmt.Fprintf(&sb, "**Status:** %s\n", capitalizeFirst(string(t.ChangeType)))
+	_, _ = fmt.Fprintf(&sb, "**Status:** %s\n", output.CapitalizeFirst(string(t.ChangeType)))
 	_, _ = fmt.Fprintf(&sb, "**Lines:** %d-%d\n\n", t.StartLine, t.EndLine)
 
 	if len(t.Fields) > 0 {
@@ -178,14 +180,10 @@ func getChangeIcon(changeType ChangeType) string {
 	}
 }
 
-func capitalizeFirst(s string) string {
-	if s == "" {
-		return s
-	}
-	return strings.ToUpper(s[:1]) + s[1:]
-}
-
-// RenderJSON returns the diff as formatted JSON
+// RenderJSON returns the diff as formatted JSON.
+// Exception to the fileutil.WriteJSONFile migration (H26): this helper
+// returns bytes for downstream consumers that may stream or inspect the
+// output before writing; it does not itself persist to a file.
 func RenderJSON(diff *SemanticDiff) ([]byte, error) {
 	return json.MarshalIndent(diff, "", "  ")
 }

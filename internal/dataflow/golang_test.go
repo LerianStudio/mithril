@@ -248,6 +248,76 @@ func processQuery(db *sql.DB, q string) {
 	require.NotEmpty(t, flows, "expected flow when source is passed as function argument")
 }
 
+func TestGoAnalyzer_TrackFlows_NoJSONUnmarshalSelfFlow(t *testing.T) {
+	tmpDir := t.TempDir()
+	testFile := filepath.Join(tmpDir, "jsonself.go")
+	content := `package main
+
+import (
+	"bytes"
+	"encoding/json"
+)
+
+type Static struct{}
+type Calls struct{}
+
+func decode(data []byte) {
+	var static Static
+	if err := json.Unmarshal(data, &static); err == nil {
+		_ = static
+	}
+
+	var calls Calls
+	if err := json.Unmarshal(bytes.NewReader(data).Bytes(), &calls); err == nil {
+		_ = calls
+	}
+
+	var decoded Static
+	if err := json.NewDecoder(bytes.NewReader(data)).Decode(&decoded); err == nil {
+		_ = decoded
+	}
+}
+`
+	err := os.WriteFile(testFile, []byte(content), 0o644)
+	require.NoError(t, err)
+
+	analyzer := NewGoAnalyzer(tmpDir)
+	sources, err := analyzer.DetectSources([]string{testFile})
+	require.NoError(t, err)
+	require.Condition(t, func() bool {
+		for _, src := range sources {
+			if src.Type == SourceJSONDecode {
+				return true
+			}
+		}
+		return false
+	}, "expected at least one SourceJSONDecode source")
+
+	sinks, err := analyzer.DetectSinks([]string{testFile})
+	require.NoError(t, err)
+	require.Condition(t, func() bool {
+		for _, sink := range sinks {
+			if sink.Function == "json.Unmarshal" || sink.Function == "json.NewDecoder" {
+				return true
+			}
+		}
+		return false
+	}, "expected JSON decode sink candidates")
+
+	flows, err := analyzer.TrackFlows(sources, sinks, []string{testFile})
+	require.NoError(t, err)
+
+	for _, flow := range flows {
+		if flow.Source.Type == SourceJSONDecode &&
+			(flow.Sink.Function == "json.Unmarshal" || flow.Sink.Function == "json.NewDecoder") {
+			t.Fatalf("unexpected json.Unmarshal self-flow: %+v -> %+v", flow.Source, flow.Sink)
+		}
+		if flow.Risk == RiskHigh && flow.Source.Type == SourceJSONDecode {
+			t.Fatalf("SourceJSONDecode should not produce HIGH risk flows: %+v", flow)
+		}
+	}
+}
+
 func TestGoAnalyzer_DetectNilSources(t *testing.T) {
 	tmpDir := t.TempDir()
 

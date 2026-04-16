@@ -5,8 +5,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"path/filepath"
 
+	"github.com/lerianstudio/mithril/internal/fileutil"
 	"github.com/lerianstudio/mithril/internal/scope"
 )
 
@@ -22,11 +22,14 @@ type scopeJSON struct {
 	Packages  []string  `json:"packages_affected"`
 }
 
-// filesJSON groups file changes by status.
+// filesJSON groups file changes by status. Renamed preserves OldPath→NewPath
+// for consumers that need identity across moves; the new path is also
+// included in Modified so existing readers continue to work.
 type filesJSON struct {
-	Modified []string `json:"modified"`
-	Added    []string `json:"added"`
-	Deleted  []string `json:"deleted"`
+	Modified []string            `json:"modified"`
+	Added    []string            `json:"added"`
+	Deleted  []string            `json:"deleted"`
+	Renamed  []scope.RenamedFile `json:"renamed"`
 }
 
 // statsJSON contains aggregate statistics for the diff.
@@ -61,6 +64,7 @@ func (s *ScopeOutput) toScopeJSON() scopeJSON {
 				Modified: []string{},
 				Added:    []string{},
 				Deleted:  []string{},
+				Renamed:  []scope.RenamedFile{},
 			},
 			Languages: []string{},
 			Packages:  []string{},
@@ -83,6 +87,11 @@ func (s *ScopeOutput) toScopeJSON() scopeJSON {
 		deleted = []string{}
 	}
 
+	renamed := s.result.RenamedFiles
+	if renamed == nil {
+		renamed = []scope.RenamedFile{}
+	}
+
 	packages := s.result.PackagesAffected
 	if packages == nil {
 		packages = []string{}
@@ -102,6 +111,7 @@ func (s *ScopeOutput) toScopeJSON() scopeJSON {
 			Modified: modified,
 			Added:    added,
 			Deleted:  deleted,
+			Renamed:  renamed,
 		},
 		Stats: statsJSON{
 			TotalFiles:     s.result.TotalFiles,
@@ -124,6 +134,9 @@ func (s *ScopeOutput) ToJSON() ([]byte, error) {
 
 // ToPrettyJSON returns formatted JSON with indentation.
 // Returns an error if receiver or result is nil.
+// Exception to the fileutil.WriteJSONFile migration (H26): this helper
+// is a bytes-returning sibling to WriteToFile and is used by tests and
+// stdout rendering. WriteToFile below is the path that persists to disk.
 func (s *ScopeOutput) ToPrettyJSON() ([]byte, error) {
 	if s == nil || s.result == nil {
 		return nil, fmt.Errorf("cannot convert nil ScopeOutput to JSON")
@@ -143,34 +156,7 @@ func (s *ScopeOutput) WriteToFile(path string) error {
 	if s == nil || s.result == nil {
 		return fmt.Errorf("cannot write nil ScopeOutput to file")
 	}
-
-	// Ensure we don't follow symlinks for the output file.
-	if info, err := os.Lstat(path); err == nil {
-		if info.Mode()&os.ModeSymlink != 0 {
-			return fmt.Errorf("refusing to write to symlink path: %s", path)
-		}
-	} else if !os.IsNotExist(err) {
-		return fmt.Errorf("failed to stat output path %s: %w", path, err)
-	}
-
-	// Create parent directories if needed
-	dir := filepath.Dir(path)
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return fmt.Errorf("failed to create directory %s: %w", dir, err)
-	}
-
-	// Get pretty JSON
-	jsonBytes, err := s.ToPrettyJSON()
-	if err != nil {
-		return fmt.Errorf("failed to marshal JSON: %w", err)
-	}
-
-	// Write to file
-	if err := os.WriteFile(path, jsonBytes, 0o600); err != nil {
-		return fmt.Errorf("failed to write file %s: %w", path, err)
-	}
-
-	return nil
+	return fileutil.WriteJSONFile(path, s.toScopeJSON())
 }
 
 // WriteToStdout writes pretty-printed JSON to stdout with a trailing newline.

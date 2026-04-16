@@ -5,7 +5,8 @@ import (
 	"sort"
 	"strings"
 	"time"
-	"unicode"
+
+	"github.com/lerianstudio/mithril/internal/output"
 )
 
 var markdownInlineEscaper = strings.NewReplacer(
@@ -24,17 +25,6 @@ var markdownInlineEscaper = strings.NewReplacer(
 	"\r", " ",
 	"\t", " ",
 )
-
-// capitalizeFirst capitalizes the first letter of a string.
-// stdlib-only replacement for deprecated strings.Title.
-func capitalizeFirst(s string) string {
-	if s == "" {
-		return s
-	}
-	runes := []rune(s)
-	runes[0] = unicode.ToUpper(runes[0])
-	return string(runes)
-}
 
 // escapeMarkdownInline escapes special markdown characters in inline text
 // to prevent markdown injection attacks in generated reports.
@@ -144,7 +134,7 @@ func GenerateSecuritySummary(analyses map[string]*FlowAnalysis) string {
 
 			fmt.Fprintf(&sb, "### %s Flow %d: %s\n\n", riskLabel, flowNum, escapeMarkdownInline(flow.Description))
 
-			fmt.Fprintf(&sb, "**Risk Level:** %s\n\n", capitalizeFirst(string(flow.Risk)))
+			fmt.Fprintf(&sb, "**Risk Level:** %s\n\n", output.CapitalizeFirst(string(flow.Risk)))
 
 			fmt.Fprintf(&sb, "**Source:** `%s:%d` (Type: %s)\n\n", escapeMarkdownInline(flow.Source.File), flow.Source.Line, escapeMarkdownInline(string(flow.Source.Type)))
 
@@ -176,16 +166,16 @@ func GenerateSecuritySummary(analyses map[string]*FlowAnalysis) string {
 	// Nil/Null Safety Issues
 	if len(allNilSources) > 0 {
 		sb.WriteString("## Nil/Null Safety Issues\n\n")
-		sb.WriteString("| File | Line | Variable | Origin | Checked | Risk |\n")
-		sb.WriteString("|------|------|----------|--------|---------|------|\n")
+		sb.WriteString("| File | Line | Variable | Pattern | Origin | Checked | Risk |\n")
+		sb.WriteString("|------|------|----------|---------|--------|---------|------|\n")
 
 		for _, ns := range allNilSources {
 			checked := "No"
 			if ns.IsChecked {
 				checked = "Yes"
 			}
-			fmt.Fprintf(&sb, "| %s | %d | %s | %s | %s | %s |\n",
-				escapeMarkdownInline(ns.File), ns.Line, escapeMarkdownInline(ns.Variable), escapeMarkdownInline(ns.Origin), checked, capitalizeFirst(string(ns.Risk)))
+			fmt.Fprintf(&sb, "| %s | %d | %s | %s | %s | %s | %s |\n",
+				escapeMarkdownInline(ns.File), ns.Line, escapeMarkdownInline(ns.Variable), escapeMarkdownInline(ns.Pattern), escapeMarkdownInline(ns.Origin), checked, output.CapitalizeFirst(string(ns.Risk)))
 		}
 		sb.WriteString("\n")
 	}
@@ -200,7 +190,7 @@ func GenerateSecuritySummary(analyses map[string]*FlowAnalysis) string {
 				continue
 			}
 
-			fmt.Fprintf(&sb, "### %s\n\n", capitalizeFirst(lang))
+			fmt.Fprintf(&sb, "### %s\n\n", output.CapitalizeFirst(lang))
 			sb.WriteString("| Metric | Value |\n")
 			sb.WriteString("|--------|-------|\n")
 			fmt.Fprintf(&sb, "| Sources | %d |\n", analysis.Statistics.TotalSources)

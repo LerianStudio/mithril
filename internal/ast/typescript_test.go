@@ -16,11 +16,12 @@ func TestTypeScriptExtractor_SupportedExtensions(t *testing.T) {
 
 	extensions := extractor.SupportedExtensions()
 
-	assert.Len(t, extensions, 4)
+	assert.Len(t, extensions, 5)
 	assert.Contains(t, extensions, ".ts")
 	assert.Contains(t, extensions, ".tsx")
 	assert.Contains(t, extensions, ".js")
 	assert.Contains(t, extensions, ".jsx")
+	assert.Contains(t, extensions, ".d.ts")
 }
 
 func TestTypeScriptExtractor_Language(t *testing.T) {

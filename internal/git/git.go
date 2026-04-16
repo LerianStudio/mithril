@@ -5,12 +5,13 @@ package git
 import (
 	"bytes"
 	"fmt"
-	"os"
 	"os/exec"
 	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
+
+	"github.com/lerianstudio/mithril/internal/procenv"
 )
 
 // FileStatus represents the status of a file in git diff output.
@@ -175,7 +176,11 @@ func runGitCommand(workDir string, args ...string) ([]byte, error) {
 	if workDir != "" {
 		cmd.Dir = workDir
 	}
-	cmd.Env = append([]string{"LC_ALL=C"}, os.Environ()...)
+	// Filter the subprocess environment via the shared allowlist and force
+	// GIT_TERMINAL_PROMPT=0 to avoid interactive prompts. Credentials-bearing
+	// vars (GITHUB_TOKEN, GIT_SSH_COMMAND, GIT_CONFIG_*, SSH_AUTH_SOCK, etc.)
+	// are intentionally NOT forwarded.
+	cmd.Env = append(procenv.Build(), "GIT_TERMINAL_PROMPT=0")
 
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
@@ -216,7 +221,13 @@ func isMissingPathError(err error) bool {
 		return false
 	}
 	msg := err.Error()
-	return strings.Contains(msg, "does not exist in") || strings.Contains(msg, "Path '")
+	// Git phrases missing-path errors several ways:
+	//   - "<path> does not exist in <ref>"          (classic)
+	//   - "Path '<path>' does not exist in <ref>"   (quoted form)
+	//   - "<path> exists on disk, but not in <ref>" (untracked worktree file)
+	return strings.Contains(msg, "does not exist in") ||
+		strings.Contains(msg, "Path '") ||
+		strings.Contains(msg, "exists on disk, but not in")
 }
 
 // GetDiff returns the diff between two refs, or combined changes vs HEAD when refs are empty.
@@ -405,7 +416,16 @@ func (c *Client) GetAllChangesDiff() (*DiffResult, error) {
 	return result, nil
 }
 
-// GetDiffStatsForFiles returns numstat data for a list of files against a base ref.
+// maxDiffStatsArgBytes caps the byte length of the `files...` portion of a
+// single `git diff --numstat` invocation. It is well below the macOS ARG_MAX
+// (~256KB) and the Linux ARG_MAX (~1MB), leaving plenty of room for the
+// command name, fixed flags, and the process environment.
+const maxDiffStatsArgBytes = 96 * 1024
+
+// GetDiffStatsForFiles returns numstat data for a list of files against a
+// base ref. Large file lists are transparently split into multiple git
+// invocations so monorepos with tens of thousands of changed paths do not
+// hit E2BIG.
 func (c *Client) GetDiffStatsForFiles(baseRef string, files []string) (DiffStats, map[string]FileStats, error) {
 	if err := validateRef(baseRef); err != nil {
 		return DiffStats{}, nil, err
@@ -415,28 +435,58 @@ func (c *Client) GetDiffStatsForFiles(baseRef string, files []string) (DiffStats
 		return DiffStats{}, map[string]FileStats{}, nil
 	}
 
-	args := []string{"diff", "--numstat", "-z", baseRef, "--"}
-	args = append(args, files...)
-
-	output, err := c.runGit(args...)
-	if err != nil {
-		return DiffStats{TotalFiles: len(files)}, nil, fmt.Errorf("failed to get diff numstat: %w", err)
-	}
-
-	statsMap, err := parseNumstat(output)
-	if err != nil {
-		return DiffStats{TotalFiles: len(files)}, nil, fmt.Errorf("failed to parse diff numstat: %w", err)
-	}
-
-	result := make(map[string]FileStats, len(statsMap))
+	result := make(map[string]FileStats)
 	stats := DiffStats{TotalFiles: len(files)}
-	for path, fileStat := range statsMap {
-		result[path] = FileStats{Additions: fileStat.additions, Deletions: fileStat.deletions}
-		stats.TotalAdditions += fileStat.additions
-		stats.TotalDeletions += fileStat.deletions
+
+	for _, batch := range batchPathsByBytes(files, maxDiffStatsArgBytes) {
+		args := []string{"diff", "--numstat", "-z", baseRef, "--"}
+		args = append(args, batch...)
+
+		output, err := c.runGit(args...)
+		if err != nil {
+			return DiffStats{TotalFiles: len(files)}, nil, fmt.Errorf("failed to get diff numstat: %w", err)
+		}
+
+		statsMap, err := parseNumstat(output)
+		if err != nil {
+			return DiffStats{TotalFiles: len(files)}, nil, fmt.Errorf("failed to parse diff numstat: %w", err)
+		}
+
+		for path, fileStat := range statsMap {
+			result[path] = FileStats{Additions: fileStat.additions, Deletions: fileStat.deletions}
+			stats.TotalAdditions += fileStat.additions
+			stats.TotalDeletions += fileStat.deletions
+		}
 	}
 
 	return stats, result, nil
+}
+
+// batchPathsByBytes splits paths into groups whose concatenated byte length
+// (including one separator byte per entry) fits within maxBytes. A single
+// path longer than maxBytes is emitted as its own batch — worst case git
+// will error, but the caller's intent to try that path is preserved.
+func batchPathsByBytes(paths []string, maxBytes int) [][]string {
+	if maxBytes <= 0 {
+		return [][]string{paths}
+	}
+	batches := make([][]string, 0)
+	current := make([]string, 0)
+	currentLen := 0
+	for _, p := range paths {
+		pLen := len(p) + 1 // +1 for argv separator accounting
+		if len(current) > 0 && currentLen+pLen > maxBytes {
+			batches = append(batches, current)
+			current = make([]string, 0)
+			currentLen = 0
+		}
+		current = append(current, p)
+		currentLen += pLen
+	}
+	if len(current) > 0 {
+		batches = append(batches, current)
+	}
+	return batches
 }
 
 // parseNameStatusOutput parses NUL-delimited output from git diff --name-status -z.

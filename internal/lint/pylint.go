@@ -74,13 +74,7 @@ func (p *Pylint) Version(ctx context.Context) (string, error) {
 // Run executes pylint on the specified files.
 func (p *Pylint) Run(ctx context.Context, projectDir string, files []string) (*Result, error) {
 	result := NewResult()
-
-	version, err := p.Version(ctx)
-	if err != nil {
-		result.Errors = append(result.Errors, fmt.Sprintf("pylint version check failed: %v", err))
-	} else {
-		result.ToolVersions["pylint"] = version
-	}
+	recordToolVersion(ctx, result, "pylint", p.Version)
 
 	// Build arguments
 	args := []string{
@@ -90,8 +84,7 @@ func (p *Pylint) Run(ctx context.Context, projectDir string, files []string) (*R
 
 	// Add files to lint
 	if len(files) > 0 {
-		if err := validateTargetArgs(files); err != nil {
-			result.Errors = append(result.Errors, fmt.Sprintf("pylint target validation failed: %v", err))
+		if !appendValidationError(result, "pylint", files) {
 			return result, nil
 		}
 		args = append(args, files...)
@@ -101,14 +94,14 @@ func (p *Pylint) Run(ctx context.Context, projectDir string, files []string) (*R
 
 	execResult := p.executor.Run(ctx, projectDir, "pylint", args...)
 	if execResult.Err != nil {
-		result.Errors = append(result.Errors, fmt.Sprintf("pylint execution failed: %v", execResult.Err))
-		return result, nil
+		appendExecError(result, "pylint", execResult.Err)
+		return result, fmt.Errorf("pylint execution failed: %w", execResult.Err)
 	}
 
 	// Parse JSON output
 	var output pylintOutput
 	if err := json.Unmarshal(execResult.Stdout, &output); err != nil {
-		result.Errors = append(result.Errors, fmt.Sprintf("pylint output parse warning: %v", err))
+		appendParseError(result, "pylint", err)
 		return result, nil
 	}
 

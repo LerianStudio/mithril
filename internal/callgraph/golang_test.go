@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"golang.org/x/tools/go/packages"
@@ -465,5 +466,88 @@ go 1.20
 	}
 	if len(result.Warnings) == 0 {
 		t.Fatalf("expected warnings when truncating")
+	}
+}
+
+// TestAnalyze_VirtualEdges asserts that interface-dispatched calls are flagged
+// as virtual (see H13) and that a summary warning is emitted (see H15).
+func TestAnalyze_VirtualEdges(t *testing.T) {
+	workDir := t.TempDir()
+	module := `module example.com/iface
+
+go 1.20
+`
+	if err := os.WriteFile(filepath.Join(workDir, "go.mod"), []byte(module), 0o644); err != nil {
+		t.Fatalf("failed to write go.mod: %v", err)
+	}
+
+	source := `package iface
+
+type Greeter interface {
+	Greet() string
+}
+
+type Hello struct{}
+
+func (h Hello) Greet() string { return "hi" }
+
+type World struct{}
+
+func (w World) Greet() string { return "world" }
+
+func DoGreet(g Greeter) string {
+	return g.Greet()
+}
+
+func Use() string {
+	var g Greeter = Hello{}
+	return DoGreet(g)
+}
+`
+	pkgDir := filepath.Join(workDir, "iface")
+	if err := os.MkdirAll(pkgDir, 0o755); err != nil {
+		t.Fatalf("failed to create package dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(pkgDir, "iface.go"), []byte(source), 0o644); err != nil {
+		t.Fatalf("failed to write iface.go: %v", err)
+	}
+
+	analyzer := NewGoAnalyzer(workDir)
+	result, err := analyzer.Analyze([]ModifiedFunction{{
+		Name:     "Greet",
+		File:     filepath.Join("iface", "iface.go"),
+		Receiver: "Hello",
+	}}, 30)
+	if err != nil {
+		t.Fatalf("Analyze returned error: %v", err)
+	}
+	if len(result.ModifiedFunctions) != 1 {
+		t.Fatalf("expected 1 modified function, got %d", len(result.ModifiedFunctions))
+	}
+
+	// Hello.Greet is invoked via the Greeter interface in DoGreet, so CHA
+	// should mark that caller edge as virtual.
+	fcg := result.ModifiedFunctions[0]
+	sawVirtualCaller := false
+	for _, c := range fcg.Callers {
+		if c.Function == "DoGreet" && c.IsVirtual {
+			sawVirtualCaller = true
+			break
+		}
+	}
+	if !sawVirtualCaller {
+		t.Fatalf("expected DoGreet to be a virtual caller of Hello.Greet, got callers=%v", fcg.Callers)
+	}
+
+	// And a summary warning should have been emitted.
+	sawSummary := false
+	for _, w := range result.Warnings {
+		if strings.Contains(w, "virtual") {
+			sawSummary = true
+			break
+		}
+	}
+	if !sawSummary {
+		t.Fatalf("expected virtual-edge summary warning, got %v", result.Warnings)
 	}
 }

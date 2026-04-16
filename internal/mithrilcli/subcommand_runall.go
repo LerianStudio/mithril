@@ -2,16 +2,19 @@ package mithrilcli
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/lerianstudio/mithril/internal/callgraph"
 	"github.com/lerianstudio/mithril/internal/fileutil"
@@ -92,7 +95,7 @@ func runAll(args []string, stdout io.Writer, stderr io.Writer) error {
 		_, _ = fmt.Fprintf(stderr, "\n")
 	}
 
-	skipSet := parseSkipList(cfg.skip)
+	skipSet := parseSkipListWithWarnings(cfg.skip, stderr)
 	phases := []runAllPhase{
 		{name: "scope", run: runScopePhase},
 		{name: "static-analysis", run: runStaticAnalysisPhase, skip: shouldSkipForNoFilesOrMissingScope},
@@ -126,6 +129,39 @@ func runAll(args []string, stdout io.Writer, stderr io.Writer) error {
 		return fmt.Errorf("one or more phases failed")
 	}
 	return nil
+}
+
+// defaultBaseBranchDetector is the package-level hook used by validation to
+// auto-detect the default base branch. It is overridable in tests so the
+// flag-validation logic can be exercised hermetically without depending on
+// the host repository's branch layout. Tests should restore the original
+// value via t.Cleanup.
+var defaultBaseBranchDetector = detectDefaultBaseBranch
+
+// detectDefaultBaseBranch returns the repository's default base branch for
+// compare mode. It prefers `origin/HEAD` if set, then falls back to locally
+// present branches in the order main, master, trunk, develop. Returns an
+// error describing the failure when none are detected so the user can set
+// --base explicitly.
+func detectDefaultBaseBranch() (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// 1. origin/HEAD symbolic ref points at the remote default branch.
+	if out, err := exec.CommandContext(ctx, "git", "symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD").Output(); err == nil {
+		ref := strings.TrimSpace(string(out))
+		ref = strings.TrimPrefix(ref, "origin/")
+		if ref != "" {
+			return ref, nil
+		}
+	}
+	// 2. Scan well-known local branch names.
+	for _, candidate := range []string{"main", "master", "trunk", "develop"} {
+		if err := exec.CommandContext(ctx, "git", "show-ref", "--verify", "--quiet", "refs/heads/"+candidate).Run(); err == nil {
+			return candidate, nil
+		}
+	}
+	return "", fmt.Errorf("could not detect default base branch; pass --base explicitly")
 }
 
 func validateRunAllFlags(fs *flag.FlagSet, cfg *runAllConfig, stderr io.Writer) error {
@@ -169,7 +205,12 @@ func validateRunAllFlags(fs *flag.FlagSet, cfg *runAllConfig, stderr io.Writer) 
 		cfg.compare = true
 	}
 	if cfg.compare && !baseSet {
-		cfg.baseRef = "main"
+		detected, detectErr := defaultBaseBranchDetector()
+		if detectErr != nil {
+			_, _ = fmt.Fprintln(stderr, "Error:", detectErr)
+			return detectErr
+		}
+		cfg.baseRef = detected
 	}
 	if cfg.compare && !headSet {
 		cfg.headRef = "HEAD"
@@ -286,14 +327,33 @@ func runContextPhase(cfg *runAllConfig, stdout io.Writer, stderr io.Writer) erro
 }
 
 func parseSkipList(skip string) map[string]bool {
+	return parseSkipListWithWarnings(skip, os.Stderr)
+}
+
+// parseSkipListWithWarnings is like parseSkipList but emits warnings for
+// unknown phase names to the provided writer. Exposed to allow tests to
+// capture the warning output without touching os.Stderr.
+func parseSkipListWithWarnings(skip string, stderr io.Writer) map[string]bool {
 	skipSet := make(map[string]bool)
 	if skip == "" {
 		return skipSet
 	}
+	knownPhases := map[string]bool{
+		"scope":           true,
+		"static-analysis": true,
+		"ast":             true,
+		"callgraph":       true,
+		"dataflow":        true,
+		"context":         true,
+	}
 	for _, name := range strings.Split(skip, ",") {
 		name = strings.TrimSpace(name)
-		if name != "" {
-			skipSet[name] = true
+		if name == "" {
+			continue
+		}
+		skipSet[name] = true
+		if !knownPhases[name] {
+			_, _ = fmt.Fprintf(stderr, "Warning: unknown phase '%s' in skip list\n", name)
 		}
 	}
 	return skipSet
@@ -357,10 +417,26 @@ func generateASTBatchFile(cfg *runAllConfig) (string, string, error) {
 	if beforeRef == "" {
 		beforeRef = cfg.baseRef
 	}
-	tempDir, err := os.MkdirTemp("", "mithril-ast-before-*")
+	if beforeRef == "" {
+		beforeRef = "HEAD"
+	}
+	// Create the temp dir for "before" files under outputDir so batch paths remain
+	// within the workDir confinement enforced by ast.NewPathValidator.
+	tempDir, err := os.MkdirTemp(cfg.outputDir, "ast-before-*")
 	if err != nil {
 		return "", "", fmt.Errorf("failed to create temp directory: %w", err)
 	}
+	cleanupTempDir := true
+	defer func() {
+		if cleanupTempDir {
+			_ = os.RemoveAll(tempDir)
+		}
+	}()
+
+	// For --staged mode the "after" version is in the git index, not the working
+	// tree; we have to extract it explicitly so that unstaged edits in the working
+	// tree do not leak into the index-vs-HEAD diff.
+	stagedMode := strings.EqualFold(strings.TrimSpace(scopeData.HeadRef), "staged")
 
 	var pairs []filePair
 	for _, file := range scopeData.Files.Modified {
@@ -368,10 +444,26 @@ func generateASTBatchFile(cfg *runAllConfig) (string, string, error) {
 		if extractErr != nil {
 			return "", "", fmt.Errorf("failed to extract %s from %s: %w", file, beforeRef, extractErr)
 		}
-		pairs = append(pairs, filePair{BeforePath: beforePath, AfterPath: file})
+		afterPath := file
+		if stagedMode {
+			staged, stageErr := extractFileFromIndex(file, tempDir)
+			if stageErr != nil {
+				return "", "", fmt.Errorf("failed to extract %s from index: %w", file, stageErr)
+			}
+			afterPath = staged
+		}
+		pairs = append(pairs, filePair{BeforePath: beforePath, AfterPath: afterPath})
 	}
 	for _, file := range scopeData.Files.Added {
-		pairs = append(pairs, filePair{AfterPath: file})
+		afterPath := file
+		if stagedMode {
+			staged, stageErr := extractFileFromIndex(file, tempDir)
+			if stageErr != nil {
+				return "", "", fmt.Errorf("failed to extract %s from index: %w", file, stageErr)
+			}
+			afterPath = staged
+		}
+		pairs = append(pairs, filePair{AfterPath: afterPath})
 	}
 	for _, file := range scopeData.Files.Deleted {
 		beforePath, extractErr := extractFileFromGit(beforeRef, file, tempDir)
@@ -382,14 +474,24 @@ func generateASTBatchFile(cfg *runAllConfig) (string, string, error) {
 	}
 
 	batchPath := filepath.Join(cfg.outputDir, "ast-batch.json")
-	data, err := json.MarshalIndent(pairs, "", "  ")
-	if err != nil {
-		return "", "", fmt.Errorf("failed to marshal batch file: %w", err)
-	}
-	if err := os.WriteFile(batchPath, data, 0o600); err != nil {
+	if err := fileutil.WriteJSONFile(batchPath, pairs); err != nil {
 		return "", "", fmt.Errorf("failed to write batch file: %w", err)
 	}
+	cleanupTempDir = false
 	return batchPath, tempDir, nil
+}
+
+// extractFileFromIndex extracts a file from the git index (staged content)
+// and writes it under an "after" subdirectory of tempDir. This keeps the
+// staged "after" version separate from the "before" version.
+func extractFileFromIndex(filePath, tempDir string) (string, error) {
+	afterRoot := filepath.Join(tempDir, "__after")
+	if err := os.MkdirAll(afterRoot, 0o700); err != nil {
+		return "", fmt.Errorf("failed to create staged subdirectory: %w", err)
+	}
+	// The git client's ShowFile rejects refs that start with "-" but accepts "" to
+	// form `git show :PATH`, which reads from the index.
+	return extractFileFromGit("", filePath, afterRoot)
 }
 
 func extractFileFromGit(ref, filePath, tempDir string) (string, error) {
@@ -403,7 +505,20 @@ func extractFileFromGit(ref, filePath, tempDir string) (string, error) {
 	if strings.HasPrefix(cleaned, ".."+string(filepath.Separator)) || cleaned == ".." {
 		return "", fmt.Errorf("invalid file path: contains path traversal")
 	}
-	destPath := filepath.Join(tempDir, cleaned)
+	relPath, err := filepath.Rel(".", cleaned)
+	if err != nil {
+		return "", fmt.Errorf("invalid file path: %w", err)
+	}
+	if strings.HasPrefix(relPath, ".."+string(filepath.Separator)) || relPath == ".." {
+		return "", fmt.Errorf("invalid file path: contains path traversal")
+	}
+	destPath := filepath.Join(tempDir, relPath)
+	// Post-join containment: make sure the computed destination stays within tempDir.
+	cleanTemp := filepath.Clean(tempDir)
+	cleanDest := filepath.Clean(destPath)
+	if !strings.HasPrefix(cleanDest, cleanTemp+string(filepath.Separator)) && cleanDest != cleanTemp {
+		return "", fmt.Errorf("invalid file path: escapes temp directory")
+	}
 	if err := os.MkdirAll(filepath.Dir(destPath), 0o700); err != nil {
 		return "", fmt.Errorf("failed to create temp subdirectory: %w", err)
 	}
@@ -531,23 +646,15 @@ func writeASTOutputsByLanguage(outputDir string, payload []byte, defaultLanguage
 	}
 
 	written := make([]string, 0, len(byLanguage)+1)
-	mixedPayload, err := json.MarshalIndent(docs, "", "  ")
-	if err != nil {
-		return nil, fmt.Errorf("failed to marshal mixed AST payload: %w", err)
-	}
 	mixedPath := filepath.Join(outputDir, "mixed-ast.json")
-	if err := os.WriteFile(mixedPath, mixedPayload, 0o600); err != nil {
+	if err := fileutil.WriteJSONFile(mixedPath, docs); err != nil {
 		return nil, fmt.Errorf("failed to write %s: %w", mixedPath, err)
 	}
 	written = append(written, mixedPath)
 
 	for language, docsForLang := range byLanguage {
 		astOutputPath := filepath.Join(outputDir, fmt.Sprintf("%s-ast.json", language))
-		languagePayload, err := json.MarshalIndent(docsForLang, "", "  ")
-		if err != nil {
-			return nil, fmt.Errorf("failed to marshal %s AST payload: %w", language, err)
-		}
-		if err := os.WriteFile(astOutputPath, languagePayload, 0o600); err != nil {
+		if err := fileutil.WriteJSONFile(astOutputPath, docsForLang); err != nil {
 			return nil, fmt.Errorf("failed to write %s: %w", astOutputPath, err)
 		}
 		written = append(written, astOutputPath)

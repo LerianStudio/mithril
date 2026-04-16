@@ -3,28 +3,35 @@ package context
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
 
+	cgpkg "github.com/lerianstudio/mithril/internal/callgraph"
 	"github.com/lerianstudio/mithril/internal/fileutil"
 	scopepkg "github.com/lerianstudio/mithril/internal/scope"
 )
 
 // highImpactCallerThreshold is the minimum number of callers for a function
-// to be considered high-impact. Used consistently across all analysis.
-const highImpactCallerThreshold = 3
+// to be considered high-impact. Re-exported from callgraph so the context
+// builders share a single threshold with the markdown writer.
+const highImpactCallerThreshold = cgpkg.HighImpactCallerThreshold
 
-// reviewerDataBuilder is a function that populates template data for a specific reviewer.
-type reviewerDataBuilder func(c *Compiler, data *TemplateData, outputs *PhaseOutputs)
+// reviewerDataBuilder populates template data for a specific reviewer.
+// Builders are pure functions over the phase outputs — they do not need
+// *Compiler state (H25).
+type reviewerDataBuilder func(data *TemplateData, outputs *PhaseOutputs)
 
 // reviewerDataBuilders maps reviewer names to their data builder functions.
 var reviewerDataBuilders = map[string]reviewerDataBuilder{
-	"code-reviewer":           (*Compiler).buildCodeReviewerData,
-	"security-reviewer":       (*Compiler).buildSecurityReviewerData,
-	"business-logic-reviewer": (*Compiler).buildBusinessLogicReviewerData,
-	"test-reviewer":           (*Compiler).buildTestReviewerData,
-	"nil-safety-reviewer":     (*Compiler).buildNilSafetyReviewerData,
+	"code-reviewer":           buildCodeReviewerData,
+	"security-reviewer":       buildSecurityReviewerData,
+	"business-logic-reviewer": buildBusinessLogicReviewerData,
+	"test-reviewer":           buildTestReviewerData,
+	"nil-safety-reviewer":     buildNilSafetyReviewerData,
+	"consequences-reviewer":   buildConsequencesReviewerData,
+	"dead-code-reviewer":      buildDeadCodeReviewerData,
 }
 
 func hasReviewerDataBuilder(reviewer string) bool {
@@ -97,18 +104,20 @@ func NewCompilerWithValidation(inputDir, outputDir string) (*Compiler, error) {
 }
 
 // Compile reads all phase outputs and generates reviewer context files.
+// Per-phase failures are logged and degrade to empty data for the affected
+// phase so one corrupt input can no longer wipe every reviewer context
+// (H23). Errors are still surfaced via outputs.Errors for observability.
 func (c *Compiler) Compile() error {
 	if err := reviewerConfigurationError(); err != nil {
 		return fmt.Errorf("reviewer configuration invalid: %w", err)
 	}
 
-	// Read all phase outputs
 	outputs, err := c.readPhaseOutputs()
 	if err != nil {
 		return fmt.Errorf("failed to read phase outputs: %w", err)
 	}
-	if len(outputs.Errors) > 0 {
-		return fmt.Errorf("one or more phase outputs could not be read or parsed: %s", strings.Join(outputs.Errors, "; "))
+	for _, e := range outputs.Errors {
+		log.Printf("context compile: phase degraded — %s", e)
 	}
 
 	// Determine language from scope
@@ -127,117 +136,188 @@ func (c *Compiler) Compile() error {
 	return nil
 }
 
-// readPhaseOutputs reads all phase outputs from the input directory.
-func (c *Compiler) readPhaseOutputs() (*PhaseOutputs, error) {
-	outputs := &PhaseOutputs{}
+// Phase name constants used as keys in PhaseOutputs.PhaseStatus. Each one
+// distinguishes between "file absent", "parse/read failed", "ran but empty",
+// and "completed with data" (H24).
+const (
+	phaseScope          = "scope"
+	phaseStaticAnalysis = "static_analysis"
+	phaseAST            = "ast"
+	phaseCallGraph      = "call_graph"
+	phaseDataFlow       = "data_flow"
+)
 
-	// Read scope.json (Phase 0)
+// readPhaseOutputs reads all phase outputs from the input directory.
+// It tracks per-phase status so downstream reviewers can distinguish
+// "phase did not run" from "phase ran and found nothing" (H24), and
+// failures in one phase no longer wipe output for other phases (H23).
+func (c *Compiler) readPhaseOutputs() (*PhaseOutputs, error) {
+	outputs := &PhaseOutputs{PhaseStatus: map[string]PhaseStatus{}}
+
+	// Phase 0: scope.json
 	scopePath := filepath.Join(c.inputDir, "scope.json")
 	if canonicalScope, err := scopepkg.ReadScopeJSON(scopePath); err == nil {
 		scopeData := ScopeData{
-			BaseRef:          canonicalScope.BaseRef,
-			HeadRef:          canonicalScope.HeadRef,
-			Language:         canonicalScope.Language,
-			Languages:        append([]string{}, canonicalScope.Languages...),
-			Files:            ScopeFiles(canonicalScope.Files),
+			BaseRef:   canonicalScope.BaseRef,
+			HeadRef:   canonicalScope.HeadRef,
+			Language:  canonicalScope.Language,
+			Languages: append([]string{}, canonicalScope.Languages...),
+			Files: ScopeFiles{
+				Modified: canonicalScope.Files.Modified,
+				Added:    canonicalScope.Files.Added,
+				Deleted:  canonicalScope.Files.Deleted,
+			},
 			Stats:            ScopeStats(canonicalScope.Stats),
 			PackagesAffected: append([]string{}, canonicalScope.Packages...),
 		}
-		applyScopeDerivedFields(&scopeData)
+		if scopeData.Languages == nil {
+			scopeData.Languages = []string{}
+		}
 		outputs.Scope = &scopeData
-	} else if !isFileNotFound(err) {
+		outputs.PhaseStatus[phaseScope] = PhaseStatusCompleted
+	} else if isFileNotFound(err) {
+		outputs.PhaseStatus[phaseScope] = PhaseStatusNotRun
+	} else {
+		outputs.PhaseStatus[phaseScope] = PhaseStatusFailed
 		outputs.Errors = append(outputs.Errors, "scope.json read error")
 	}
 
-	// Read static-analysis.json (Phase 1)
+	// Phase 1: static-analysis.json
 	staticPath := filepath.Join(c.inputDir, "static-analysis.json")
 	if data, err := readJSONFileWithLimit(staticPath); err == nil {
 		var static StaticAnalysisData
-		if err := json.Unmarshal(data, &static); err == nil {
+		if parseErr := json.Unmarshal(data, &static); parseErr == nil {
 			outputs.StaticAnalysis = &static
+			if len(static.Findings) == 0 {
+				outputs.PhaseStatus[phaseStaticAnalysis] = PhaseStatusEmpty
+			} else {
+				outputs.PhaseStatus[phaseStaticAnalysis] = PhaseStatusCompleted
+			}
 		} else {
+			outputs.PhaseStatus[phaseStaticAnalysis] = PhaseStatusFailed
 			outputs.Errors = append(outputs.Errors, "static-analysis.json parse error")
 		}
-	} else if !isFileNotFound(err) {
+	} else if isFileNotFound(err) {
+		outputs.PhaseStatus[phaseStaticAnalysis] = PhaseStatusNotRun
+	} else {
+		outputs.PhaseStatus[phaseStaticAnalysis] = PhaseStatusFailed
 		outputs.Errors = append(outputs.Errors, "static-analysis.json read error")
 	}
 
-	// Read language-specific AST (Phase 2) - support multi-language projects
-	outputs.ASTByLanguage = make(map[string]*ASTData)
-	for _, lang := range c.languagesFromScope(outputs.Scope) {
-		astPath := filepath.Join(c.inputDir, fmt.Sprintf("%s-ast.json", lang))
-		if data, err := readJSONFileWithLimit(astPath); err == nil {
-			astData, parseErr := parseASTData(data)
-			if parseErr == nil {
-				outputs.ASTByLanguage[lang] = astData
-				// Keep backward compatibility: first language found becomes primary
-				if outputs.AST == nil {
-					outputs.AST = astData
-				}
-			} else {
-				outputs.Errors = append(outputs.Errors, fmt.Sprintf("%s-ast.json parse error", lang))
-			}
-		} else if !isFileNotFound(err) {
-			outputs.Errors = append(outputs.Errors, fmt.Sprintf("%s-ast.json read error", lang))
+	// Phases 2-4: language-aware scan. We iterate languages and pick the first
+	// successful parse per phase as the primary output (matching legacy
+	// behaviour). Each phase gets a single aggregate status: Completed if any
+	// language parsed, Failed if all attempts errored, NotRun if no file for
+	// any language existed, Empty if it parsed but produced nothing.
+	langs := c.languagesFromScope(outputs.Scope)
+
+	outputs.PhaseStatus[phaseAST] = loadPhasePerLanguage(c.inputDir, langs, "-ast.json", func(data []byte) (bool, error) {
+		astData, err := parseASTData(data)
+		if err != nil {
+			return false, err
 		}
+		if outputs.AST == nil {
+			outputs.AST = astData
+		}
+		return astData != nil, nil
+	}, func(msg string) { outputs.Errors = append(outputs.Errors, msg) })
+	if outputs.PhaseStatus[phaseAST] == PhaseStatusCompleted && astIsEmpty(outputs.AST) {
+		outputs.PhaseStatus[phaseAST] = PhaseStatusEmpty
 	}
 
-	// Read language-specific call graph (Phase 3) - support multi-language projects
-	outputs.CallGraphByLanguage = make(map[string]*CallGraphData)
-	for _, lang := range c.languagesFromScope(outputs.Scope) {
-		callsPath := filepath.Join(c.inputDir, fmt.Sprintf("%s-calls.json", lang))
-		if data, err := readJSONFileWithLimit(callsPath); err == nil {
-			var calls CallGraphData
-			if err := json.Unmarshal(data, &calls); err == nil {
-				outputs.CallGraphByLanguage[lang] = &calls
-				// Keep backward compatibility: first language found becomes primary
-				if outputs.CallGraph == nil {
-					outputs.CallGraph = &calls
-				}
-			} else {
-				outputs.Errors = append(outputs.Errors, fmt.Sprintf("%s-calls.json parse error", lang))
-			}
-		} else if !isFileNotFound(err) {
-			outputs.Errors = append(outputs.Errors, fmt.Sprintf("%s-calls.json read error", lang))
+	outputs.PhaseStatus[phaseCallGraph] = loadPhasePerLanguage(c.inputDir, langs, "-calls.json", func(data []byte) (bool, error) {
+		var calls CallGraphData
+		if err := json.Unmarshal(data, &calls); err != nil {
+			return false, err
 		}
+		if outputs.CallGraph == nil {
+			outputs.CallGraph = &calls
+		}
+		return true, nil
+	}, func(msg string) { outputs.Errors = append(outputs.Errors, msg) })
+	if outputs.PhaseStatus[phaseCallGraph] == PhaseStatusCompleted && outputs.CallGraph != nil && len(outputs.CallGraph.ModifiedFunctions) == 0 {
+		outputs.PhaseStatus[phaseCallGraph] = PhaseStatusEmpty
 	}
 
-	// Read language-specific data flow (Phase 4) - support multi-language projects
-	outputs.DataFlowByLanguage = make(map[string]*DataFlowData)
-	for _, lang := range c.languagesFromScope(outputs.Scope) {
-		flowPath := filepath.Join(c.inputDir, fmt.Sprintf("%s-flow.json", lang))
-		if data, err := readJSONFileWithLimit(flowPath); err == nil {
-			flowData, parseErr := parseDataFlowData(data)
-			if parseErr == nil {
-				outputs.DataFlowByLanguage[lang] = flowData
-				// Keep backward compatibility: first language found becomes primary
-				if outputs.DataFlow == nil {
-					outputs.DataFlow = flowData
-				}
-			} else {
-				outputs.Errors = append(outputs.Errors, fmt.Sprintf("%s-flow.json parse error", lang))
-			}
-		} else if !isFileNotFound(err) {
-			outputs.Errors = append(outputs.Errors, fmt.Sprintf("%s-flow.json read error", lang))
+	outputs.PhaseStatus[phaseDataFlow] = loadPhasePerLanguage(c.inputDir, langs, "-flow.json", func(data []byte) (bool, error) {
+		flowData, err := parseDataFlowData(data)
+		if err != nil {
+			return false, err
 		}
+		if outputs.DataFlow == nil {
+			outputs.DataFlow = flowData
+		}
+		return flowData != nil, nil
+	}, func(msg string) { outputs.Errors = append(outputs.Errors, msg) })
+	if outputs.PhaseStatus[phaseDataFlow] == PhaseStatusCompleted && outputs.DataFlow != nil &&
+		len(outputs.DataFlow.Flows) == 0 && len(outputs.DataFlow.NilSources) == 0 {
+		outputs.PhaseStatus[phaseDataFlow] = PhaseStatusEmpty
 	}
 
 	return outputs, nil
 }
 
-func applyScopeDerivedFields(scope *ScopeData) {
-	if scope == nil {
-		return
+// loadPhasePerLanguage walks the supplied languages, reads each
+// "<lang><suffix>" file from dir, and passes the raw bytes to parse. Returns
+// the aggregated PhaseStatus across all languages. Errors are funnelled into
+// recordErr so the caller can log or accumulate as it sees fit.
+func loadPhasePerLanguage(
+	dir string,
+	languages []string,
+	suffix string,
+	parse func([]byte) (bool, error),
+	recordErr func(string),
+) PhaseStatus {
+	var (
+		anyCompleted bool
+		anyFailed    bool
+		anyFound     bool
+	)
+	for _, lang := range languages {
+		path := filepath.Join(dir, lang+suffix)
+		data, err := readJSONFileWithLimit(path)
+		if err != nil {
+			if isFileNotFound(err) {
+				continue
+			}
+			anyFailed = true
+			anyFound = true
+			recordErr(fmt.Sprintf("%s%s read error", lang, suffix))
+			continue
+		}
+		anyFound = true
+		if _, perr := parse(data); perr == nil {
+			anyCompleted = true
+		} else {
+			anyFailed = true
+			recordErr(fmt.Sprintf("%s%s parse error", lang, suffix))
+		}
 	}
-	scope.ModifiedFiles = scope.Files.Modified
-	scope.AddedFiles = scope.Files.Added
-	scope.DeletedFiles = scope.Files.Deleted
-	scope.TotalFiles = scope.Stats.TotalFiles
-	scope.TotalAdditions = scope.Stats.TotalAdditions
-	scope.TotalDeletions = scope.Stats.TotalDeletions
-	if scope.Languages == nil {
-		scope.Languages = []string{}
+
+	switch {
+	case anyCompleted:
+		return PhaseStatusCompleted
+	case anyFailed:
+		return PhaseStatusFailed
+	case !anyFound:
+		return PhaseStatusNotRun
+	default:
+		return PhaseStatusEmpty
 	}
+}
+
+func astIsEmpty(a *ASTData) bool {
+	if a == nil {
+		return true
+	}
+	return len(a.Functions.Modified) == 0 &&
+		len(a.Functions.Added) == 0 &&
+		len(a.Functions.Deleted) == 0 &&
+		len(a.Types.Modified) == 0 &&
+		len(a.Types.Added) == 0 &&
+		len(a.Types.Deleted) == 0 &&
+		len(a.Imports.Added) == 0 &&
+		len(a.Imports.Removed) == 0
 }
 
 func isFileNotFound(err error) bool {
@@ -318,12 +398,12 @@ func (c *Compiler) buildTemplateData(reviewer string, outputs *PhaseOutputs) *Te
 		}}
 		return data
 	}
-	builder(c, data, outputs)
+	builder(data, outputs)
 	return data
 }
 
 // buildCodeReviewerData populates data for the code reviewer.
-func (c *Compiler) buildCodeReviewerData(data *TemplateData, outputs *PhaseOutputs) {
+func buildCodeReviewerData(data *TemplateData, outputs *PhaseOutputs) {
 	// Static analysis findings (non-security)
 	if outputs.StaticAnalysis != nil {
 		data.Findings = FilterFindingsForCodeReviewer(outputs.StaticAnalysis.Findings)
@@ -339,11 +419,11 @@ func (c *Compiler) buildCodeReviewerData(data *TemplateData, outputs *PhaseOutpu
 	}
 
 	// Build focus areas
-	data.FocusAreas = c.buildCodeReviewerFocusAreas(outputs)
+	data.FocusAreas = buildCodeReviewerFocusAreas(outputs)
 }
 
 // buildSecurityReviewerData populates data for the security reviewer.
-func (c *Compiler) buildSecurityReviewerData(data *TemplateData, outputs *PhaseOutputs) {
+func buildSecurityReviewerData(data *TemplateData, outputs *PhaseOutputs) {
 	// Security-specific findings
 	if outputs.StaticAnalysis != nil {
 		data.Findings = FilterFindingsForSecurityReviewer(outputs.StaticAnalysis.Findings)
@@ -364,11 +444,15 @@ func (c *Compiler) buildSecurityReviewerData(data *TemplateData, outputs *PhaseO
 	}
 
 	// Build focus areas
-	data.FocusAreas = c.buildSecurityReviewerFocusAreas(outputs)
+	data.FocusAreas = buildSecurityReviewerFocusAreas(outputs)
 }
 
 // buildBusinessLogicReviewerData populates data for the business logic reviewer.
-func (c *Compiler) buildBusinessLogicReviewerData(data *TemplateData, outputs *PhaseOutputs) {
+// Also surfaces data-flow findings (H40): a user-input -> database flow is
+// a correctness concern (is validation right, is the query appropriate?),
+// not purely a security concern. The security reviewer still sees the same
+// flows via its own builder — they are complementary, not exclusive.
+func buildBusinessLogicReviewerData(data *TemplateData, outputs *PhaseOutputs) {
 	// Call graph for impact analysis
 	if outputs.CallGraph != nil {
 		data.HasCallGraph = true
@@ -384,12 +468,28 @@ func (c *Compiler) buildBusinessLogicReviewerData(data *TemplateData, outputs *P
 		data.ModifiedFunctions = outputs.AST.Functions.Modified
 	}
 
+	// Data-flow correctness signals: high/medium risk flows indicate where
+	// validation and query shape matter, independent of pure security risk.
+	if outputs.DataFlow != nil {
+		for _, flow := range outputs.DataFlow.Flows {
+			switch flow.Risk {
+			case "high", "critical":
+				data.HighRiskFlows = append(data.HighRiskFlows, flow)
+			case "medium":
+				data.MediumRiskFlows = append(data.MediumRiskFlows, flow)
+			}
+		}
+		if len(data.HighRiskFlows) > 0 || len(data.MediumRiskFlows) > 0 {
+			data.HasDataFlowAnalysis = true
+		}
+	}
+
 	// Build focus areas
-	data.FocusAreas = c.buildBusinessLogicReviewerFocusAreas(outputs)
+	data.FocusAreas = buildBusinessLogicReviewerFocusAreas(outputs, data)
 }
 
 // buildTestReviewerData populates data for the test reviewer.
-func (c *Compiler) buildTestReviewerData(data *TemplateData, outputs *PhaseOutputs) {
+func buildTestReviewerData(data *TemplateData, outputs *PhaseOutputs) {
 	// Call graph for test coverage
 	if outputs.CallGraph != nil {
 		data.HasCallGraph = true
@@ -402,11 +502,11 @@ func (c *Compiler) buildTestReviewerData(data *TemplateData, outputs *PhaseOutpu
 	}
 
 	// Build focus areas
-	data.FocusAreas = c.buildTestReviewerFocusAreas(outputs)
+	data.FocusAreas = buildTestReviewerFocusAreas(outputs)
 }
 
 // buildNilSafetyReviewerData populates data for the nil safety reviewer.
-func (c *Compiler) buildNilSafetyReviewerData(data *TemplateData, outputs *PhaseOutputs) {
+func buildNilSafetyReviewerData(data *TemplateData, outputs *PhaseOutputs) {
 	// Nil sources from data flow
 	if outputs.DataFlow != nil && len(outputs.DataFlow.NilSources) > 0 {
 		data.HasNilSources = true
@@ -415,12 +515,12 @@ func (c *Compiler) buildNilSafetyReviewerData(data *TemplateData, outputs *Phase
 	}
 
 	// Build focus areas
-	data.FocusAreas = c.buildNilSafetyReviewerFocusAreas(outputs)
+	data.FocusAreas = buildNilSafetyReviewerFocusAreas(outputs)
 }
 
-// Focus area builders
+// Focus area builders (package-level — no Compiler state used).
 
-func (c *Compiler) buildCodeReviewerFocusAreas(outputs *PhaseOutputs) []FocusArea {
+func buildCodeReviewerFocusAreas(outputs *PhaseOutputs) []FocusArea {
 	var areas []FocusArea
 
 	// Check for deprecation warnings
@@ -449,7 +549,7 @@ func (c *Compiler) buildCodeReviewerFocusAreas(outputs *PhaseOutputs) []FocusAre
 	return areas
 }
 
-func (c *Compiler) buildSecurityReviewerFocusAreas(outputs *PhaseOutputs) []FocusArea {
+func buildSecurityReviewerFocusAreas(outputs *PhaseOutputs) []FocusArea {
 	var areas []FocusArea
 
 	// Check for high-risk data flows
@@ -485,7 +585,7 @@ func (c *Compiler) buildSecurityReviewerFocusAreas(outputs *PhaseOutputs) []Focu
 	return areas
 }
 
-func (c *Compiler) buildBusinessLogicReviewerFocusAreas(outputs *PhaseOutputs) []FocusArea {
+func buildBusinessLogicReviewerFocusAreas(outputs *PhaseOutputs, data *TemplateData) []FocusArea {
 	var areas []FocusArea
 
 	// Check for high-impact changes
@@ -507,10 +607,18 @@ func (c *Compiler) buildBusinessLogicReviewerFocusAreas(outputs *PhaseOutputs) [
 		})
 	}
 
+	// H40: dataflow correctness focus
+	if data != nil && len(data.HighRiskFlows) > 0 {
+		areas = append(areas, FocusArea{
+			Title:       "Data Flow Correctness",
+			Description: fmt.Sprintf("%d high-risk data flow(s) — verify input validation and query shape", len(data.HighRiskFlows)),
+		})
+	}
+
 	return areas
 }
 
-func (c *Compiler) buildTestReviewerFocusAreas(outputs *PhaseOutputs) []FocusArea {
+func buildTestReviewerFocusAreas(outputs *PhaseOutputs) []FocusArea {
 	var areas []FocusArea
 
 	// Check for uncovered functions
@@ -537,7 +645,7 @@ func (c *Compiler) buildTestReviewerFocusAreas(outputs *PhaseOutputs) []FocusAre
 	return areas
 }
 
-func (c *Compiler) buildNilSafetyReviewerFocusAreas(outputs *PhaseOutputs) []FocusArea {
+func buildNilSafetyReviewerFocusAreas(outputs *PhaseOutputs) []FocusArea {
 	var areas []FocusArea
 
 	// Check for unchecked nil sources
@@ -558,6 +666,131 @@ func (c *Compiler) buildNilSafetyReviewerFocusAreas(outputs *PhaseOutputs) []Foc
 				Description: fmt.Sprintf("%d high-risk nil sources require immediate attention", len(highRisk)),
 			})
 		}
+	}
+
+	return areas
+}
+
+func buildConsequencesReviewerData(data *TemplateData, outputs *PhaseOutputs) {
+	if outputs.AST != nil {
+		for _, f := range outputs.AST.Functions.Modified {
+			if f.Before.Signature != f.After.Signature {
+				data.SignatureChanges = append(data.SignatureChanges, f)
+			}
+		}
+		data.TypeSurfaceChanges = outputs.AST.Types.Modified
+		data.ImportsAdded = outputs.AST.Imports.Added
+		data.ImportsRemoved = outputs.AST.Imports.Removed
+		data.ErrorReturnsAdded = outputs.AST.ErrorHandling.NewErrorReturns
+		data.ErrorChecksRemoved = outputs.AST.ErrorHandling.RemovedErrorChecks
+	}
+
+	if outputs.CallGraph != nil {
+		for _, f := range outputs.CallGraph.ModifiedFunctions {
+			if len(f.Callers) > 0 {
+				data.CallerImpactedFunctions = append(data.CallerImpactedFunctions, f)
+			}
+		}
+	}
+
+	data.HasConsequences = len(data.SignatureChanges) > 0 ||
+		len(data.TypeSurfaceChanges) > 0 ||
+		len(data.ImportsAdded) > 0 ||
+		len(data.ImportsRemoved) > 0 ||
+		len(data.ErrorReturnsAdded) > 0 ||
+		len(data.ErrorChecksRemoved) > 0 ||
+		len(data.CallerImpactedFunctions) > 0
+
+	data.FocusAreas = buildConsequencesReviewerFocusAreas(outputs, data)
+}
+
+func buildDeadCodeReviewerData(data *TemplateData, outputs *PhaseOutputs) {
+	if outputs.AST != nil {
+		data.DeletedFunctions = outputs.AST.Functions.Deleted
+		data.DeletedTypes = outputs.AST.Types.Deleted
+		data.RemovedImports = outputs.AST.Imports.Removed
+	}
+
+	if outputs.CallGraph != nil {
+		for _, f := range outputs.CallGraph.ModifiedFunctions {
+			if len(f.Callers) == 0 {
+				data.OrphanFunctions = append(data.OrphanFunctions, f)
+				if len(f.TestCoverage) > 0 {
+					data.ZombieTests = append(data.ZombieTests, f)
+				}
+			}
+		}
+	}
+
+	data.HasDeadCodeSignals = len(data.DeletedFunctions) > 0 ||
+		len(data.DeletedTypes) > 0 ||
+		len(data.RemovedImports) > 0 ||
+		len(data.OrphanFunctions) > 0 ||
+		len(data.ZombieTests) > 0
+
+	data.FocusAreas = buildDeadCodeReviewerFocusAreas(outputs, data)
+}
+
+func buildConsequencesReviewerFocusAreas(outputs *PhaseOutputs, data *TemplateData) []FocusArea {
+	var areas []FocusArea
+
+	if len(data.SignatureChanges) > 0 {
+		areas = append(areas, FocusArea{
+			Title:       "Signature Changes",
+			Description: fmt.Sprintf("%d function signature(s) changed - all direct callers must be verified", len(data.SignatureChanges)),
+		})
+	}
+	if len(data.TypeSurfaceChanges) > 0 {
+		areas = append(areas, FocusArea{
+			Title:       "Type Shape Changes",
+			Description: fmt.Sprintf("%d type(s) modified - downstream serialization and field access may break", len(data.TypeSurfaceChanges)),
+		})
+	}
+	if outputs.CallGraph != nil {
+		highImpact := GetHighImpactFunctions(outputs.CallGraph, highImpactCallerThreshold)
+		if len(highImpact) > 0 {
+			areas = append(areas, FocusArea{
+				Title:       "Broad Caller Reach",
+				Description: fmt.Sprintf("%d modified function(s) have %d+ callers", len(highImpact), highImpactCallerThreshold),
+			})
+		}
+	}
+	if len(data.ErrorReturnsAdded) > 0 {
+		areas = append(areas, FocusArea{
+			Title:       "New Error Paths",
+			Description: fmt.Sprintf("%d new error return(s) widen the failure surface for callers", len(data.ErrorReturnsAdded)),
+		})
+	}
+
+	return areas
+}
+
+func buildDeadCodeReviewerFocusAreas(_ *PhaseOutputs, data *TemplateData) []FocusArea {
+	var areas []FocusArea
+
+	if len(data.DeletedFunctions) > 0 {
+		areas = append(areas, FocusArea{
+			Title:       "Deleted Functions",
+			Description: fmt.Sprintf("%d function(s) removed - confirm no external consumers remain", len(data.DeletedFunctions)),
+		})
+	}
+	if len(data.OrphanFunctions) > 0 {
+		areas = append(areas, FocusArea{
+			Title:       "Orphan Functions",
+			Description: fmt.Sprintf("%d modified function(s) have zero callers in the call graph", len(data.OrphanFunctions)),
+		})
+	}
+	if len(data.ZombieTests) > 0 {
+		areas = append(areas, FocusArea{
+			Title:       "Zombie Tests",
+			Description: fmt.Sprintf("%d orphan function(s) are still covered by tests - candidates for joint removal", len(data.ZombieTests)),
+		})
+	}
+	if len(data.RemovedImports) > 0 {
+		areas = append(areas, FocusArea{
+			Title:       "Removed Imports",
+			Description: fmt.Sprintf("%d import(s) removed - verify downstream packages still resolve", len(data.RemovedImports)),
+		})
 	}
 
 	return areas

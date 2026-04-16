@@ -1,0 +1,59 @@
+{
+  "language": "go",
+  "sources": [
+    {
+      "type": "http_query",
+      "file": "internal/handler/user.go",
+      "line": 12,
+      "variable": "id",
+      "pattern": "c.Query",
+      "context": "id := c.Query(\"id\")"
+    }
+  ],
+  "sinks": [
+    {
+      "type": "database",
+      "file": "internal/repo/user.go",
+      "line": 45,
+      "function": "db.Exec",
+      "pattern": "db.Exec",
+      "context": "db.Exec(\"SELECT * FROM users WHERE id=\"+id)"
+    }
+  ],
+  "flows": [
+    {
+      "id": "flow-1",
+      "source": {
+        "type": "http_query",
+        "file": "internal/handler/user.go",
+        "line": 12,
+        "variable": "id",
+        "pattern": "c.Query",
+        "context": "id := c.Query(\"id\")"
+      },
+      "sink": {
+        "type": "database",
+        "file": "internal/repo/user.go",
+        "line": 45,
+        "function": "db.Exec",
+        "pattern": "db.Exec",
+        "context": "db.Exec(\"SELECT * FROM users WHERE id=\"+id)"
+      },
+      "path": ["internal/handler/user.go:12", "internal/repo/user.go:45"],
+      "sanitized": false,
+      "risk": "critical",
+      "description": "SQL injection via unsanitized query param"
+    }
+  ],
+  "nil_sources": [],
+  "statistics": {
+    "total_sources": 1,
+    "total_sinks": 1,
+    "total_flows": 1,
+    "unsanitized_flows": 1,
+    "critical_flows": 1,
+    "high_risk_flows": 0,
+    "nil_risks": 0,
+    "unchecked_nil_risks": 0
+  }
+}

@@ -2,6 +2,21 @@ import * as fs from "fs"
 import * as path from "path"
 import * as ts from "typescript"
 
+const DEFAULT_SCRIPT_TIMEOUT_MS = 120 * 1000
+
+function installWallClockTimeout(): void {
+  const raw = process.env.MITHRIL_SCRIPT_TIMEOUT_SEC
+  const seconds = raw ? parseInt(raw, 10) : DEFAULT_SCRIPT_TIMEOUT_MS / 1000
+  if (!Number.isFinite(seconds) || seconds <= 0) return
+  const timer = setTimeout(() => {
+    process.stderr.write(
+      JSON.stringify({ error: `script wall-clock timeout after ${seconds}s` }) + "\n",
+    )
+    process.exit(2)
+  }, seconds * 1000)
+  if (typeof timer.unref === "function") timer.unref()
+}
+
 const IGNORED_CALLEE_TARGETS = new Set<string>([
   // Common Node/TS/JS built-ins / globals that usually add noise to call graphs.
   "require",
@@ -106,11 +121,20 @@ function analyzeCallGraph(filePaths: string[], targetFunctions?: string[]): Call
   const allFunctions: ParsedFunction[] = []
 
   if (useTypeChecker) {
+    // A fixed compiler-options object is passed explicitly so workspace
+    // tsconfig.json `extends` / `paths` / `types` directives cannot pull
+    // hostile code into the compilation. noResolve disables module resolution
+    // (we only need the local type checker), skipLib* short-circuits the
+    // default lib + .d.ts crawl.
     const program = ts.createProgram(existingFiles, {
       target: ts.ScriptTarget.Latest,
       module: ts.ModuleKind.CommonJS,
       allowJs: true,
       checkJs: true,
+      noResolve: true,
+      skipLibCheck: true,
+      skipDefaultLibCheck: true,
+      types: [],
     })
     const programTypeChecker = program.getTypeChecker()
     typeChecker = programTypeChecker
@@ -670,14 +694,18 @@ function getBaseName(name: string): string {
 /**
  * Parses CLI arguments.
  */
-function parseArgs(args: string[]): { files: string[]; functions: string[] } {
+function parseArgs(args: string[]): {
+  files: string[]
+  functions: string[]
+  baseDir: string
+} {
   const files: string[] = []
   const functions: string[] = []
+  let baseDir = ""
 
   for (let i = 0; i < args.length; i++) {
     const arg = args[i]
     if (arg === "--functions" && i + 1 < args.length) {
-      // Parse comma-separated function names
       const funcList = args[i + 1]
       functions.push(
         ...funcList
@@ -686,39 +714,75 @@ function parseArgs(args: string[]): { files: string[]; functions: string[] } {
           .filter((f) => f),
       )
       i++
+    } else if (arg === "--base-dir" && i + 1 < args.length) {
+      baseDir = args[i + 1]
+      i++
     } else if (!arg.startsWith("--")) {
       files.push(arg)
     }
   }
 
-  return { files, functions }
+  return { files, functions, baseDir }
+}
+
+/**
+ * Returns the canonical absolute path if `p` lies inside `baseDir`, else null.
+ * Resolves symlinks so an in-repo link pointing outside the sandbox is rejected.
+ */
+export function sandboxPath(p: string, baseDir: string): string | null {
+  try {
+    const baseAbs = path.resolve(baseDir)
+    const baseReal = fs.existsSync(baseAbs) ? fs.realpathSync(baseAbs) : baseAbs
+    const candAbs = path.resolve(p)
+    const candReal = fs.existsSync(candAbs) ? fs.realpathSync(candAbs) : candAbs
+    if (candReal === baseReal) return candReal
+    const prefix = baseReal + path.sep
+    if (candReal.startsWith(prefix)) return candReal
+    return null
+  } catch {
+    return null
+  }
 }
 
 /**
  * Main CLI entry point.
  */
 function main() {
+  installWallClockTimeout()
   const args = process.argv.slice(2)
 
   if (args.length === 0) {
-    console.error("Usage: call-graph <files...> [--functions func1,func2,...]")
+    console.error("Usage: call-graph <files...> [--functions func1,func2,...] [--base-dir <dir>]")
     console.error("")
     console.error("Analyzes TypeScript files and outputs function call relationships.")
     console.error("")
     console.error("Options:")
     console.error("  --functions    Comma-separated list of function names to focus on")
+    console.error("  --base-dir     Sandbox root; files must lie inside (default: cwd)")
     process.exit(1)
   }
 
-  const { files, functions } = parseArgs(args)
+  const { files, functions, baseDir } = parseArgs(args)
 
   if (files.length === 0) {
     console.error("Error: No files specified")
     process.exit(1)
   }
 
-  // Resolve file paths
-  const resolvedFiles = files.map((f) => path.resolve(f))
+  const sandboxRoot = baseDir || process.cwd()
+
+  // Resolve & sandbox each file path; reject any that escape the base dir.
+  const resolvedFiles: string[] = []
+  for (const f of files) {
+    const safe = sandboxPath(f, sandboxRoot)
+    if (safe === null) {
+      console.error(
+        `Error: path escapes base directory (base=${sandboxRoot}): ${f}`,
+      )
+      process.exit(1)
+    }
+    resolvedFiles.push(safe)
+  }
 
   try {
     const targetFunctions = functions.length > 0 ? functions : undefined

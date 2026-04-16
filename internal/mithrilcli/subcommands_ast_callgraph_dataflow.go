@@ -102,6 +102,8 @@ func runAstExtractor(args []string, stdout io.Writer, stderr io.Writer) error {
 			_, _ = fmt.Fprint(stdout, ast.RenderMultipleMarkdown(diffs))
 			return nil
 		}
+		// fileutil.WriteJSONFile exception: we're streaming the payload to
+		// an open writer (stdout), not persisting to a file.
 		payload, err := json.MarshalIndent(diffs, "", "  ")
 		if err != nil {
 			return fmt.Errorf("failed to marshal output: %w", err)
@@ -303,6 +305,8 @@ func runDataFlow(args []string, stdout io.Writer, stderr io.Writer) error {
 	}
 
 	if *jsonOnly {
+		// fileutil.WriteJSONFile exception: streams to stdout (open writer),
+		// does not persist to a file.
 		payload, err := json.MarshalIndent(struct {
 			Languages map[string]*dataflow.FlowAnalysis `json:"languages"`
 		}{Languages: results}, "", "  ")
@@ -594,6 +598,7 @@ func writeResultsWithOutputDir(result *callgraph.CallGraphResult, outputDir stri
 
 type scopeFile struct {
 	Files           []string
+	DeletedFiles    []string
 	Languages       []string
 	FilesByLanguage map[string][]string
 }
@@ -616,7 +621,10 @@ func loadScopeForDataFlow(path, workDir string) (*scopeFile, error) {
 
 func buildScopeFromCanonical(canonical *scopepkg.ScopeJSON, workDir string) (*scopeFile, error) {
 	s := &scopeFile{Languages: []string{}, FilesByLanguage: map[string][]string{}}
-	rawFiles := canonical.GetAllFiles()
+	// Dataflow needs files present on disk; deleted paths are surfaced
+	// separately via DeletedFiles so callers wanting before-image analysis
+	// can load them from git explicitly.
+	rawFiles := canonical.GetAnalyzableFiles()
 	if len(rawFiles) > maxFiles {
 		return nil, fmt.Errorf("too many files: %d (max %d)", len(rawFiles), maxFiles)
 	}
@@ -627,6 +635,7 @@ func buildScopeFromCanonical(canonical *scopepkg.ScopeJSON, workDir string) (*sc
 		}
 		s.Files = append(s.Files, validPath)
 	}
+	s.DeletedFiles = canonical.GetDeletedFiles()
 	seen := map[string]struct{}{}
 	for _, lang := range canonical.Languages {
 		normalized := normalizeDataFlowLanguage(lang)
@@ -659,6 +668,7 @@ func loadLegacyScope(path, workDir string) (*scopeFile, error) {
 		return nil, err
 	}
 	var rawFiles []string
+	var deletedFiles []string
 	if filesRaw, ok := raw["files"]; ok {
 		var flat []string
 		if err := json.Unmarshal(filesRaw, &flat); err == nil {
@@ -668,6 +678,7 @@ func loadLegacyScope(path, workDir string) (*scopeFile, error) {
 			if err := json.Unmarshal(filesRaw, &nested); err == nil {
 				rawFiles = append(rawFiles, nested.Modified...)
 				rawFiles = append(rawFiles, nested.Added...)
+				deletedFiles = append(deletedFiles, nested.Deleted...)
 			}
 		}
 	}
@@ -678,6 +689,7 @@ func loadLegacyScope(path, workDir string) (*scopeFile, error) {
 		}
 		s.Files = append(s.Files, validPath)
 	}
+	s.DeletedFiles = deletedFiles
 	for _, file := range s.Files {
 		if lang := detectDataFlowLanguage(file); lang != "" {
 			s.FilesByLanguage[lang] = append(s.FilesByLanguage[lang], file)
@@ -746,15 +758,11 @@ func getFilesForLanguage(scope *scopeFile, lang string) []string {
 	return filtered
 }
 
-func writeJSON(path string, data interface{}) error {
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		return err
-	}
-	payload, err := json.MarshalIndent(data, "", "  ")
-	if err != nil {
-		return err
-	}
-	return os.WriteFile(path, payload, 0o600)
+// writeJSON is now a thin wrapper around fileutil.WriteJSONFile so every
+// analysis output honours the same 0o600 / trailing-newline / symlink-safe
+// contract (H26).
+func writeJSON(path string, data any) error {
+	return fileutil.WriteJSONFile(path, data)
 }
 
 func printDataFlowSummary(results map[string]*dataflow.FlowAnalysis, outputDir *string, stdout io.Writer) {

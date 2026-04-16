@@ -330,19 +330,22 @@ func TestTemplateFuncs_SignatureChanged(t *testing.T) {
 func TestTemplateFuncs_RiskLevel(t *testing.T) {
 	fn := templateFuncs["riskLevel"].(func(FunctionCallGraph) string)
 
-	high := FunctionCallGraph{Callers: make([]CallSite, 5)}
-	if fn(high) != "HIGH" {
-		t.Error("5+ callers should be HIGH risk")
+	// Thresholds come from callgraph.RiskLevelFromCallerCount (shared helper):
+	// >=3 HIGH, >=1 MEDIUM, 0 LOW. Verifies the unified threshold from H41.
+	if got := fn(FunctionCallGraph{Callers: make([]CallSite, 5)}); got != "HIGH" {
+		t.Errorf("5 callers should be HIGH, got %s", got)
 	}
-
-	medium := FunctionCallGraph{Callers: make([]CallSite, 3)}
-	if fn(medium) != "MEDIUM" {
-		t.Error("2-4 callers should be MEDIUM risk")
+	if got := fn(FunctionCallGraph{Callers: make([]CallSite, 3)}); got != "HIGH" {
+		t.Errorf("3 callers should be HIGH (boundary), got %s", got)
 	}
-
-	low := FunctionCallGraph{Callers: make([]CallSite, 1)}
-	if fn(low) != "LOW" {
-		t.Error("0-1 callers should be LOW risk")
+	if got := fn(FunctionCallGraph{Callers: make([]CallSite, 2)}); got != "MEDIUM" {
+		t.Errorf("2 callers should be MEDIUM, got %s", got)
+	}
+	if got := fn(FunctionCallGraph{Callers: make([]CallSite, 1)}); got != "MEDIUM" {
+		t.Errorf("1 caller should be MEDIUM, got %s", got)
+	}
+	if got := fn(FunctionCallGraph{Callers: nil}); got != "LOW" {
+		t.Errorf("0 callers should be LOW, got %s", got)
 	}
 }
 

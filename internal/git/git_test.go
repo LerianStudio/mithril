@@ -2,6 +2,7 @@ package git
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -1069,6 +1070,55 @@ func TestClientShowFile(t *testing.T) {
 	}
 }
 
+// TestRunGitCommandEnvFiltered verifies that runGitCommand does not forward
+// credentials-bearing environment variables from the parent process to the
+// git subprocess. We install a PATH shim named "git" that prints its own
+// environment and then inspect stdout.
+func TestRunGitCommandEnvFiltered(t *testing.T) {
+	envBin, err := exec.LookPath("env")
+	if err != nil {
+		t.Skip("env binary not available")
+	}
+
+	shimDir := t.TempDir()
+	shimPath := filepath.Join(shimDir, "git")
+	shim := "#!/bin/sh\nexec " + envBin + "\n"
+	if err := os.WriteFile(shimPath, []byte(shim), 0o755); err != nil {
+		t.Fatalf("failed to create shim: %v", err)
+	}
+
+	// Pollute the parent env with vars that must NOT leak to the child.
+	forbidden := map[string]string{
+		"GITHUB_TOKEN":     "super-secret-token",
+		"GIT_SSH_COMMAND":  "ssh -i /tmp/should-not-leak",
+		"SSH_AUTH_SOCK":    "/tmp/should-not-leak.sock",
+		"GIT_CONFIG_KEY_0": "http.extraheader",
+	}
+	for k, v := range forbidden {
+		t.Setenv(k, v)
+	}
+	// Ensure PATH points at the shim (LookPath inside exec.Command uses PATH).
+	t.Setenv("PATH", shimDir)
+
+	out, err := runGitCommand("", "status")
+	if err != nil {
+		t.Fatalf("runGitCommand returned error: %v (out=%s)", err, string(out))
+	}
+
+	output := string(out)
+	for key := range forbidden {
+		if strings.Contains(output, key+"=") {
+			t.Errorf("subprocess env leaked %s: %s", key, output)
+		}
+	}
+	if !strings.Contains(output, "LC_ALL=C") {
+		t.Errorf("expected LC_ALL=C in child env, got: %s", output)
+	}
+	if !strings.Contains(output, "GIT_TERMINAL_PROMPT=0") {
+		t.Errorf("expected GIT_TERMINAL_PROMPT=0 in child env, got: %s", output)
+	}
+}
+
 func TestClientGetDiffStatsForFiles(t *testing.T) {
 	repo := setupTestRepo(t)
 	writeFile(t, repo, "notes.txt", "hello\n")
@@ -1091,5 +1141,72 @@ func TestClientGetDiffStatsForFiles(t *testing.T) {
 	}
 	if fileStats.Additions != 1 || fileStats.Deletions != 0 {
 		t.Fatalf("notes.txt stats = %+v", fileStats)
+	}
+}
+
+func TestBatchPathsByBytes(t *testing.T) {
+	// Three 10-byte paths, cap 25 bytes (accounting for +1 separator each
+	// = 11 bytes per path). Batch 1 fits 2 (22B); batch 2 holds the rest.
+	paths := []string{"aaaaaaaaaa", "bbbbbbbbbb", "cccccccccc"}
+	batches := batchPathsByBytes(paths, 25)
+	if len(batches) != 2 {
+		t.Fatalf("got %d batches, want 2: %v", len(batches), batches)
+	}
+	if len(batches[0]) != 2 || len(batches[1]) != 1 {
+		t.Fatalf("batch sizes = [%d, %d], want [2, 1]", len(batches[0]), len(batches[1]))
+	}
+
+	// Everything-in-one-batch case.
+	single := batchPathsByBytes([]string{"a", "b", "c"}, 1024)
+	if len(single) != 1 || len(single[0]) != 3 {
+		t.Fatalf("single batch case failed: %v", single)
+	}
+
+	// Oversized single path still gets its own batch (not dropped).
+	giant := strings.Repeat("x", 200)
+	oversized := batchPathsByBytes([]string{giant, "small"}, 50)
+	if len(oversized) != 2 || oversized[0][0] != giant || oversized[1][0] != "small" {
+		t.Fatalf("oversized case failed: %v", oversized)
+	}
+
+	// maxBytes <= 0 is defensive: return input unchanged.
+	if got := batchPathsByBytes([]string{"a", "b"}, 0); len(got) != 1 || len(got[0]) != 2 {
+		t.Fatalf("nonpositive maxBytes should return single batch, got %v", got)
+	}
+}
+
+func TestClientGetDiffStatsForFilesBatches(t *testing.T) {
+	repo := setupTestRepo(t)
+	// Build enough path bytes to exceed maxDiffStatsArgBytes and force at
+	// least two git diff --numstat invocations.
+	files := make([]string, 0)
+	totalBytes := 0
+	for i := 0; totalBytes <= maxDiffStatsArgBytes+1024; i++ {
+		name := fmt.Sprintf("batch_%04d_%s.txt", i, strings.Repeat("y", 120))
+		writeFile(t, repo, name, "v1\n")
+		files = append(files, name)
+		totalBytes += len(name) + 1
+	}
+	runGit(t, repo, "add", ".")
+	runGit(t, repo, "commit", "-m", "seed")
+	for _, f := range files {
+		writeFile(t, repo, f, "v1\nv2\n")
+	}
+
+	client := NewClient(repo)
+	stats, perFile, err := client.GetDiffStatsForFiles("HEAD", files)
+	if err != nil {
+		t.Fatalf("GetDiffStatsForFiles error = %v", err)
+	}
+	if stats.TotalFiles != len(files) {
+		t.Fatalf("TotalFiles = %d, want %d", stats.TotalFiles, len(files))
+	}
+	if len(perFile) != len(files) {
+		t.Fatalf("perFile len = %d, want %d", len(perFile), len(files))
+	}
+	for _, f := range files {
+		if _, ok := perFile[f]; !ok {
+			t.Errorf("missing stats for %q", f)
+		}
 	}
 }

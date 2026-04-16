@@ -6,7 +6,8 @@
   "scripts": {
     "build": "tsc",
     "extract": "node dist/ast-extractor.js",
-    "call-graph": "node dist/call-graph.js"
+    "call-graph": "node dist/call-graph.js",
+    "test": "npm run build && node --test smoke.test.mjs"
   },
   "dependencies": {
     "typescript": "^5.3.0"

@@ -1,34 +1,18 @@
-.PHONY: all build test test-coverage clean install fmt vet golangci-lint lint \
-	scope-detector static-analysis ast-extractor call-graph data-flow compile-context run-all mithril \
-	build-context
+.PHONY: all build test test-coverage test-integration clean install fmt vet golangci-lint lint mithril
 
 # Binary output directory
 BIN_DIR := bin
-
-# All binaries to build
-BINARIES := scope-detector static-analysis ast-extractor call-graph data-flow compile-context run-all
 
 VERSION ?= dev
 
 all: build
 
-build: $(BINARIES) mithril
-
-# Pattern rule for building all phase binaries
-# Replaces individual targets with identical echo/mkdir/go-build pattern
-$(BINARIES):
-	@echo "Building $@..."
-	@mkdir -p $(BIN_DIR)
-	@go build -o $(BIN_DIR)/$@ ./cmd/$@
+build: mithril
 
 mithril:
 	@echo "Building mithril..."
 	@mkdir -p $(BIN_DIR)
 	@go build -ldflags "-X main.version=$(VERSION)" -o $(BIN_DIR)/mithril .
-
-# Convenience target for Phase 5 binaries only
-build-context: compile-context run-all
-	@echo "Context binaries built."
 
 test:
 	@echo "Running tests..."
@@ -39,6 +23,13 @@ test-coverage:
 	@go test -v -race -coverprofile=coverage.out ./...
 	@go tool cover -html=coverage.out -o coverage.html
 	@echo "Coverage report: coverage.html"
+
+# Integration tests exercise the built `mithril` binary via exec.Command and
+# are gated behind the `integration` build tag so the default `make test`
+# remains fast and hermetic.
+test-integration:
+	@echo "Running integration tests..."
+	@go test -v -tags=integration ./...
 
 clean:
 	@echo "Cleaning..."

@@ -13,6 +13,7 @@ const (
 	SourceDatabase   SourceType = "database"
 	SourceUserInput  SourceType = "user_input"
 	SourceExternal   SourceType = "external_api"
+	SourceJSONDecode SourceType = "json_decode"
 )
 
 // SinkType categorizes where data flows to
@@ -77,7 +78,9 @@ type Flow struct {
 type NilSource struct {
 	File      string    `json:"file"`
 	Line      int       `json:"line"`
+	Column    int       `json:"column,omitempty"`
 	Variable  string    `json:"variable"`
+	Pattern   string    `json:"pattern,omitempty"`
 	Origin    string    `json:"origin"`
 	IsChecked bool      `json:"is_checked"`
 	CheckLine int       `json:"check_line,omitempty"`
@@ -116,12 +119,21 @@ type SecuritySummary struct {
 	TopRisks   []Flow                  `json:"top_risks"`
 }
 
-// Analyzer interface for language-specific implementations
+// Analyzer is the contract that external callers use to drive a full
+// language-specific data-flow analysis pipeline.
+//
+// The interface is intentionally narrow — only Analyze is part of the public
+// contract. The per-phase helpers (DetectSources, DetectSinks, TrackFlows,
+// DetectNilSources) and Language remain on the concrete analyzer types
+// (*GoAnalyzer, *PythonAnalyzer) so in-package code and tests can drive
+// individual phases without widening the interface for every new caller.
+//
+// Dispatch pattern note: this package uses direct construction
+// (dataflow.NewGoAnalyzer / NewPythonAnalyzer / NewTypeScriptAnalyzer) rather
+// than a registry (see internal/ast) or a switch factory (see
+// internal/callgraph) because the only external caller dispatches once per
+// supported language and needs to bind language-specific configuration
+// (workDir vs scriptDir) at construction time.
 type Analyzer interface {
-	Language() string
-	DetectSources(files []string) ([]Source, error)
-	DetectSinks(files []string) ([]Sink, error)
-	TrackFlows(sources []Source, sinks []Sink, files []string) ([]Flow, error)
-	DetectNilSources(files []string) ([]NilSource, error)
 	Analyze(files []string) (*FlowAnalysis, error)
 }

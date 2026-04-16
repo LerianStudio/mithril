@@ -1,0 +1,14 @@
+[
+  {
+    "before_path": ".ring/codereview/.tmp/internal/handler/user.go",
+    "after_path": "internal/handler/user.go"
+  },
+  {
+    "before_path": "",
+    "after_path": "internal/handler/order.go"
+  },
+  {
+    "before_path": ".ring/codereview/.tmp/legacy/old_util.go",
+    "after_path": ""
+  }
+]

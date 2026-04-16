@@ -3,6 +3,21 @@ import * as path from "path"
 import * as ts from "typescript"
 
 const MAX_AST_FILE_SIZE = 10 * 1024 * 1024
+const DEFAULT_SCRIPT_TIMEOUT_MS = 120 * 1000
+
+function installWallClockTimeout(): void {
+  const raw = process.env.MITHRIL_SCRIPT_TIMEOUT_SEC
+  const seconds = raw ? parseInt(raw, 10) : DEFAULT_SCRIPT_TIMEOUT_MS / 1000
+  if (!Number.isFinite(seconds) || seconds <= 0) return
+  const timer = setTimeout(() => {
+    process.stderr.write(
+      JSON.stringify({ error: `script wall-clock timeout after ${seconds}s` }) + "\n",
+    )
+    process.exit(2)
+  }, seconds * 1000)
+  // Don't keep the event loop alive solely for the timer.
+  if (typeof timer.unref === "function") timer.unref()
+}
 
 interface Param {
   name: string
@@ -182,10 +197,39 @@ function parseFile(filePath: string): ParsedFile {
   }
 
   const content = fs.readFileSync(filePath, "utf-8")
-  const sourceFile = ts.createSourceFile(filePath, content, ts.ScriptTarget.Latest, true)
+  // Pick the right ScriptKind so JSX syntax in .tsx/.jsx parses correctly
+  // and ambient declarations in .d.ts are understood (see H17). .mts/.cts
+  // (ESM/CJS TypeScript) are handled explicitly as plain TS. Other
+  // extensions default to plain TS.
+  const lower = filePath.toLowerCase()
+  let scriptKind: ts.ScriptKind = ts.ScriptKind.TS
+  if (lower.endsWith(".tsx")) {
+    scriptKind = ts.ScriptKind.TSX
+  } else if (lower.endsWith(".jsx")) {
+    scriptKind = ts.ScriptKind.JSX
+  } else if (lower.endsWith(".js")) {
+    scriptKind = ts.ScriptKind.JS
+  } else if (lower.endsWith(".mts") || lower.endsWith(".cts")) {
+    scriptKind = ts.ScriptKind.TS
+  }
+  const sourceFile = ts.createSourceFile(
+    filePath,
+    content,
+    ts.ScriptTarget.Latest,
+    true,
+    scriptKind,
+  )
 
   function getLineNumber(pos: number): number {
     return sourceFile.getLineAndCharacterOfPosition(pos).line + 1
+  }
+
+  // startLineOf returns the 1-based line number at a node's true start
+  // (skipping leading trivia such as comments and whitespace). Using
+  // node.pos directly would include those, producing misleading line
+  // numbers when a function is preceded by a JSDoc block (see H16).
+  function startLineOf(node: ts.Node): number {
+    return getLineNumber(node.getStart(sourceFile))
   }
 
   function typeToString(type: ts.TypeNode | undefined): string {
@@ -223,7 +267,7 @@ function parseFile(filePath: string): ParsedFile {
         returns: [],
         isAsync: node.modifiers?.some((m) => m.kind === ts.SyntaxKind.AsyncKeyword) || false,
         isExported: isExported(node),
-        startLine: getLineNumber(node.pos),
+        startLine: startLineOf(node),
         endLine: getLineNumber(node.end),
         bodyText: node.body ? content.substring(node.body.pos, node.body.end) : "",
       }
@@ -253,7 +297,7 @@ function parseFile(filePath: string): ParsedFile {
 				kind,
 				type: typeToString(decl.type),
 				value: decl.initializer ? decl.initializer.getText(sourceFile).trim() : "",
-				startLine: getLineNumber(decl.pos),
+				startLine: startLineOf(decl),
 				endLine: getLineNumber(decl.end),
 			}
 			result.variables.set(parsedVar.name, parsedVar)
@@ -271,7 +315,7 @@ function parseFile(filePath: string): ParsedFile {
             returns: [],
             isAsync: arrow.modifiers?.some((m) => m.kind === ts.SyntaxKind.AsyncKeyword) || false,
             isExported: exported,
-            startLine: getLineNumber(node.pos),
+            startLine: startLineOf(node),
             endLine: getLineNumber(node.end),
             bodyText: content.substring(arrow.body.pos, arrow.body.end),
           }
@@ -299,7 +343,7 @@ function parseFile(filePath: string): ParsedFile {
         kind: "interface",
         fields: new Map(),
         isExported: isExported(node),
-        startLine: getLineNumber(node.pos),
+        startLine: startLineOf(node),
         endLine: getLineNumber(node.end),
       }
 
@@ -321,7 +365,7 @@ function parseFile(filePath: string): ParsedFile {
         kind: "type",
         fields: new Map(),
         isExported: isExported(node),
-        startLine: getLineNumber(node.pos),
+        startLine: startLineOf(node),
         endLine: getLineNumber(node.end),
       }
 
@@ -345,7 +389,7 @@ function parseFile(filePath: string): ParsedFile {
         kind: "class",
         fields: new Map(),
         isExported: isExported(node),
-        startLine: getLineNumber(node.pos),
+        startLine: startLineOf(node),
         endLine: getLineNumber(node.end),
       }
 
@@ -364,7 +408,7 @@ function parseFile(filePath: string): ParsedFile {
             returns: [],
             isAsync: member.modifiers?.some((m) => m.kind === ts.SyntaxKind.AsyncKeyword) || false,
             isExported: isExported(node),
-            startLine: getLineNumber(member.pos),
+            startLine: startLineOf(member),
             endLine: getLineNumber(member.end),
             bodyText: member.body ? content.substring(member.body.pos, member.body.end) : "",
           }
@@ -385,6 +429,38 @@ function parseFile(filePath: string): ParsedFile {
       })
 
       result.types.set(parsedType.name, parsedType)
+    }
+
+    // Extract enums (H17). Each enum member becomes a field entry so diffs
+    // expose added/removed members.
+    if (ts.isEnumDeclaration(node)) {
+      const parsedType: ParsedType = {
+        name: node.name.text,
+        kind: "enum",
+        fields: new Map(),
+        isExported: isExported(node),
+        startLine: startLineOf(node),
+        endLine: getLineNumber(node.end),
+      }
+
+      node.members.forEach((member) => {
+        if (member.name) {
+          const name = member.name.getText(sourceFile)
+          const initializer = member.initializer
+            ? member.initializer.getText(sourceFile).trim()
+            : ""
+          parsedType.fields.set(name, initializer)
+        }
+      })
+
+      result.types.set(parsedType.name, parsedType)
+    }
+
+    // Namespaces (ts.ModuleDeclaration) are walked into so their nested
+    // functions / types / enums are picked up (H17).
+    if (ts.isModuleDeclaration(node) && node.body) {
+      ts.forEachChild(node.body, visit)
+      return // body already recursed; skip the forEachChild below
     }
 
     ts.forEachChild(node, visit)
@@ -721,6 +797,7 @@ function parseArgs(args: string[]): { before: string; after: string; baseDir: st
 
 // CLI entry point
 function main() {
+  installWallClockTimeout()
   const args = process.argv.slice(2)
 
   if (args.length < 2) {
