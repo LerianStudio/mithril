@@ -2,7 +2,11 @@ package mithrilcli
 
 import (
 	"bytes"
+	"encoding/json"
 	"io"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -125,6 +129,96 @@ func TestRun_NoArgsExecutesRunAll(t *testing.T) {
 	}
 	if !called {
 		t.Fatal("expected run-all runner to be called")
+	}
+}
+
+// initTempGitRepo initialises a minimal git repo inside a fresh t.TempDir() so
+// real-runner E2E tests can exercise the scope detector without depending on
+// the repo the tests run inside. It seeds the repo with a single commit so
+// `git diff HEAD` works, then stages a new file so the detector has
+// something to report. Skips the test when git is not on PATH.
+func initTempGitRepo(t *testing.T) string {
+	t.Helper()
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git binary not available; skipping real-runner E2E test")
+	}
+	dir := t.TempDir()
+	runGit := func(args ...string) {
+		cmd := exec.Command("git", args...)
+		cmd.Dir = dir
+		if output, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %s failed: %v\n%s", strings.Join(args, " "), err, string(output))
+		}
+	}
+	runGit("init", "-q", "-b", "main")
+	runGit("config", "user.email", "test@example.com")
+	runGit("config", "user.name", "Test User")
+	runGit("config", "commit.gpgsign", "false")
+
+	if err := os.WriteFile(filepath.Join(dir, "README.md"), []byte("base\n"), 0o644); err != nil {
+		t.Fatalf("write README: %v", err)
+	}
+	runGit("add", "README.md")
+	runGit("commit", "-q", "-m", "initial")
+
+	// Add and stage a new file to produce a non-empty scope.
+	if err := os.WriteFile(filepath.Join(dir, "service.go"), []byte("package service\n\nfunc Hello() string { return \"hi\" }\n"), 0o644); err != nil {
+		t.Fatalf("write service.go: %v", err)
+	}
+	runGit("add", "service.go")
+	return dir
+}
+
+// TestRun_ScopeDetectorEndToEnd_RealRunner exercises the real scope-detector
+// runner (no commandRunners stubbing) against a throwaway git repository and
+// asserts that a well-formed scope.json is written to disk. This closes the
+// coverage gap flagged by C16: the stub-based tests above only verify dispatch
+// wiring — this test verifies the full post-dispatch execution path is still
+// wired to a working implementation.
+func TestRun_ScopeDetectorEndToEnd_RealRunner(t *testing.T) {
+	workDir := initTempGitRepo(t)
+	scopePath := filepath.Join(workDir, "scope.json")
+
+	var stdout, stderr bytes.Buffer
+	args := []string{
+		"scope-detector",
+		"--workdir=" + workDir,
+		"--output=" + scopePath,
+		"--staged",
+	}
+	if err := Run("dev", args, &stdout, &stderr); err != nil {
+		t.Fatalf("Run(scope-detector) unexpected error: %v\nstderr: %s", err, stderr.String())
+	}
+
+	data, err := os.ReadFile(scopePath) // #nosec G304 — path built from t.TempDir()
+	if err != nil {
+		t.Fatalf("scope.json was not written: %v", err)
+	}
+	var parsed struct {
+		Language string `json:"language"`
+		Files    struct {
+			Added    []string `json:"added"`
+			Modified []string `json:"modified"`
+			Deleted  []string `json:"deleted"`
+		} `json:"files"`
+	}
+	if err := json.Unmarshal(data, &parsed); err != nil {
+		t.Fatalf("scope.json did not parse: %v\nraw: %s", err, string(data))
+	}
+	// Real runner must have detected our seeded untracked .go file and
+	// resolved language to "go" (or at least a non-empty value).
+	if parsed.Language == "" {
+		t.Errorf("expected non-empty language in scope.json, got empty\nscope.json: %s", string(data))
+	}
+	found := false
+	for _, f := range parsed.Files.Added {
+		if filepath.Base(f) == "service.go" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("expected added file 'service.go' in scope.json, got %+v", parsed.Files)
 	}
 }
 
