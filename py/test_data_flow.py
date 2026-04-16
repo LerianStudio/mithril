@@ -308,8 +308,10 @@ class SandboxAndManifestTests(unittest.TestCase):
             self.assertIsNotNone(sandbox_path(inside, base))
 
     def test_manifest_too_large_is_rejected(self):
+        # Write manifest inside CWD so it passes the sandbox path check
+        # (sandbox fires before size check, which is intentional).
         with tempfile.NamedTemporaryFile(
-            "w", suffix=".txt", delete=False, dir=tempfile.gettempdir()
+            "w", suffix=".txt", delete=False, dir=os.getcwd()
         ) as m:
             manifest_path = m.name
             # Write slightly more than the cap
