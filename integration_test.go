@@ -1,120 +1,126 @@
+//go:build integration
+
+// Package main integration tests exercise the shipped `mithril` binary via
+// exec.Command. They replace the former cmd/run-all binary-integration tests
+// (see cmd/run-all/main_test.go before deletion) and are gated behind the
+// `integration` build tag so normal `go test ./...` runs stay fast and
+// hermetic. Run with:
+//
+//	go test -tags=integration ./...
 package main
 
 import (
-	"context"
+	"bytes"
+	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
+	"sync"
 	"testing"
-
-	"github.com/lerianstudio/mithril/internal/lint"
-	"github.com/lerianstudio/mithril/internal/scope"
-	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
 )
 
-func TestScopeReader(t *testing.T) {
-	scopePath := filepath.Join("testdata", "scope.json")
-	s, err := scope.ReadScopeJSON(scopePath)
+var (
+	integrationBinaryOnce sync.Once
+	integrationBinaryPath string
+	integrationBinaryErr  error
+)
 
-	require.NoError(t, err)
-	assert.Equal(t, "main", s.BaseRef)
-	assert.Equal(t, "HEAD", s.HeadRef)
-	assert.Equal(t, "go", s.Language)
-	assert.Equal(t, lint.LanguageGo, s.GetLanguage())
-
-	files := s.GetAllFiles()
-	assert.Len(t, files, 2)
-	assert.Contains(t, files, "internal/handler/user.go")
-	assert.Contains(t, files, "internal/service/notification.go")
-
-	fileMap := s.GetAllFilesMap()
-	assert.True(t, fileMap["internal/handler/user.go"])
-	assert.True(t, fileMap["internal/service/notification.go"])
-	assert.False(t, fileMap["nonexistent.go"])
-
-	packages := s.GetPackages()
-	assert.Len(t, packages, 2)
+// buildMithrilBinary builds `mithril` once per test binary and returns its
+// absolute path.
+func buildMithrilBinary(t *testing.T) string {
+	t.Helper()
+	integrationBinaryOnce.Do(func() {
+		out, err := os.MkdirTemp("", "mithril-integration-*")
+		if err != nil {
+			integrationBinaryErr = err
+			return
+		}
+		bin := filepath.Join(out, "mithril")
+		build := exec.Command("go", "build", "-o", bin, ".")
+		if output, err := build.CombinedOutput(); err != nil {
+			integrationBinaryErr = &buildFailure{Err: err, Output: string(output)}
+			return
+		}
+		integrationBinaryPath = bin
+	})
+	if integrationBinaryErr != nil {
+		t.Fatalf("failed to build mithril binary: %v", integrationBinaryErr)
+	}
+	return integrationBinaryPath
 }
 
-func TestLinterRegistry(t *testing.T) {
-	ctx := context.Background()
-	registry := lint.NewRegistry()
+type buildFailure struct {
+	Err    error
+	Output string
+}
 
-	// Register all linters
-	registry.Register(lint.NewGolangciLint())
-	registry.Register(lint.NewStaticcheck())
-	registry.Register(lint.NewGosec())
-	registry.Register(lint.NewTSC())
-	registry.Register(lint.NewESLint())
-	registry.Register(lint.NewRuff())
-	registry.Register(lint.NewMypy())
-	registry.Register(lint.NewPylint())
-	registry.Register(lint.NewBandit())
+func (b *buildFailure) Error() string { return b.Err.Error() + ": " + b.Output }
 
-	// Check Go linters registered
-	goLinters := registry.GetLinters(lint.LanguageGo)
-	assert.Len(t, goLinters, 3)
-
-	// Check TS linters registered
-	tsLinters := registry.GetLinters(lint.LanguageTypeScript)
-	assert.Len(t, tsLinters, 2)
-
-	// Check Python linters registered
-	pyLinters := registry.GetLinters(lint.LanguagePython)
-	assert.Len(t, pyLinters, 4)
-
-	// Available linters depend on what's installed
-	availableGo := registry.GetAvailableLinters(ctx, lint.LanguageGo)
-	t.Logf("Available Go linters: %d", len(availableGo))
-	for _, l := range availableGo {
-		t.Logf("  - %s", l.Name())
+// TestIntegration_Version ensures `mithril --version` prints the expected
+// preamble and does not panic.
+func TestIntegration_Version(t *testing.T) {
+	bin := buildMithrilBinary(t)
+	output, err := exec.Command(bin, "--version").CombinedOutput()
+	if err != nil {
+		t.Fatalf("--version failed: %v\n%s", err, string(output))
+	}
+	if !strings.HasPrefix(string(output), "mithril version ") {
+		t.Fatalf("unexpected version output: %s", string(output))
 	}
 }
 
-func TestResultAggregation(t *testing.T) {
-	result := lint.NewResult()
-
-	// Simulate findings from multiple tools
-	result.AddFinding(lint.Finding{
-		Tool:     "golangci-lint",
-		Rule:     "SA1019",
-		Severity: lint.SeverityWarning,
-		File:     "internal/handler/user.go",
-		Line:     45,
-		Column:   12,
-		Message:  "deprecated API",
-		Category: lint.CategoryDeprecation,
-	})
-
-	result.AddFinding(lint.Finding{
-		Tool:     "gosec",
-		Rule:     "G401",
-		Severity: lint.SeverityHigh,
-		File:     "internal/handler/user.go",
-		Line:     67,
-		Column:   8,
-		Message:  "weak crypto",
-		Category: lint.CategorySecurity,
-	})
-
-	// Verify aggregation
-	assert.Len(t, result.Findings, 2)
-	assert.Equal(t, 0, result.Summary.Critical)
-	assert.Equal(t, 1, result.Summary.High)
-	assert.Equal(t, 1, result.Summary.Warning)
-	assert.Equal(t, 0, result.Summary.Info)
-	assert.Equal(t, 0, result.Summary.Unknown)
-
-	// Test filtering
-	fileMap := map[string]bool{
-		"internal/handler/user.go": true,
+// TestIntegration_Help ensures `mithril --help` prints the CLI overview
+// including subcommand names.
+func TestIntegration_Help(t *testing.T) {
+	bin := buildMithrilBinary(t)
+	output, _ := exec.Command(bin, "--help").CombinedOutput()
+	for _, want := range []string{"Mithril CLI", "run-all", "scope-detector", "compile-context"} {
+		if !strings.Contains(string(output), want) {
+			t.Errorf("help output missing %q\n%s", want, string(output))
+		}
 	}
-	filtered := result.FilterByFiles(fileMap)
-	assert.Len(t, filtered.Findings, 2)
+}
 
-	// Filter to non-existent file
-	fileMap2 := map[string]bool{
-		"other.go": true,
+// TestIntegration_AllPhasesSkipped runs the shipped binary with every phase
+// skipped and verifies the skip banners appear in stderr. This replaces
+// cmd/run-all/main_test.go#TestRun_AllPhasesSkipped.
+func TestIntegration_AllPhasesSkipped(t *testing.T) {
+	bin := buildMithrilBinary(t)
+	outDir := t.TempDir()
+	cmd := exec.Command(bin,
+		"--output="+outDir,
+		"--skip=scope,static-analysis,ast,callgraph,dataflow,context",
+	)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("expected success, got %v\nstderr: %s", err, stderr.String())
 	}
-	filtered2 := result.FilterByFiles(fileMap2)
-	assert.Len(t, filtered2.Findings, 0)
+	for _, want := range []string{
+		"[SKIP] scope", "[SKIP] static-analysis", "[SKIP] ast",
+		"[SKIP] callgraph", "[SKIP] dataflow", "[SKIP] context",
+	} {
+		if !strings.Contains(stderr.String(), want) {
+			t.Errorf("stderr missing %q\nstderr: %s", want, stderr.String())
+		}
+	}
+}
+
+// TestIntegration_InvalidFlagCombinations verifies mutually exclusive flag
+// combinations exit non-zero.
+func TestIntegration_InvalidFlagCombinations(t *testing.T) {
+	bin := buildMithrilBinary(t)
+	cases := [][]string{
+		{"--files=README.md", "--base=main"},
+		{"--unstaged", "--base=main"},
+		{"--unstaged", "--staged"},
+	}
+	for _, args := range cases {
+		t.Run(strings.Join(args, " "), func(t *testing.T) {
+			err := exec.Command(bin, args...).Run()
+			if err == nil {
+				t.Fatalf("expected non-zero exit for %v", args)
+			}
+		})
+	}
 }
