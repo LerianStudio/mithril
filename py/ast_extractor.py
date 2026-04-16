@@ -10,12 +10,37 @@ import ast
 import argparse
 import hashlib
 import json
+import os
+import signal
 import sys
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Optional
 
 MAX_AST_FILE_SIZE = 10 * 1024 * 1024
+
+# Script-side wall-clock cap. Layered with the Go-side subprocess timeout so
+# a runaway parser cannot outlive the caller's context. Override via
+# MITHRIL_SCRIPT_TIMEOUT_SEC for debugging.
+DEFAULT_SCRIPT_TIMEOUT_SEC = 120
+
+
+def _install_wall_clock_timeout() -> None:
+    if not hasattr(signal, "SIGALRM"):
+        return
+    try:
+        seconds = int(os.environ.get("MITHRIL_SCRIPT_TIMEOUT_SEC", DEFAULT_SCRIPT_TIMEOUT_SEC))
+    except ValueError:
+        seconds = DEFAULT_SCRIPT_TIMEOUT_SEC
+    if seconds <= 0:
+        return
+
+    def _handler(signum, frame):  # noqa: ARG001
+        print(json.dumps({"error": f"script wall-clock timeout after {seconds}s"}), file=sys.stderr)
+        sys.exit(2)
+
+    signal.signal(signal.SIGALRM, _handler)
+    signal.alarm(seconds)
 
 
 @dataclass
@@ -152,11 +177,24 @@ class ParsedFile:
     error: str = ""
 
 
+def safe_unparse(node) -> str:
+    """ast.unparse is recursive and will stack-overflow on deeply nested
+    expressions like ``((((...))))`` or heavily chained attribute access.
+    Catch RecursionError / MemoryError and surface a truncation marker
+    instead of crashing the whole extractor."""
+    try:
+        return ast.unparse(node)
+    except RecursionError:
+        return "<unparseable:recursion-limit>"
+    except MemoryError:
+        return "<unparseable:memory-limit>"
+
+
 def get_annotation_str(node: Optional[ast.expr]) -> str:
     """Convert an annotation AST node to string."""
     if node is None:
         return ""
-    return ast.unparse(node)
+    return safe_unparse(node)
 
 
 def parse_file(file_path: str) -> ParsedFile:
@@ -176,6 +214,12 @@ def parse_file(file_path: str) -> ParsedFile:
         tree = ast.parse(content)
     except SyntaxError as e:
         result.error = f"Syntax error: {e.msg} at line {e.lineno}"
+        return result
+    except RecursionError:
+        result.error = "parser exceeded recursion limit (deeply nested source)"
+        return result
+    except MemoryError:
+        result.error = "parser exceeded memory limit"
         return result
 
     for node in ast.walk(tree):
@@ -208,7 +252,7 @@ def parse_file(file_path: str) -> ParsedFile:
                     result.functions[method.name] = method
 
         elif isinstance(node, ast.Assign):
-            value = ast.unparse(node.value) if node.value is not None else ""
+            value = safe_unparse(node.value) if node.value is not None else ""
             for target in node.targets:
                 if isinstance(target, ast.Name):
                     name = target.id
@@ -227,7 +271,38 @@ def parse_file(file_path: str) -> ParsedFile:
                 name=name,
                 kind="const" if name.isupper() else "var",
                 type=get_annotation_str(node.annotation),
-                value=ast.unparse(node.value) if node.value is not None else "",
+                value=safe_unparse(node.value) if node.value is not None else "",
+                start_line=node.lineno,
+                end_line=node.end_lineno or node.lineno,
+            )
+
+        # PEP 695 type alias:  type Name = <expr>
+        # ast.TypeAlias only exists on Python 3.12+; guard accordingly.
+        elif hasattr(ast, "TypeAlias") and isinstance(node, getattr(ast, "TypeAlias")):
+            name_node = node.name
+            if isinstance(name_node, ast.Name):
+                alias_name = name_node.id
+                result.classes[alias_name] = ParsedClass(
+                    name=alias_name,
+                    is_dataclass=False,
+                    fields={alias_name: safe_unparse(node.value)},
+                    methods=[],
+                    is_exported=not alias_name.startswith("_"),
+                    start_line=node.lineno,
+                    end_line=node.end_lineno or node.lineno,
+                )
+
+        # PEP 634 match statement — surface top-level match as a synthetic
+        # "variable" entry so diffs reveal changes. Individual match arms are
+        # not parsed further; we only record the subject expression.
+        elif hasattr(ast, "Match") and isinstance(node, getattr(ast, "Match")):
+            subject = safe_unparse(node.subject)
+            synthetic_name = f"__match_{node.lineno}__"
+            result.variables[synthetic_name] = ParsedVar(
+                name=synthetic_name,
+                kind="var",
+                type="match",
+                value=subject,
                 start_line=node.lineno,
                 end_line=node.end_lineno or node.lineno,
             )
@@ -254,7 +329,10 @@ def _parse_function(
         elif isinstance(dec, ast.Call) and isinstance(dec.func, ast.Name):
             decorators.append(dec.func.id)
         elif isinstance(dec, ast.Attribute):
-            decorators.append(ast.unparse(dec))
+            decorators.append(safe_unparse(dec))
+        else:
+            # PEP 614 relaxed decorator syntax allows arbitrary expressions.
+            decorators.append(safe_unparse(dec))
 
     # Hash the function implementation body (excluding signature/decorators)
     end_line = node.end_lineno if node.end_lineno else node.lineno
@@ -584,7 +662,13 @@ def extract_diff(before_path: str, after_path: str) -> SemanticDiff:
 
 
 def dataclass_to_dict(obj):
-    """Recursively convert dataclass to dict, omitting empty values.
+    """Recursively convert dataclass to dict, omitting only None values.
+
+    Aligns with the omission rule used by py/data_flow.py (to_dict) and
+    py/call_graph.py (to_dict): keep empty strings and empty lists so the
+    JSON contract is consistent across Mithril's Python producers. Go
+    consumers already tolerate empty values because every field uses
+    `json:"...,omitempty"`.
 
     NOTE: dataclass field names are part of the JSON contract consumed by Go.
     Renaming fields is a breaking change for downstream consumers.
@@ -593,10 +677,6 @@ def dataclass_to_dict(obj):
         result = {}
         for key, value in asdict(obj).items():
             if value is None:
-                continue
-            if isinstance(value, list) and not value:
-                continue
-            if isinstance(value, str) and not value:
                 continue
             result[key] = value
         return result
@@ -656,6 +736,7 @@ def validate_input_path(file_path: str, base_dir: Path) -> str:
 
 def main():
     """CLI entry point."""
+    _install_wall_clock_timeout()
     parser = argparse.ArgumentParser(
         prog="ast_extractor.py",
         description="Extract semantic diff between before/after Python files.",

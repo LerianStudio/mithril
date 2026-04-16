@@ -19,12 +19,56 @@ import hashlib
 import json
 import os
 import re
+import signal
 import sys
 from dataclasses import dataclass, field
 from typing import Optional
 
 # Maximum file size to analyze (10MB) - prevents memory exhaustion
 MAX_FILE_SIZE = 10 * 1024 * 1024
+
+# Maximum size for a --files-from manifest (10MB).
+MAX_MANIFEST_SIZE = 10 * 1024 * 1024
+
+# Script-side wall-clock cap layered with the Go-side subprocess timeout.
+DEFAULT_SCRIPT_TIMEOUT_SEC = 120
+
+
+def _install_wall_clock_timeout() -> None:
+    if not hasattr(signal, "SIGALRM"):
+        return
+    try:
+        seconds = int(os.environ.get("MITHRIL_SCRIPT_TIMEOUT_SEC", DEFAULT_SCRIPT_TIMEOUT_SEC))
+    except ValueError:
+        seconds = DEFAULT_SCRIPT_TIMEOUT_SEC
+    if seconds <= 0:
+        return
+
+    def _handler(signum, frame):  # noqa: ARG001
+        print(json.dumps({"error": f"script wall-clock timeout after {seconds}s"}), file=sys.stderr)
+        sys.exit(2)
+
+    signal.signal(signal.SIGALRM, _handler)
+    signal.alarm(seconds)
+
+
+def sandbox_path(path: str, base_dir: str) -> Optional[str]:
+    """Return the canonical absolute path if it lies inside base_dir, else None.
+
+    Resolves symlinks so that in-repo entries pointing outside the sandbox are
+    rejected. base_dir itself is canonicalized the same way.
+    """
+    try:
+        base_real = os.path.realpath(os.path.abspath(base_dir))
+        cand_real = os.path.realpath(os.path.abspath(path))
+    except OSError:
+        return None
+    if cand_real == base_real:
+        return cand_real
+    prefix = base_real + os.sep
+    if cand_real.startswith(prefix):
+        return cand_real
+    return None
 
 
 @dataclass
@@ -242,7 +286,7 @@ TYPESCRIPT_SOURCE_PATTERNS: dict[str, list[tuple[str, str]]] = {
         (r"ctx\.request\.body\b", "ctx.request.body"),
         (r"ctx\.body\b", "ctx.body"),
         (r"event\.body\b", "event.body"),
-        (r"\.json\s*\(\s*\)", ".json()"),
+        (r"(?:req|request|ctx|context)\.json\s*\(\s*\)", "req.json()"),
     ],
     "http_query": [
         (r"req\.query\b", "req.query"),
@@ -275,16 +319,14 @@ TYPESCRIPT_SOURCE_PATTERNS: dict[str, list[tuple[str, str]]] = {
         (r"Bun\.file\s*\(", "Bun.file"),
     ],
     "database": [
-        (r"\.query\s*\(", ".query()"),
-        (r"\.findOne\s*\(", ".findOne()"),
-        (r"\.find\s*\(", ".find()"),
-        (r"\.findFirst\s*\(", ".findFirst()"),
-        (r"\.findUnique\s*\(", ".findUnique()"),
-        (r"\.findMany\s*\(", ".findMany()"),
-        (r"\.aggregate\s*\(", ".aggregate()"),
-        (r"\.select\s*\(", ".select()"),
+        (r"(?:db|conn|tx|pool|client|connection)\.query\s*\(", "db.query()"),
+        (r"(?:db|conn|tx|pool|client|connection|repo|repository|model|collection)\.findOne\s*\(", "db.findOne()"),
+        (r"(?:db|conn|tx|pool|client|connection|repo|repository|model|collection)\.findFirst\s*\(", "db.findFirst()"),
+        (r"(?:db|conn|tx|pool|client|connection|repo|repository|model|collection)\.findUnique\s*\(", "db.findUnique()"),
+        (r"(?:db|conn|tx|pool|client|connection|repo|repository|model|collection)\.findMany\s*\(", "db.findMany()"),
+        (r"(?:db|conn|tx|pool|client|connection|repo|repository|model|collection)\.aggregate\s*\(", "db.aggregate()"),
         (r"prisma\.\w+\.", "prisma query"),
-        (r"db\.\w+\.", "db query"),
+        (r"\bdb\.\w+\.", "db query"),
     ],
     "external_api": [
         (r"\bfetch\s*\(", "fetch()"),
@@ -918,6 +960,7 @@ def output_to_json(output: AnalysisOutput, language: str) -> str:
 
 def main() -> None:
     """Main CLI entry point."""
+    _install_wall_clock_timeout()
     args = sys.argv[1:]
 
     if len(args) < 2:
@@ -936,6 +979,11 @@ def main() -> None:
         print("  python     Python (Flask, Django, FastAPI)", file=sys.stderr)
         print("  typescript TypeScript/JavaScript (Express, Node)", file=sys.stderr)
         print("", file=sys.stderr)
+        print("Options:", file=sys.stderr)
+        print(
+            "  --base-dir <dir>  Sandbox root; file paths must lie inside (default: cwd)",
+            file=sys.stderr,
+        )
         print("Output:", file=sys.stderr)
         print(
             "  JSON to stdout with sources, sinks, flows, nil_sources", file=sys.stderr
@@ -950,25 +998,73 @@ def main() -> None:
         )
         sys.exit(1)
 
-    file_args = args[1:]
+    # Extract optional --base-dir from file_args (can appear before or after
+    # --files-from). Any file path argument that escapes base_dir is rejected.
+    file_args = list(args[1:])
+    base_dir = ""
+    cleaned: list[str] = []
+    i = 0
+    while i < len(file_args):
+        tok = file_args[i]
+        if tok == "--base-dir" and i + 1 < len(file_args):
+            base_dir = file_args[i + 1]
+            i += 2
+            continue
+        cleaned.append(tok)
+        i += 1
+    file_args = cleaned
+
+    if not base_dir:
+        base_dir = os.getcwd()
+
     files: list[str] = []
     if len(file_args) >= 2 and file_args[0] == "--files-from":
         manifest_path = file_args[1]
         try:
+            manifest_size = os.path.getsize(manifest_path)
+        except OSError as e:
+            print(f"Error: failed to stat file manifest: {e}", file=sys.stderr)
+            sys.exit(1)
+        if manifest_size > MAX_MANIFEST_SIZE:
+            print(
+                f"Error: manifest exceeds maximum size "
+                f"({manifest_size} > {MAX_MANIFEST_SIZE} bytes)",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        try:
             with open(manifest_path, encoding="utf-8") as manifest:
-                files = [line.strip() for line in manifest.readlines() if line.strip()]
+                raw_lines = [line.strip() for line in manifest.readlines() if line.strip()]
         except OSError as e:
             print(f"Error: failed to read file manifest: {e}", file=sys.stderr)
             sys.exit(1)
+        for line in raw_lines:
+            safe = sandbox_path(line, base_dir)
+            if safe is None:
+                print(
+                    f"Warning: dropping manifest entry outside base dir "
+                    f"(base={base_dir}): {line}",
+                    file=sys.stderr,
+                )
+                continue
+            files.append(safe)
     else:
-        files = file_args
+        for f in file_args:
+            safe = sandbox_path(f, base_dir)
+            if safe is None:
+                print(
+                    f"Error: path escapes base directory (base={base_dir}): {f}",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+            files.append(safe)
 
     if not files:
         print("Error: No files specified", file=sys.stderr)
         sys.exit(1)
 
-    # Resolve file paths
-    resolved_files = [os.path.abspath(f) for f in files]
+    # files are already canonicalized absolute paths via sandbox_path.
+    resolved_files = files
 
     try:
         result = analyze(resolved_files, language)
